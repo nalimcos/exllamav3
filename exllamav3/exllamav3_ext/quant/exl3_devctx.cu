@@ -83,6 +83,21 @@ int* DevCtx::get_locks(int device)
     std::lock_guard<std::mutex> lock(mtx);
     if (!locks[device])
     {
+        // cudaMalloc during CUDA graph capture is illegal. prepare_ctx() - and the first eager
+        // run of any graphed path - allocates this buffer before capture starts, so reaching here
+        // mid-capture means that pre-warm was skipped. Fail loudly instead of letting the driver
+        // abort the capture with cudaErrorStreamCaptureUnsupported.
+        cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream(device).stream();
+        if (cudaStreamIsCapturing(stream, &st) == cudaSuccess)
+        {
+            TORCH_CHECK(st == cudaStreamCaptureStatusNone,
+                "exl3 lock buffer on device ", device, " must be allocated before CUDA graph capture");
+        }
+        else
+        {
+            cudaGetLastError();
+        }
         c10::cuda::CUDAGuard guard(device);
         size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS) * sizeof(int);
         cudaError_t e = cudaMalloc(&locks[device], size);
@@ -114,4 +129,6 @@ void prepare_ctx(int device)
     DevCtx::instance().get_cc(device);
     DevCtx::instance().get_smem_max(device);
     DevCtx::instance().get_locks(device);
+    // Resolve the m==1 GEMV path decision now, before any graph capture: the probe allocates.
+    g_get_gemv_core(device);
 }

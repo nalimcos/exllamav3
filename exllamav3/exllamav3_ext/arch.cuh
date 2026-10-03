@@ -11,7 +11,10 @@
 //                          correct, just without global->shared overlap.
 //   2. mma.m16n8k16     -> ptx.cuh issues two mma.m16n8k8 instead. The k=16 fragment splits
 //                          exactly into the two k=8 fragments (A: {a0,a1} then {a2,a3},
-//                          B: b0 then b1), so this is bit-equivalent, not an approximation.
+//                          B: b0 then b1), but the split is not guaranteed bit-identical: it
+//                          forces a rounding of the partial sum at the k=8 boundary that the
+//                          fused form need not perform, at most one extra rounding per
+//                          16-element dot product. See the longer note in ptx.cuh.
 //   3. 90 KB shared mem -> Turing caps dynamic shared memory at 64 KB per block. The limit is
 //                          a host-side launch parameter, so it is resolved per device at
 //                          runtime (DevCtx::get_smem_max) and shapes that do not fit are
