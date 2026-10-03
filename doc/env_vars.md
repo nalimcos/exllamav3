@@ -209,6 +209,16 @@ the path wherever its hard constraints allow (testing).
 Weight-extraction strategy inside the fp16 GEMV kernel: `-1` picks per bitrate (default), `0`
 forces shuffle extraction, `1` forces shared-memory staging. Testing only.
 
+### `EXL3_GEMV_CORE` (default: `auto`)
+
+Selects the m == 1 GEMV inner loop. `auto` probes once per device whether the emulated
+`mma.m16n8k8` tensor-core chain is less than half the rate of a packed `__hfma2` CUDA-core
+chain, and uses the CUDA-core path where it wins (GeForce GTX 16-series, sm_75 TU117/TU116,
+whose tensor cores run far below the FP16 CUDA-core rate). `0` forces the tensor-core mma path,
+`1` forces the CUDA-core path. The probe is gated to compute capability 7.5: every other
+architecture, including tensor-core sm_75 (T4, RTX 20xx) and sm_80+, uses the mma path
+unchanged. Also exposed as the `exllamav3_ext.g_get_gemv_core(device)` decision (0 or 1).
+
 ### `EXL3_INT8_GEMV` (default: `2`)
 
 Fused int8-activation GEMV for tensors quantized with the mul1 codebook: one cooperative launch

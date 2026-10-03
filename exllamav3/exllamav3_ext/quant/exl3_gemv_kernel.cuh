@@ -183,12 +183,19 @@ __device__ __forceinline__ void dq8_regs_half(uint32_t a7, uint32_t b7, int s7, 
 // ptxas spends 81-85 registers on them on sm_86/sm_89 (one 512-thread block per SM instead of two, measured
 // 18-28% slower at attention-projection shapes on the 3090). They are packed into one register (see x_pack) and
 // the bound keeps the compiler at the integer instances' 64
-template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
+// CORE selects the CUDA-core __hfma2 inner loop for the m == 1 (MMODE 0) GEMV instead of the
+// emulated tensor-core mma. g_get_gemv_core() picks it on sm_75 GeForce parts (GTX 16-series),
+// where the tensor cores run at a fraction of the FP16 CUDA-core rate; on tensor-core sm_75 and
+// sm_80+ it is off and the mma path below is used unchanged. The body itself is portable, so the
+// architecture gate lives host-side in g_get_gemv_core and this template stays instantiable in
+// multi-arch builds. CORE=false reproduces the previous kernel byte for byte.
+template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false, bool CORE = false>
 __global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
 void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 {
     static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
                   "exl3_gemv_kernel supports 2, 3 and 4 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
+    static_assert(!CORE || MMODE == 0, "exl3_gemv_kernel CORE path is the m == 1 GEMV");
     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
     constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
     constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
@@ -240,10 +247,11 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     const half2* A2 = (const half2*) A;
     const half2 hzero = __half2half2(__ushort_as_half(0));
 
-    // A fragment row indices for this lane
+    // A fragment row indices for this lane. CORE does the m == 1 dot product directly: every
+    // lane reads row 0 and its own k-pair (see the CORE store below), so the row guard is moot.
     const int r0 = lane >> 2;
-    const size_t a_row0 = (size_t) r0 * (size_k / 2);
-    const bool r0_ok = MMODE == 0 ? lane < 4 : r0 < size_m;
+    const size_t a_row0 = CORE ? 0 : (size_t) r0 * (size_k / 2);
+    const bool r0_ok = CORE ? true : (MMODE == 0 ? lane < 4 : r0 < size_m);
 
     // Per-lane extraction constants (see dq8_aligned_2bits / dq8<3, cb, 4> / dq8_half in exl3_dq.cuh)
     [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
@@ -393,8 +401,21 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
                 }
 
-                exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
-                exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+                if constexpr (CORE)
+                {
+                    // CUDA-core dot product, no cross-lane routing. ch[t][f][0] is a half2 whose
+                    // lanes accumulate the even- and odd-k products for column g = lane >> 2
+                    // (f0) / g + 8 (f1): a01[0] pairs k = 2*(lane&3),+1, a23[0] pairs k + 8.
+                    ch[t][0][0] = __hfma2(a01[0], f0[0], ch[t][0][0]);
+                    ch[t][0][0] = __hfma2(a23[0], f0[1], ch[t][0][0]);
+                    ch[t][1][0] = __hfma2(a01[0], f1[0], ch[t][1][0]);
+                    ch[t][1][0] = __hfma2(a23[0], f1[1], ch[t][1][0]);
+                }
+                else
+                {
+                    exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
+                    exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+                }
             }
 
             if ((d + 1) % FOLD == 0 || i + 1 == myn)
@@ -412,9 +433,31 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         }
         }
 
-        // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
-        // tile*16 + frag*8 + 2*(l%4) (+1)
+        if constexpr (CORE)
         {
+            // CORE accumulated even/odd-k partials for column g = lane >> 2 (frag 0) and g + 8
+            // (frag 1); lane&3 selects the k-pair, so reduce the four lanes of each group.
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t)
+            {
+                float v0 = acc0[t][0].x + acc0[t][0].y;
+                float v1 = acc0[t][1].x + acc0[t][1].y;
+                v0 += __shfl_xor_sync(0xffffffffu, v0, 1);
+                v0 += __shfl_xor_sync(0xffffffffu, v0, 2);
+                v1 += __shfl_xor_sync(0xffffffffu, v1, 1);
+                v1 += __shfl_xor_sync(0xffffffffu, v1, 2);
+                if ((lane & 3) == 0)
+                {
+                    const int g = lane >> 2;
+                    sh_red[warp][0][t * 16 + g] = v0;
+                    sh_red[warp][0][t * 16 + g + 8] = v1;
+                }
+            }
+        }
+        else
+        {
+            // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
+            // tile*16 + frag*8 + 2*(l%4) (+1)
             const int c0 = 2 * (lane & 3);
             const bool store0 = MMODE == 0 ? lane < 4 : r0 < ROWS;
             const int sr0 = MMODE == 0 ? 0 : r0;

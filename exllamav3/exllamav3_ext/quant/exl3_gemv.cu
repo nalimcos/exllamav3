@@ -71,19 +71,27 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
     return -1;
 }
 
-static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, int cfg, bool smem)
+static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, int cfg, bool smem, bool core)
 {
-    #define SEL(bits_, cb_, fp32_, mm_, cfg_, sm_) \
-        if (bits == bits_ && cb == cb_ && c_fp32 == fp32_ && mmode == mm_ && cfg == cfg_ && smem == sm_) \
-            return (void*) exl3_gemv_kernel<bits_, fp32_, cb_, mm_, cfg_, sm_>;
+    #define SEL(bits_, cb_, fp32_, mm_, cfg_, sm_, core_) \
+        if (bits == bits_ && cb == cb_ && c_fp32 == fp32_ && mmode == mm_ && cfg == cfg_ && smem == sm_ && core == core_) \
+            return (void*) exl3_gemv_kernel<bits_, fp32_, cb_, mm_, cfg_, sm_, false, core_>;
     #define SEL_GRID(bits_, cb_, sm_) \
-        SEL(bits_, cb_, false, 0, 0, sm_) SEL(bits_, cb_, false, 0, 1, sm_) \
-        SEL(bits_, cb_, false, 1, 0, sm_) SEL(bits_, cb_, false, 1, 1, sm_) \
-        SEL(bits_, cb_, true,  0, 0, sm_) SEL(bits_, cb_, true,  0, 1, sm_) \
-        SEL(bits_, cb_, true,  1, 0, sm_) SEL(bits_, cb_, true,  1, 1, sm_)
+        SEL(bits_, cb_, false, 0, 0, sm_, false) SEL(bits_, cb_, false, 0, 1, sm_, false) \
+        SEL(bits_, cb_, false, 1, 0, sm_, false) SEL(bits_, cb_, false, 1, 1, sm_, false) \
+        SEL(bits_, cb_, true,  0, 0, sm_, false) SEL(bits_, cb_, true,  0, 1, sm_, false) \
+        SEL(bits_, cb_, true,  1, 0, sm_, false) SEL(bits_, cb_, true,  1, 1, sm_, false)
+    // CORE (CUDA-core __hfma2) instances exist only for the m == 1 GEMV (MMODE 0)
+    #define SEL_GRID_CORE(bits_, cb_, sm_) \
+        SEL(bits_, cb_, false, 0, 0, sm_, true) SEL(bits_, cb_, false, 0, 1, sm_, true) \
+        SEL(bits_, cb_, true,  0, 0, sm_, true) SEL(bits_, cb_, true,  0, 1, sm_, true)
     SEL_GRID(4, 0, false) SEL_GRID(4, 1, false) SEL_GRID(4, 2, false)
     SEL_GRID(2, 1, false) SEL_GRID(2, 2, false) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
     SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
+    SEL_GRID_CORE(4, 0, false) SEL_GRID_CORE(4, 1, false) SEL_GRID_CORE(4, 2, false)
+    SEL_GRID_CORE(2, 1, false) SEL_GRID_CORE(2, 2, false) SEL_GRID_CORE(2, 1, true) SEL_GRID_CORE(2, 2, true)
+    SEL_GRID_CORE(3, 1, false) SEL_GRID_CORE(3, 2, false) SEL_GRID_CORE(3, 1, true) SEL_GRID_CORE(3, 2, true)
+    #undef SEL_GRID_CORE
     #undef SEL_GRID
     #undef SEL
     return nullptr;
@@ -128,6 +136,26 @@ bool exl3_gemv_try_launch
     int mmode = size_m == 1 ? 0 : 1;
     int num_sms = DevCtx::instance().get_num_sms(device);
 
+    // m == 1 only: pick the CUDA-core __hfma2 inner loop on devices where the probe found it
+    // faster (sm_75 GeForce). During graph capture the decision must already be cached - probing
+    // calls cudaMalloc, which is illegal there - so an uncached decision falls back to mma without
+    // being cached, and the captured node keeps the mma kernel.
+    bool core = false;
+    if (mmode == 0)
+    {
+        int cached = g_get_gemv_core_cached(device);
+        if (cached >= 0)
+        {
+            core = cached == 1;
+        }
+        else
+        {
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess) cudaGetLastError();
+            else if (capture == cudaStreamCaptureStatusNone) core = g_get_gemv_core(device) == 1;
+        }
+    }
+
     // Cooperative launch: grids are capped at full co-residency (cached per kernel), and the
     // narrow config's co-residency also feeds the shape heuristic
     static std::map<void*, int> occ_cache[MAX_DEVICES];
@@ -147,8 +175,8 @@ bool exl3_gemv_try_launch
 
     auto select = [&] (int cfg_) -> void*
     {
-        return half_k ? exl3_gemv_select_kernel_half(K, c_fp32, mmode, cfg_, smem)
-                      : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg_, smem);
+        return half_k ? exl3_gemv_select_kernel_half(K, c_fp32, mmode, cfg_, smem, core)
+                      : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg_, smem, core);
     };
     void* narrow_kernel = select(0);
     if (!narrow_kernel) return false;

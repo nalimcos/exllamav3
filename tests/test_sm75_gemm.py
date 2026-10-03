@@ -13,6 +13,7 @@ Run on any device; on sm_80+ this is a regression test that the refactor changed
     python -m pytest tests/test_sm75_gemm.py -v
 """
 
+import os
 import pytest
 import torch
 
@@ -118,3 +119,62 @@ def test_smem_budget_respected():
         ext.exl3_gemm(A, trellis, C, suh, A_had, svh, 0, False, False, 0)
         torch.cuda.synchronize()
         assert torch.isfinite(C.float()).all(), f"K={K}: non-finite output (limit {limit})"
+
+
+def test_gemv_core_decision():
+    """g_get_gemv_core must return a definite decision, and honor the env override.
+
+    The env value is read once per process (the probe is cached per device), so the mma and
+    CUDA-core inner loops are exercised by running the suite with EXL3_GEMV_CORE=0 and =1.
+    """
+    v = ext.g_get_gemv_core(0)
+    assert v in (0, 1), f"g_get_gemv_core(0) = {v}"
+
+    forced = os.environ.get("EXL3_GEMV_CORE")
+    if forced in ("0", "1") and torch.cuda.get_device_capability(0) == (7, 5):
+        assert v == int(forced), f"EXL3_GEMV_CORE={forced} but g_get_gemv_core(0) = {v}"
+
+
+@pytest.mark.parametrize("K", [2, 4])
+def test_gemv_core_m1_matches_reconstruct(K):
+    """m=1 (the GEMV tier) must match reconstruct under either EXL3_GEMV_CORE setting.
+
+    The existing m sweep already covers m=1 once; this isolates it and reports the active
+    inner loop, so an EXL3_GEMV_CORE=1 run is a real test of the CUDA-core __hfma2 path.
+    """
+    k, n = 512, 512
+    trellis, suh, svh = _make_trellis(k, n, K, seed=991 + K)
+    A = (torch.randn((1, k), device=DEV) * 0.5).to(torch.float16)
+
+    C = torch.empty((1, n), dtype=torch.float16, device=DEV)
+    A_had = torch.empty_like(A)
+    ext.exl3_gemm(A, trellis, C, suh, A_had, svh, 0, False, False, 0)
+
+    ref = _reference(A, trellis, suh, svh, K, False, False)
+    err = (C.float() - ref.float()).square().mean().sqrt()
+    scale = ref.float().square().mean().sqrt()
+    rel = (err / scale).item()
+    assert rel < 0.02, f"K={K} m=1 (CORE={ext.g_get_gemv_core(0)}): relative RMS error {rel:.4f}"
+
+
+@pytest.mark.parametrize("K", [2, 4])
+def test_gemv_core_m1_deterministic(K):
+    """Repeated m=1 GEMV launches must be bit-identical, under either inner loop.
+
+    Same race-detection rationale as test_gemm_deterministic: the k-split reduction and the
+    CORE lane shuffles are fixed-order, so any run-to-run variation is a bug.
+    """
+    k, n = 512, 512
+    trellis, suh, svh = _make_trellis(k, n, K, seed=13)
+    A = (torch.randn((1, k), device=DEV) * 0.5).to(torch.float16)
+
+    outs = []
+    for _ in range(8):
+        C = torch.empty((1, n), dtype=torch.float16, device=DEV)
+        A_had = torch.empty_like(A)
+        ext.exl3_gemm(A, trellis, C, suh, A_had, svh, 0, False, False, 0)
+        torch.cuda.synchronize()
+        outs.append(C.clone())
+
+    for i, o in enumerate(outs[1:], 1):
+        assert torch.equal(outs[0], o), f"K={K}: m=1 launch {i} differs from launch 0"

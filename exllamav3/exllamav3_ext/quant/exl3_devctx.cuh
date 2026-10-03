@@ -59,4 +59,12 @@ int g_get_cc(int device);
 int g_get_num_sms(int device);
 int g_get_smem_max(int device);
 
+// m==1 GEMV path selection: 1 = CUDA-core __hfma2 (CORE), 0 = tensor-core mma. Probed once per
+// device (cudaMalloc during the probe, so it is skipped and left undecided during graph capture)
+// and forced by EXL3_GEMV_CORE=0/1 where the cc 7.5 gate allows. See exl3_gemv_core.cu.
+int g_get_gemv_core(int device);
+// The cached decision (-1 undecided, 0 mma, 1 CORE) without probing. Used by the launch path to
+// consult a pre-warmed decision during graph capture without triggering an allocation.
+int g_get_gemv_core_cached(int device);
+
 void prepare_ctx(int device);
