@@ -14,23 +14,40 @@ SM75_DEFAULTS = {
 
 _cc_cache = {}
 
-def _capability(device) -> tuple[int, int]:
+def _device_index(device) -> int:
     if device is None:
-        idx = torch.cuda.current_device()
+        return torch.cuda.current_device()
     elif isinstance(device, torch.Tensor):
-        idx = device.device.index
+        return device.device.index
     elif isinstance(device, torch.device):
-        idx = device.index if device.index is not None else torch.cuda.current_device()
+        return device.index if device.index is not None else torch.cuda.current_device()
     elif isinstance(device, str):
         d = torch.device(device)
-        idx = d.index if d.index is not None else torch.cuda.current_device()
+        return d.index if d.index is not None else torch.cuda.current_device()
     else:
-        idx = int(device)
+        return int(device)
+
+
+def _capability(device) -> tuple[int, int]:
+    idx = _device_index(device)
     cc = _cc_cache.get(idx)
     if cc is None:
         cc = torch.cuda.get_device_capability(idx) if torch.version.cuda else (0, 0)
         _cc_cache[idx] = cc
     return cc
+
+
+def _gemv_core(device) -> int:
+    # Per-device probe owned by the extension: 1 means the CUDA-core inner loop was selected, i.e.
+    # the part has no usable tensor cores (sm_75 GeForce / TU117). Reused here rather than adding a
+    # second heuristic. The extension caches the decision; it is resolved on the first uncaptured
+    # call, so callers may transiently see 0 while a graph capture is in progress.
+    try:
+        idx = _device_index(device)
+        from ..ext import exllamav3_ext as ext
+        return 1 if ext.g_get_gemv_core(idx) == 1 else 0
+    except Exception:
+        return 0
 
 
 def turing_flag(name: str, device = None) -> int:
@@ -46,4 +63,12 @@ def turing_flag(name: str, device = None) -> int:
             return 0 if env.strip().lower() in ("", "false", "off", "no") else 1
     if not torch.cuda.is_available():
         return 0
-    return SM75_DEFAULTS.get(name, 0) if _capability(device) == (7, 5) else 0
+    if _capability(device) != (7, 5):
+        return 0
+    default = SM75_DEFAULTS.get(name, 0)
+    if name == "FA75" and default:
+        # fa75 emits mma.sync.m16n8k8; sm_75 parts without usable tensor cores (TU117 / GeForce
+        # GTX 16-series) run those on the CUDA cores, where fa75 is slower than the SDPA path.
+        if _gemv_core(device) == 1:
+            return 0
+    return default
