@@ -78,7 +78,26 @@ class InferParams:
             if device.type == "cuda" and device.index is not None:
                 from ..ext import exllamav3_ext as ext
                 K_thr = ext.exl3_gemv_int8_max_k(device.index) + 1
+        # On devices where the per-device probe routes the m <= 8 GEMV to the CUDA cores (sm_75
+        # GeForce, see g_get_gemv_core), the separate GEMV kernels beat the fused MGEMM at every
+        # decode shape -- the int8-based fusion policy above does not apply. Unfuse there; the
+        # probe returns 0 on sm_80+, so those keep the previous behavior.
+        if device is not None and self._gemv_core(device):
+            return False
         return K >= K_thr or (self.mgemm_n_threshold > 0 and out_features < self.mgemm_n_threshold)
+
+    def _gemv_core(self, device) -> bool:
+        # True when the per-device GEMV probe selected the CUDA-core inner loop. Safe during load;
+        # the C++ side caches the decision per device after the first query.
+        try:
+            import torch
+            d = torch.device(device)
+            if d.type != "cuda" or d.index is None:
+                return False
+            from ..ext import exllamav3_ext as ext
+            return ext.g_get_gemv_core(d.index) == 1
+        except Exception:
+            return False
 
 
 class NullConfig:

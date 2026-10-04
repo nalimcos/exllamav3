@@ -43,7 +43,7 @@ static int exl3_gemv_env_smem()
 
 // -1: not eligible, 0: narrow config, 1: wide config. narrow_coresident = number of narrow-config
 // blocks that fit on the device at once (its grid is one block per 32 output columns)
-static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident)
+static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident, bool core)
 {
     if (mode == 0) return -1;
     if (K < 2 || K > 4) return -1;
@@ -54,6 +54,11 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
     if (mode == 2) return size_n <= 8192 ? 0 : 1;
     if (mode == 3) return 0;   // testing: force narrow config
     if (mode == 4) return 1;   // testing: force wide config
+
+    // CUDA-core GEMV (sm_75 GeForce, g_get_gemv_core): the emulated-mma GEMM is several times
+    // slower at every m <= 8 decode shape, so the Ampere-tuned envelope below does not apply.
+    // Accept anything the hard constraints allowed, keeping the config/grid split.
+    if (core) return size_n <= 8192 ? 0 : 1;
 
     // The narrow config wins (up to ~30%) whenever its grid fits in a single co-resident wave;
     // in the 1..2-wave zone the trailing partial wave costs more than the kernel gains unless
@@ -184,7 +189,7 @@ bool exl3_gemv_try_launch
 
     // Shape heuristic: a half-integer rate K + 0.5 is handled like the integer rate above it (its tile is
     // between the two in bytes; unmeasured, so it inherits the K + 1 envelope)
-    int cfg = exl3_gemv_cfg(cc, size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident);
+    int cfg = exl3_gemv_cfg(cc, size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident, core);
     if (cfg < 0) return false;
 
     void* kernel = cfg == 0 ? narrow_kernel : select(cfg);
