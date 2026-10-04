@@ -193,9 +193,12 @@ template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bo
 __global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
 void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 {
-    static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
-                  "exl3_gemv_kernel supports 2, 3 and 4 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
-    static_assert(!CORE || MMODE == 0, "exl3_gemv_kernel CORE path is the m == 1 GEMV");
+    static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits >= 2 && bits <= 5),
+                  "exl3_gemv_kernel supports 2, 3, 4 and 5 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
+    static_assert(!CORE || MMODE <= 1, "exl3_gemv_kernel CORE path covers MMODE 0 and 1");
+    // 5 bpw tiles are 40 uint32, more than one warp load covers, so the tile is staged through
+    // shared memory (the shuffle extraction has no lane->word mapping for a 40-word tile).
+    static_assert(bits != 5 || SMEM_STAGE, "5 bpw GEMV requires SMEM_STAGE");
     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
     constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
     constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
@@ -206,8 +209,12 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
     constexpr int TWORDS = HALF ? 4 * (2 * bits + 1) : 8 * bits;              // uint32 per 16x16 tile
     constexpr bool TWO_PER_LOAD = HALF ? bits == 1 : bits == 2;               // two tiles per warp load
-    constexpr int LOADS = TWO_PER_LOAD ? WNT / 2 : WNT;                       // warp loads per k-slice
+    // 5 bpw: a tile is 40 uint32 and one warp load covers 32, so it takes two loads per tile (the
+    // second one only lanes 0..7, the remaining 24 lanes load 0). The staging slot stays
+    // contiguous - load 2t+lane and 32+lane land at word lane and word 32+lane of the tile.
+    constexpr int LOADS = bits == 5 ? 2 * WNT : (TWO_PER_LOAD ? WNT / 2 : WNT);   // warp loads per k-slice
     constexpr int LSTRIDE = TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 ? TWORDS : 32);   // uint32 per load (lanes < LSTRIDE load)
+    constexpr int TSTRIDE = bits == 5 ? 2 * LSTRIDE : TWORDS;                 // uint32 per tile in the staging area
     static_assert(!TWO_PER_LOAD || WNT % 2 == 0, "two tiles per warp load needs an even tile count per warp");
 
     auto grid = cooperative_groups::this_grid();
@@ -298,7 +305,15 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         // Prefetch ring (indices must be compile-time or pf lands in local memory)
         auto ld_b = [&] (int i, int l) -> uint32_t
         {
-            if constexpr (LSTRIDE < 32)
+            if constexpr (bits == 5)
+            {
+                // Two loads per tile: even l covers words lane (0..31), odd l covers word 32+lane
+                // from lanes 0..7 only. Guarding the odd load keeps the last tile of B in bounds.
+                const int half = l & 1;
+                if (half && lane >= 8) return 0;
+                return __ldcs(bp + (size_t) i * slice_stride + (size_t) (l >> 1) * TWORDS + half * 32);
+            }
+            else if constexpr (LSTRIDE < 32)
                 return lane < LSTRIDE ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
             else
                 return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
@@ -314,6 +329,11 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
         FragC_h ch[WNT][2] = {};
         float2 acc0[WNT][2] = {};
+        // MMODE 1 CORE: the m-loop generalises the m == 1 inner loop to every row, so each lane
+        // carries a half2 partial and a folded fp32 accumulator per row (unused in the other
+        // configurations, and eliminated by the compiler there).
+        [[maybe_unused]] half2 chm[WNT][2][ROWS] = {};
+        [[maybe_unused]] float accm[WNT][2][ROWS] = {};
 
         for (int ib = 0; ib < myn; ib += PF)
         {
@@ -353,11 +373,36 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             a01[1] = hzero;
             a23[1] = hzero;
 
+            // MMODE 1 CORE: every row's A fragment is loaded once per k-slice and reused across the
+            // n-tiles; rows past size_m read zero so the whole loop stays unguarded.
+            [[maybe_unused]] FragB ar01[ROWS], ar23[ROWS];
+            if constexpr (CORE && MMODE == 1)
+            {
+                #pragma unroll
+                for (int r = 0; r < ROWS; ++r)
+                {
+                    const bool ok = r < size_m;
+                    ar01[r][0] = ok ? A2[(size_t) r * (size_k / 2) + a_col] : hzero;
+                    ar23[r][0] = ok ? A2[(size_t) r * (size_k / 2) + a_col + 4] : hzero;
+                    ar01[r][1] = hzero;
+                    ar23[r][1] = hzero;
+                }
+            }
+
             #pragma unroll
             for (int t = 0; t < WNT; ++t)
             {
                 FragB f0, f1;
-                if constexpr (SMEM_STAGE)
+                if constexpr (bits == 5)
+                {
+                    // 5 bpw: the 40-word tile is staged contiguously; read the two dq4 groups the
+                    // GEMM inner kernel also feeds the mma B fragment (exl3_dq.cuh) straight from
+                    // shared memory, no lane->word shuffle exists for a 40-word tile.
+                    const uint32_t* tp = &sh_stage[warp][t * TSTRIDE];
+                    dq4<bits, cb>(tp, lane << 3, f0);
+                    dq4<bits, cb>(tp, (lane << 3) + 4, f1);
+                }
+                else if constexpr (SMEM_STAGE)
                 {
                     const uint32_t* tp = &sh_stage[warp][t * TWORDS];
                     if constexpr (HALF)
@@ -403,13 +448,28 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
                 if constexpr (CORE)
                 {
-                    // CUDA-core dot product, no cross-lane routing. ch[t][f][0] is a half2 whose
-                    // lanes accumulate the even- and odd-k products for column g = lane >> 2
-                    // (f0) / g + 8 (f1): a01[0] pairs k = 2*(lane&3),+1, a23[0] pairs k + 8.
-                    ch[t][0][0] = __hfma2(a01[0], f0[0], ch[t][0][0]);
-                    ch[t][0][0] = __hfma2(a23[0], f0[1], ch[t][0][0]);
-                    ch[t][1][0] = __hfma2(a01[0], f1[0], ch[t][1][0]);
-                    ch[t][1][0] = __hfma2(a23[0], f1[1], ch[t][1][0]);
+                    if constexpr (MMODE == 0)
+                    {
+                        // CUDA-core dot product, no cross-lane routing. ch[t][f][0] is a half2 whose
+                        // lanes accumulate the even- and odd-k products for column g = lane >> 2
+                        // (f0) / g + 8 (f1): a01[0] pairs k = 2*(lane&3),+1, a23[0] pairs k + 8.
+                        ch[t][0][0] = __hfma2(a01[0], f0[0], ch[t][0][0]);
+                        ch[t][0][0] = __hfma2(a23[0], f0[1], ch[t][0][0]);
+                        ch[t][1][0] = __hfma2(a01[0], f1[0], ch[t][1][0]);
+                        ch[t][1][0] = __hfma2(a23[0], f1[1], ch[t][1][0]);
+                    }
+                    else
+                    {
+                        // MMODE 1: same dot product per row against the one dequantized B tile.
+                        #pragma unroll
+                        for (int r = 0; r < ROWS; ++r)
+                        {
+                            chm[t][0][r] = __hfma2(ar01[r][0], f0[0], chm[t][0][r]);
+                            chm[t][0][r] = __hfma2(ar23[r][0], f0[1], chm[t][0][r]);
+                            chm[t][1][r] = __hfma2(ar01[r][0], f1[0], chm[t][1][r]);
+                            chm[t][1][r] = __hfma2(ar23[r][0], f1[1], chm[t][1][r]);
+                        }
+                    }
                 }
                 else
                 {
@@ -420,38 +480,79 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
             if ((d + 1) % FOLD == 0 || i + 1 == myn)
             {
-                #pragma unroll
-                for (int t = 0; t < WNT; ++t)
+                if constexpr (CORE && MMODE == 1)
+                {
                     #pragma unroll
-                    for (int f = 0; f < 2; ++f)
-                    {
-                        acc0[t][f].x += __low2float(ch[t][f][0]);
-                        acc0[t][f].y += __high2float(ch[t][f][0]);
-                        ch[t][f][0] = hzero;
-                    }
+                    for (int t = 0; t < WNT; ++t)
+                        #pragma unroll
+                        for (int f = 0; f < 2; ++f)
+                            #pragma unroll
+                            for (int r = 0; r < ROWS; ++r)
+                            {
+                                accm[t][f][r] += __low2float(chm[t][f][r]) + __high2float(chm[t][f][r]);
+                                chm[t][f][r] = hzero;
+                            }
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int t = 0; t < WNT; ++t)
+                        #pragma unroll
+                        for (int f = 0; f < 2; ++f)
+                        {
+                            acc0[t][f].x += __low2float(ch[t][f][0]);
+                            acc0[t][f].y += __high2float(ch[t][f][0]);
+                            ch[t][f][0] = hzero;
+                        }
+                }
             }
         }
         }
 
         if constexpr (CORE)
         {
-            // CORE accumulated even/odd-k partials for column g = lane >> 2 (frag 0) and g + 8
-            // (frag 1); lane&3 selects the k-pair, so reduce the four lanes of each group.
-            #pragma unroll
-            for (int t = 0; t < WNT; ++t)
+            if constexpr (MMODE == 0)
             {
-                float v0 = acc0[t][0].x + acc0[t][0].y;
-                float v1 = acc0[t][1].x + acc0[t][1].y;
-                v0 += __shfl_xor_sync(0xffffffffu, v0, 1);
-                v0 += __shfl_xor_sync(0xffffffffu, v0, 2);
-                v1 += __shfl_xor_sync(0xffffffffu, v1, 1);
-                v1 += __shfl_xor_sync(0xffffffffu, v1, 2);
-                if ((lane & 3) == 0)
+                // CORE accumulated even/odd-k partials for column g = lane >> 2 (frag 0) and g + 8
+                // (frag 1); lane&3 selects the k-pair, so reduce the four lanes of each group.
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
                 {
-                    const int g = lane >> 2;
-                    sh_red[warp][0][t * 16 + g] = v0;
-                    sh_red[warp][0][t * 16 + g + 8] = v1;
+                    float v0 = acc0[t][0].x + acc0[t][0].y;
+                    float v1 = acc0[t][1].x + acc0[t][1].y;
+                    v0 += __shfl_xor_sync(0xffffffffu, v0, 1);
+                    v0 += __shfl_xor_sync(0xffffffffu, v0, 2);
+                    v1 += __shfl_xor_sync(0xffffffffu, v1, 1);
+                    v1 += __shfl_xor_sync(0xffffffffu, v1, 2);
+                    if ((lane & 3) == 0)
+                    {
+                        const int g = lane >> 2;
+                        sh_red[warp][0][t * 16 + g] = v0;
+                        sh_red[warp][0][t * 16 + g + 8] = v1;
+                    }
                 }
+            }
+            else
+            {
+                // MMODE 1: per-row reduction over the four k-pair lanes, same lane->column map.
+                #pragma unroll
+                for (int r = 0; r < ROWS; ++r)
+                    #pragma unroll
+                    for (int t = 0; t < WNT; ++t)
+                    {
+                        float v0 = accm[t][0][r];
+                        float v1 = accm[t][1][r];
+                        v0 += __shfl_xor_sync(0xffffffffu, v0, 1);
+                        v0 += __shfl_xor_sync(0xffffffffu, v0, 2);
+                        v1 += __shfl_xor_sync(0xffffffffu, v1, 1);
+                        v1 += __shfl_xor_sync(0xffffffffu, v1, 2);
+                        if ((lane & 3) == 0)
+                        {
+                            const int g = lane >> 2;
+                            sh_red[warp][r][t * 16 + g] = v0;
+                            sh_red[warp][r][t * 16 + g + 8] = v1;
+                        }
+                    }
             }
         }
         else

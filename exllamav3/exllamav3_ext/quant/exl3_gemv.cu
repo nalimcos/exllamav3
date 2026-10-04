@@ -46,7 +46,7 @@ static int exl3_gemv_env_smem()
 static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident, bool core)
 {
     if (mode == 0) return -1;
-    if (K < 2 || K > 4) return -1;
+    if (K < 2 || K > 5) return -1;
     if (K != 4 && cb == 0) return -1;
     if (size_m > EXL3_GEMV_MAX_M) return -1;
     if (size_k % 128 || size_n % 128) return -1;
@@ -86,16 +86,29 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
         SEL(bits_, cb_, false, 1, 0, sm_, false) SEL(bits_, cb_, false, 1, 1, sm_, false) \
         SEL(bits_, cb_, true,  0, 0, sm_, false) SEL(bits_, cb_, true,  0, 1, sm_, false) \
         SEL(bits_, cb_, true,  1, 0, sm_, false) SEL(bits_, cb_, true,  1, 1, sm_, false)
-    // CORE (CUDA-core __hfma2) instances exist only for the m == 1 GEMV (MMODE 0)
+    // CORE (CUDA-core __hfma2) instances: MMODE 0 is the m == 1 GEMV, MMODE 1 the 2 <= m <= 8 M-loop
     #define SEL_GRID_CORE(bits_, cb_, sm_) \
         SEL(bits_, cb_, false, 0, 0, sm_, true) SEL(bits_, cb_, false, 0, 1, sm_, true) \
         SEL(bits_, cb_, true,  0, 0, sm_, true) SEL(bits_, cb_, true,  0, 1, sm_, true)
+    #define SEL_GRID_CORE_M1(bits_, cb_, sm_) \
+        SEL(bits_, cb_, false, 1, 0, sm_, true) SEL(bits_, cb_, false, 1, 1, sm_, true) \
+        SEL(bits_, cb_, true,  1, 0, sm_, true) SEL(bits_, cb_, true,  1, 1, sm_, true)
     SEL_GRID(4, 0, false) SEL_GRID(4, 1, false) SEL_GRID(4, 2, false)
     SEL_GRID(2, 1, false) SEL_GRID(2, 2, false) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
     SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
     SEL_GRID_CORE(4, 0, false) SEL_GRID_CORE(4, 1, false) SEL_GRID_CORE(4, 2, false)
     SEL_GRID_CORE(2, 1, false) SEL_GRID_CORE(2, 2, false) SEL_GRID_CORE(2, 1, true) SEL_GRID_CORE(2, 2, true)
     SEL_GRID_CORE(3, 1, false) SEL_GRID_CORE(3, 2, false) SEL_GRID_CORE(3, 1, true) SEL_GRID_CORE(3, 2, true)
+    // 5 bpw: 40-word tiles require the shared-memory staging path (SMEM_STAGE true), so only those
+    // instances exist. Used from the CUDA-core GEMV (sm_75 GeForce, see exl3_gemv_try_launch).
+    SEL_GRID(5, 1, true) SEL_GRID(5, 2, true)
+    SEL_GRID_CORE(5, 1, true) SEL_GRID_CORE(5, 2, true)
+    // CORE MMODE 1 (2 <= m <= 8), same (bits, cb, smem) coverage the shape heuristic can select
+    SEL_GRID_CORE_M1(4, 0, false) SEL_GRID_CORE_M1(4, 1, false) SEL_GRID_CORE_M1(4, 2, false)
+    SEL_GRID_CORE_M1(2, 1, false) SEL_GRID_CORE_M1(2, 2, false)
+    SEL_GRID_CORE_M1(3, 1, false) SEL_GRID_CORE_M1(3, 2, false)
+    SEL_GRID_CORE_M1(5, 1, true) SEL_GRID_CORE_M1(5, 2, true)
+    #undef SEL_GRID_CORE_M1
     #undef SEL_GRID_CORE
     #undef SEL_GRID
     #undef SEL
@@ -128,7 +141,7 @@ bool exl3_gemv_try_launch
     }
     else
     {
-        if (K < 2 || K > 4) return false;
+        if (K < 2 || K > 5) return false;
         if (K != 4 && cb == 0) return false;
     }
     if (size_m > EXL3_GEMV_MAX_M) return false;
@@ -141,25 +154,29 @@ bool exl3_gemv_try_launch
     int mmode = size_m == 1 ? 0 : 1;
     int num_sms = DevCtx::instance().get_num_sms(device);
 
-    // m == 1 only: pick the CUDA-core __hfma2 inner loop on devices where the probe found it
+    // Device decision: pick the CUDA-core __hfma2 inner loop on devices where the probe found it
     // faster (sm_75 GeForce). During graph capture the decision must already be cached - probing
     // calls cudaMalloc, which is illegal there - so an uncached decision falls back to mma without
     // being cached, and the captured node keeps the mma kernel.
-    bool core = false;
-    if (mmode == 0)
+    bool core_dev = false;
     {
         int cached = g_get_gemv_core_cached(device);
         if (cached >= 0)
         {
-            core = cached == 1;
+            core_dev = cached == 1;
         }
         else
         {
             cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
             if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess) cudaGetLastError();
-            else if (capture == cudaStreamCaptureStatusNone) core = g_get_gemv_core(device) == 1;
+            else if (capture == cudaStreamCaptureStatusNone) core_dev = g_get_gemv_core(device) == 1;
         }
     }
+    // 5 bpw tiles only exist as smem-staged instances on the CUDA-core path; leave sm_80+ (and the
+    // tensor-core mma path) byte-identical by declining them there, as before.
+    if (K == 5 && !core_dev) return false;
+    // CORE (CUDA-core __hfma2): the m == 1 GEMV (MMODE 0) and the 2 <= m <= 8 M-loop (MMODE 1)
+    bool core = core_dev;
 
     // Cooperative launch: grids are capped at full co-residency (cached per kernel), and the
     // narrow config's co-residency also feeds the shape heuristic
@@ -175,8 +192,9 @@ bool exl3_gemv_try_launch
         return blocks_per_sm;
     };
 
-    // Extraction style: shuffle by default, smem staging selectable per call for evaluation
-    bool smem = exl3_gemv_env_smem() == 1;
+    // Extraction style: shuffle by default, smem staging selectable per call for evaluation.
+    // 5 bpw always stages (a 40-word tile has no lane->word shuffle mapping).
+    bool smem = K == 5 || exl3_gemv_env_smem() == 1;
 
     auto select = [&] (int cfg_) -> void*
     {

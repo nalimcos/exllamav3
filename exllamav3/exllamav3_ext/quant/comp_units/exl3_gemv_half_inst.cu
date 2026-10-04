@@ -16,16 +16,23 @@ void* exl3_gemv_select_kernel_half(int bits, bool c_fp32, int mmode, int cfg, bo
         SEL(bits_, false, 1, 0, sm_, false) SEL(bits_, false, 1, 1, sm_, false) \
         SEL(bits_, true,  0, 0, sm_, false) SEL(bits_, true,  0, 1, sm_, false) \
         SEL(bits_, true,  1, 0, sm_, false) SEL(bits_, true,  1, 1, sm_, false)
-    // CORE (CUDA-core __hfma2) instances exist only for the m == 1 GEMV (MMODE 0)
+    // CORE (CUDA-core __hfma2) instances: MMODE 0 is the m == 1 GEMV, MMODE 1 the 2 <= m <= 8 M-loop
     #define SEL_GRID_CORE(bits_, sm_) \
         SEL(bits_, false, 0, 0, sm_, true) SEL(bits_, false, 0, 1, sm_, true) \
         SEL(bits_, true,  0, 0, sm_, true) SEL(bits_, true,  0, 1, sm_, true)
+    #define SEL_GRID_CORE_M1(bits_, sm_) \
+        SEL(bits_, false, 1, 0, sm_, true) SEL(bits_, false, 1, 1, sm_, true) \
+        SEL(bits_, true,  1, 0, sm_, true) SEL(bits_, true,  1, 1, sm_, true)
     SEL_GRID(1, false) SEL_GRID(1, true)
     SEL_GRID(2, false) SEL_GRID(2, true)
     SEL_GRID(3, false) SEL_GRID(3, true)
     SEL_GRID_CORE(1, false) SEL_GRID_CORE(1, true)
     SEL_GRID_CORE(2, false) SEL_GRID_CORE(2, true)
     SEL_GRID_CORE(3, false) SEL_GRID_CORE(3, true)
+    SEL_GRID_CORE_M1(1, false)
+    SEL_GRID_CORE_M1(2, false)
+    SEL_GRID_CORE_M1(3, false)
+    #undef SEL_GRID_CORE_M1
     #undef SEL_GRID_CORE
     #undef SEL_GRID
     #undef SEL
