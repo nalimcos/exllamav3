@@ -200,6 +200,13 @@ def gated_delta_rule_fn(
         k = k.view(bsz, seqlen, -1, k_head_dim)
         v = v.view(bsz, seqlen, -1, v_head_dim)
 
+        # The vendored FLA Triton kernels fail to lower bf16 tl.dot on sm_75 (PTX codegen error), so run
+        # the fp16 kernels and widen the result back; the gated norm only accepts bf16.
+        q = q.half()
+        k = k.half()
+        v = v.half()
+        beta = beta.half()
+
         # (Grouped attn supported in fla-core now)
         recurrent_slots_cpu = get_for_device(params, "recurrent_slots", "cpu", None)
         if recurrent_slots_cpu is None:
@@ -215,7 +222,7 @@ def gated_delta_rule_fn(
                 state.copy_(new_state)
             core_attn_out.append(core_attn)
 
-        core_attn_out = torch.cat(core_attn_out, dim = 0)
+        core_attn_out = torch.cat(core_attn_out, dim = 0).to(torch.bfloat16)
 
     # Fused recurrent rule
     else:

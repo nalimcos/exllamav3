@@ -1568,7 +1568,7 @@ def _paged_attn_prefill_kernel(
         )
     elif NEW_KV == 2:
         # Cache known empty: same structure as the cache path, reading the contiguous source
-        if CAUSAL and not HAS_WINDOW_LEFT and not HAS_WINDOW_RIGHT:
+        if CAUSAL and (not HAS_WINDOW_LEFT and not HAS_WINDOW_RIGHT):
             n_full = tl.maximum(((q_abs_min + 1) // BLOCK_N) * BLOCK_N, 0)
             acc, m, l = _paged_attn_prefill_inner(
                 q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
@@ -1589,7 +1589,7 @@ def _paged_attn_prefill_kernel(
                 n_kv_heads, page_size, head_dim, HD_PAD, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
                 True, True, BLOCK_N,
             )
-    elif CAUSAL and not HAS_WINDOW_LEFT and not HAS_WINDOW_RIGHT:
+    elif CAUSAL and (not HAS_WINDOW_LEFT and not HAS_WINDOW_RIGHT):
         n_full = tl.maximum(((q_abs_min + 1) // BLOCK_N) * BLOCK_N, 0)
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,

@@ -9,6 +9,17 @@ from ...ext import exllamav3_ext as ext
 MAX_CUDA_SEQLEN = 32
 MAX_CUDA_K = 16
 
+# Pre-Ampere (capability major < 8) parts have no bf16 tensor cores and lower the Triton slotted conv
+# poorly, so the register-resident CUDA-ext conv wins at any length there. Ampere and later keep the
+# existing short-sequence-only behavior. Capability is constant per device, so cache the probe.
+_pre_ampere_conv_ext = None
+
+def _conv_ext_any_seqlen() -> bool:
+    global _pre_ampere_conv_ext
+    if _pre_ampere_conv_ext is None:
+        _pre_ampere_conv_ext = torch.cuda.get_device_capability()[0] < 8
+    return _pre_ampere_conv_ext
+
 import triton
 import triton.language as tl
 
@@ -425,7 +436,7 @@ def causal_conv1d_update(
     if (
         not token_major and
         mixed_qkv.is_cuda and
-        seqlen <= MAX_CUDA_SEQLEN and
+        (seqlen <= MAX_CUDA_SEQLEN or _conv_ext_any_seqlen()) and
         conv1d_weight.shape[-1] <= MAX_CUDA_K and
         mixed_qkv.dtype == torch.bfloat16 and
         conv_state.dtype == torch.bfloat16 and
