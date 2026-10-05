@@ -14,6 +14,7 @@ from .triton_paged import (
     fn_triton_paged_attn_decode,
     fn_triton_paged_attn_prefill,
     fn_triton_varlen_attn,
+    fn_fa75_decode_qc,
     fn_triton_paged_attn_decode_qc,
     fn_triton_paged_attn_prefill_qc,
     fn_triton_attn_nocache,
@@ -33,6 +34,7 @@ _fns_triton_fast: list[AttnFn] = [
 # would silently attend over just the new K/V rows and ignore the cached context, so quant-direct calls only
 # ever dispatch over the qc-aware functions
 _fns_qc: list[AttnFn] = [
+    fn_fa75_decode_qc,
     fn_triton_paged_attn_decode_qc,
     fn_triton_paged_attn_prefill_qc,
 ]

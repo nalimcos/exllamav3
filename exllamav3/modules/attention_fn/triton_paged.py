@@ -8,6 +8,8 @@ import triton.language as tl
 
 from .common import AttnArgs, get_non_causal_span_arglist
 from .smem import pick_config, shared_bytes, tile_ladder, halving_ladder
+from ...ext import exllamav3_ext as ext
+from ...util.turing import turing_flag
 
 
 def _is_power_of_2(x: int) -> bool:
@@ -2317,6 +2319,91 @@ def fn_triton_varlen_attn(args: AttnArgs) -> torch.Tensor | None:
         softcap=args.softcap,
         sinks=args.sinks,
         sink_key0=args.sink_key0,
+    )
+
+
+def paged_attn_fa75_decode_qc(
+    q, k_cache, k_scales, v_cache, v_scales, block_table, cache_seqlens,
+    n_q_heads, n_kv_heads, max_kv_len, softmax_scale, num_splits = None,
+):
+    """Launch the sm_75 CUDA-core decode kernel for the packed 4-bit cache (q_len == 1, head_dim 256,
+    GQA 8), then reduce split partials with the Triton combine kernel. Mirrors paged_attn_triton_decode's
+    split sizing so the partial layout matches what the combine kernel expects."""
+    bsz, q_len, _, head_dim = q.shape
+    assert q_len == 1 and head_dim == 256 and n_q_heads // n_kv_heads == 8
+    page_size = 256
+    num_pages_per_seq = block_table.shape[1]
+    kv_append_len = q_len
+
+    max_k_len = num_pages_per_seq * page_size + kv_append_len
+    if max_kv_len is not None:
+        max_k_len = min(max_k_len, max_kv_len + kv_append_len)
+
+    programs = bsz * n_kv_heads
+    sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    target = 2 * sm_count
+    block_n = 32
+    if num_splits is None:
+        splits = max(1, min(target // programs, triton.cdiv(max_k_len, block_n), 128))
+    else:
+        splits = int(num_splits)
+
+    out = torch.empty_like(q)
+    if splits > 1:
+        partial_o = torch.empty(programs * splits * 8 * head_dim, dtype=torch.float32, device=q.device)
+        partial_ml = torch.empty(programs * splits * 8 * 2, dtype=torch.float32, device=q.device)
+    else:
+        partial_o = out
+        partial_ml = out
+
+    ext.fa75_decode_qc(
+        q, k_cache, k_scales, v_cache, v_scales, block_table, cache_seqlens,
+        out, partial_o, partial_ml,
+        splits, max_k_len, num_pages_per_seq, kv_append_len, float(softmax_scale), True,
+    )
+
+    if splits > 1:
+        h32 = _get_h32(q.device)
+        rows_sub, d_sub = combine_subtiles(8, head_dim)
+        _paged_attn_decode_combine_kernel[(programs, (8 // rows_sub) * (head_dim // d_sub))](
+            partial_o, partial_ml, out, h32,
+            splits, partial_ml,
+            1, False, 1, n_q_heads, n_kv_heads, head_dim, head_dim, head_dim,
+            1, 8, 8, rows_sub, d_sub,
+            num_warps = 4, num_stages = 1,
+        )
+    return out
+
+
+def fn_fa75_decode_qc(args: AttnArgs) -> torch.Tensor | None:
+    if (
+        turing_flag("FA75_DECODE", args.q.device) == 0 or
+        args.q_cache is None or
+        args.q_len != 1 or
+        args.dim != 256 or
+        args.q.dtype != torch.float16 or
+        not args.q.is_contiguous() or
+        args.causal is not True or
+        args.is_swa() or
+        args.softcap != 0.0 or
+        args.sinks is not None or
+        args.non_causal_spans is not None or
+        args.num_q_heads // args.num_kv_heads != 8 or
+        args.num_kv_heads == 0
+    ):
+        return None
+    qk, sk, qv, sv, k_bits, v_bits = args.q_cache
+    if k_bits != 4 or v_bits != 4:
+        return None
+    return paged_attn_fa75_decode_qc(
+        q = args.q,
+        k_cache = qk, k_scales = sk, v_cache = qv, v_scales = sv,
+        block_table = args.block_table,
+        cache_seqlens = args.cache_seqlens,
+        n_q_heads = args.num_q_heads,
+        n_kv_heads = args.num_kv_heads,
+        max_kv_len = args.max_kv_len,
+        softmax_scale = args.sm_scale,
     )
 
 

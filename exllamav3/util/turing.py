@@ -10,6 +10,7 @@ import torch
 SM75_DEFAULTS = {
     "SDPA_PREFILL": 1,    # prefill attention on the dequantized window (PyTorch SDPA / fa75), not the packed cache
     "FA75": 1,            # flash-attention prefill kernel for head_dim 256 (needs SDPA_PREFILL)
+    "FA75_DECODE": 1,     # CUDA-core flash-decode kernel for the packed 4-bit cache (q_len == 1, head_dim 256, GQA 8)
 }
 
 _cc_cache = {}
