@@ -35,6 +35,29 @@ BATCH_RECON = os.environ.get("EXL3_MOE_BATCH_RECON", "1") != "0"
 # launch
 MTILE = os.environ.get("EXL3_MOE_MTILE", "1") != "0"
 MTILE_T1, MTILE_T2 = 16, 32
+
+
+def _moe_gemm_core(device):
+    """True when the fused MoE's inner GEMM runs the sm_75 CUDA-core (__hfma2) instance.
+
+    EXL3_MOE_GEMM_CORE=1 selects it, "auto" follows the CUDA-core GEMV probe (no usable tensor
+    cores, i.e. GTX 16-series), anything else (including unset) leaves it off. Only used to skip
+    the wide-row tier split, which exists only for the mma instances; the host makes the actual
+    kernel selection. Unset is off because the CORE kernel, while numerically matching the mma
+    one, makes greedy decode non-reproducible run to run; see the host comment.
+    """
+    env = os.environ.get("EXL3_MOE_GEMM_CORE")
+    if env == "1":
+        return True
+    if env != "auto":
+        return False
+    try:
+        from exllamav3.ext import exllamav3_ext as ext
+        return ext.g_get_gemv_core(torch.device(device).index) == 1
+    except Exception:
+        return False
+
+
 # Fused-kernel row capacity per expert when the wide tiles apply: with them the fused kernel
 # beats the batched reconstruct tier up to 256 rows (Qwen3.8 4k chunk: 128 -> 256 rows +3%)
 FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
@@ -482,6 +505,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.bc_sh_exp = False
         self.fused_mode_buffers = None
         self.mtile_ok = False
+        self.moe_gemm_core = False
         self.fused_rows = TEMP_ROWS_FUSED
         self.batch_recon = None
         self._cpu_init_state()
@@ -738,6 +762,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             # N = 256 instance for the <= 16-row launch only (it is the faster 16-row tiling)
             if self.support_fused:
                 self.mtile_ok = MTILE and bool(self.multi_up.mul1)
+                # Wide row tiles are mma-only: on a CORE device the fused tier runs as one
+                # 16-row launch (the host selects the CORE instance and ignores m_tile). The row
+                # capacity stays at FUSED_ROWS_WIDE so the tier boundaries are unchanged.
+                self.moe_gemm_core = _moe_gemm_core(device)
                 self.fused_rows = FUSED_ROWS_WIDE if self.mtile_ok else TEMP_ROWS_FUSED
                 R = self.fused_rows
                 C = ext.exl3_moe_max_concurrency(torch.device(device).index)
@@ -1262,7 +1290,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         counts = [c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows]
                         t1 = sum(1 for c in counts if MTILE_T1 < c <= MTILE_T2)
                         t2 = sum(1 for c in counts if c > MTILE_T2)
-                        if self.mtile_ok and (t1 or t2):
+                        if self.mtile_ok and not self.moe_gemm_core and (t1 or t2):
                             # One launch per row tile over its expert range, largest first
                             t0 = len(counts) - t1 - t2
                             if t2:

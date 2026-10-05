@@ -11,6 +11,22 @@ namespace cg = cooperative_groups;
 #include "bits_k.cuh"
 #include "exl3_devctx.cuh"
 #include <set>
+#include <cstring>
+
+// EXL3_MOE_GEMM_CORE: the fused MoE's inner GEMM. "1" selects the sm_75 CUDA-core (__hfma2)
+// inner loop, "0" the emulated-mma one, "auto" follows the CUDA-core GEMV probe (the same
+// GTX 16-series parts the decode path avoids the mma on). Unset is "0": the CORE kernel matches
+// the mma one numerically (<= 1e-4 relative RMS on the first MoE layer) and is 1.3-1.5x faster
+// on the MoE term (+10.5% prefill at chunk 4096), but greedy decode is not reproducible run to
+// run with it enabled while both mma tilings are, so it stays opt-in until that is understood.
+// The env is read per call (the probe itself is cached) so a process can A/B the two paths.
+static int moe_core_enabled(int device)
+{
+    const char* env = std::getenv("EXL3_MOE_GEMM_CORE");
+    if (env && std::strcmp(env, "1") == 0) return 1;
+    if (env && std::strcmp(env, "auto") == 0) return g_get_gemv_core(device) == 1;
+    return 0;
+}
 
 int exl3_moe_max_concurrency(int device)
 {
@@ -311,7 +327,15 @@ void exl3_moe
     int N_off = 0;
     if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0 && moe_tile_n_override() != 128) N_off = 1;
     fp_exl3_moe_kernel kernel;
-    if (m_tile <= 16)
+    // CUDA-core inner GEMM: a single 16-row, N = 128, mul1 instance that dispatches the bitrate
+    // at runtime, so it covers every rate and row tier the mma instances split across. m_tile
+    // is not consulted on this path (the instance is compiled for the 16-row tile)
+    const bool core = moe_core_enabled(device) != 0 && cb_idx == 1;
+    if (core)
+    {
+        kernel = exl3_moe_kernel_core_n128_cb2();
+    }
+    else if (m_tile <= 16)
     {
         kernel = half_k ? exl3_moe_kernel_instances_h[2 * (K - 1) + N_off]
                         : exl3_moe_kernel_instances[4 * K + 2 * cb_idx + N_off];

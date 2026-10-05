@@ -41,6 +41,11 @@ EXL3_MOE_DECLARE_MTILE_GETTERS(8);
 
 #undef EXL3_MOE_DECLARE_MTILE_GETTERS
 
+// CUDA-core inner GEMM (sm_75 GeForce, no usable tensor cores): a 16-row, N = 128, mul1
+// instance whose GEMMs run on __hfma2 instead of the emulated mma. It dispatches the bitrate at
+// runtime, so one instance covers every rate the MoE can carry. EXL3_MOE_GEMM_CORE gates it.
+fp_exl3_moe_kernel exl3_moe_kernel_core_n128_cb2();
+
 // Half-integer rates K + 0.5 (exl3_moe_inst_h{K}_*.cu), mul1 codebook only
 #define EXL3_MOE_DECLARE_HALF_GETTERS(K) \
     fp_exl3_moe_kernel exl3_moe_kernel_h##K##_n128_cb2(); \

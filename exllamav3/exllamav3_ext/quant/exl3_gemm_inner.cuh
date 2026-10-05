@@ -26,7 +26,13 @@
 // is the fused-MoE prefill shape (32 / 64 rows per tile): TILEBLOCKS_M row fragments share each
 // dequantized B fragment instead of re-running the whole B pipeline per 16 rows, with A
 // single-buffered so the row fragments fit alongside the prefetched B fragments.
-template<EXL3_GEMM_T_ARGS, bool shmem_out_had>
+//
+// CORE selects the sm_75 CUDA-core inner loop instead of the (emulated) tensor-core mma: the
+// dequantized B fragment is consumed by packed __hfma2 instead of ptx_mma_m16n8k16. It is only
+// instantiated for the fused-MoE 16-row tile (TILESIZE_M == 16, TILEBLOCKS_M == 1) and fp16
+// output, which is the only shape the MoE host ever asks for; every other instantiation keeps
+// CORE = false and is byte-for-byte the previous kernel.
+template<EXL3_GEMM_T_ARGS, bool shmem_out_had, bool CORE = false>
 inline __device__
 void exl3_gemm_kernel_inner
 (
@@ -71,6 +77,12 @@ void exl3_gemm_kernel_inner
     static_assert(TILESIZE_M >= 16 && TILESIZE_M % 16 == 0, "Invalid kernel params");
     static_assert(TILESIZE_K % 16 == 0, "Invalid kernel params");
     static_assert(TILESIZE_N % 128 == 0, "Invalid kernel params");
+    // CORE is the sm_75 CUDA-core MoE inner loop: one 16-row tile, fp16 output, k-tile of 32
+    // (the A-tile XOR swizzle below is written for 8-half rows), no fused output hadamard
+    static_assert(!CORE || TILESIZE_M == 16, "CORE inner GEMM requires the 16-row tile");
+    static_assert(!CORE || TILESIZE_K == 32, "CORE inner GEMM requires TILESIZE_K = 32");
+    static_assert(!CORE || !c_fp32, "CORE inner GEMM writes fp16 output");
+    static_assert(!CORE || !shmem_out_had, "CORE inner GEMM has no fused output hadamard");
     static_assert
     (
         SMEM_MAX >= SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size,
@@ -233,6 +245,17 @@ void exl3_gemm_kernel_inner
         register FragC_h frag_c_h[TILEBLOCKS_M][FRAGS_N_PER_WARP];
     #endif
 
+    // CORE accumulators: per (8-column block, tile row) one fp16 k-partial half2 plus the fp32
+    // folded sum. Sized 1 when CORE is off so the arrays are eliminated in every other
+    // instantiation. core_a_ptr is the shared A tile the CORE matmul reads from (stashed in
+    // load_frags, which for CORE runs immediately before matmul with FRAG_STAGES == 1).
+    constexpr int CORE_NB = CORE ? FRAGS_N_PER_WARP : 1;
+    constexpr int CORE_NR = CORE ? 16 : 1;
+    register half2 core_ch[CORE_NB][CORE_NR];
+    register float core_acc[CORE_NB][CORE_NR];
+    const half* core_a_ptr = nullptr;
+    int core_fold = 0;
+
     auto advance2 = [&] ()
     {
         slice2_k++;
@@ -298,6 +321,7 @@ void exl3_gemm_kernel_inner
         if (!slice1_iters) return;
 
         // A fragments (XOR-swizzled shared memory layout)
+        if constexpr (!CORE)
         {
             int r = (lane_id % 8) + 8 * ((lane_id / 8) % 2);
             int base_c = lane_id / 16 + sub_k * 2;
@@ -308,6 +332,13 @@ void exl3_gemm_kernel_inner
                 int c_swizzled = base_c ^ ((R >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
                 ldsm4(frag_a[TILEBLOCKS_M == 1 ? buf : m], (int4*) sh1_a_ptr + R * A_COLS + c_swizzled);
             }
+        }
+        else
+        {
+            // CORE reads A straight from the shared tile in matmul. Hand it the stage this
+            // fragment load is about to advance past (FRAG_STAGES == 1 for CORE, so matmul runs
+            // on this same k-tile immediately afterwards)
+            core_a_ptr = sh1_a_ptr;
         }
 
         // B fragments
@@ -327,6 +358,19 @@ void exl3_gemm_kernel_inner
     // Clear C fragments
     auto clear_frag_c = [&] ()
     {
+        if constexpr (CORE)
+        {
+            #pragma unroll
+            for (int b = 0; b < FRAGS_N_PER_WARP; ++b)
+                #pragma unroll
+                for (int r = 0; r < 16; ++r)
+                {
+                    core_ch[b][r] = __float2half2_rn(0.0f);
+                    core_acc[b][r] = 0.0f;
+                }
+            core_fold = 0;
+            return;
+        }
         if constexpr (TILEBLOCKS_M == 1)
         {
             #pragma unroll
@@ -808,9 +852,96 @@ void exl3_gemm_kernel_inner
         }
     };
 
+    // CORE store / accumulate of the tile's final column values (written in reduce below).
+    // Only the (lane_id & 3) == 0 lane of each group holds the completed sum; the global C
+    // layout is the same row-major tile the mma path produces, so the split-k chain and the
+    // MoE consumer see no difference.
+    auto core_write_sum_gl = [&]()
+    {
+        if ((lane_id & 3) != 0) return;
+        const int ncol = warp_id * FRAGS_N_PER_WARP * 8 + (lane_id >> 2);
+        #pragma unroll
+        for (int b = 0; b < FRAGS_N_PER_WARP; ++b)
+            #pragma unroll
+            for (int r = 0; r < 16; ++r)
+                if (r < size_m)
+                    gl_c_ptr_16[r * size_n_stride + ncol + b * 8] = __float2half_rn(core_acc[b][r]);
+    };
+
+    auto core_read_sum_gl = [&]()
+    {
+        if ((lane_id & 3) != 0) return;
+        const int ncol = warp_id * FRAGS_N_PER_WARP * 8 + (lane_id >> 2);
+        #pragma unroll
+        for (int b = 0; b < FRAGS_N_PER_WARP; ++b)
+            #pragma unroll
+            for (int r = 0; r < 16; ++r)
+                if (r < size_m)
+                    core_acc[b][r] += __half2float(gl_c_ptr_16[r * size_n_stride + ncol + b * 8]);
+    };
+
     // Output reduction
     auto reduce = [&] ()
     {
+        if constexpr (CORE)
+        {
+            // Fold the residual fp16 k-partials, then complete each column's k=16 dot product
+            // across the four (lane_id & 3) lanes that split its k range
+            #pragma unroll
+            for (int b = 0; b < FRAGS_N_PER_WARP; ++b)
+                #pragma unroll
+                for (int r = 0; r < 16; ++r)
+                {
+                    float v = core_acc[b][r] + __low2float(core_ch[b][r]) + __high2float(core_ch[b][r]);
+                    v += __shfl_xor_sync(0xffffffffu, v, 1);
+                    v += __shfl_xor_sync(0xffffffffu, v, 2);
+                    core_acc[b][r] = v;
+                }
+            core_fold = 0;
+
+            // Cross-sub_k sum through the reduction scratch (sub_k = 1 stages, sub_k = 0 adds)
+            if (sub_k == 1 && (lane_id & 3) == 0)
+            {
+                #pragma unroll
+                for (int b = 0; b < FRAGS_N_PER_WARP; ++b)
+                    #pragma unroll
+                    for (int r = 0; r < 16; ++r)
+                        sh_c[r * TILESIZE_N + warp_id * FRAGS_N_PER_WARP * 8 + b * 8 + (lane_id >> 2)] =
+                            core_acc[b][r];
+            }
+            __syncthreads();
+            if (sub_k == 0 && (lane_id & 3) == 0)
+            {
+                #pragma unroll
+                for (int b = 0; b < FRAGS_N_PER_WARP; ++b)
+                    #pragma unroll
+                    for (int r = 0; r < 16; ++r)
+                        core_acc[b][r] +=
+                            sh_c[r * TILESIZE_N + warp_id * FRAGS_N_PER_WARP * 8 + b * 8 + (lane_id >> 2)];
+            }
+            __syncthreads();
+
+            // Same split-k chain as the mma path: process partial slices in reverse column order
+            // so the bottom-slice threadblock is free to move on to the next column
+            int lock_i = tiles_k - slice2_k - 1;
+            int lock_d = slice2_k - slice2_k0 + 1;
+            int* lock = &locks[slice_m * blocks_n + slice2_n];
+
+            barrier_acquire(lock, lock_i);
+
+            bool first = lock_i == 0;
+            bool last = lock_i + lock_d == tiles_k;
+
+            if (!sub_k && !first) core_read_sum_gl();
+            if (!sub_k && !last) core_write_sum_gl();
+            if (!sub_k && last) core_write_sum_gl();
+
+            barrier_release(lock, lock_d, last);
+
+            clear_frag_c();
+            return;
+        }
+
         #if EXL3_GEMM_H_ACC
             // Fold the fp16 MMA accumulators into the fp32 accumulators once per k-slice
             if constexpr (TILEBLOCKS_M == 1)
@@ -896,6 +1027,48 @@ void exl3_gemm_kernel_inner
     // Perform tensor core matmul on current tile
     auto matmul = [&] (int buf)
     {
+        if constexpr (CORE)
+        {
+            // CUDA-core dot product. Lane l owns tile rows 0..15 and, inside each 8-column
+            // block b, column l/4; its A k values are 2*(l%4), 2*(l%4)+1 (a01) and
+            // 2*(l%4)+8, +9 (a23) - exactly the k values the dequantized B fragment holds for
+            // that column (see dq_dispatch). The four lanes of each (l%4) group cover the
+            // whole k=16 range and are summed in reduce(). A comes straight from the swizzled
+            // shared tile; the swizzle moves whole 8-half groups, so a lane's two half2 words
+            // sit at cols (r>>1)&3 and 1^((r>>1)&3), offsets 2*(l%4).
+            const int koff = 2 * (lane_id & 3);
+            const int kc = sub_k * 2;   // int4 columns this k-half owns (16 halves per sub_k)
+            #pragma unroll
+            for (int r = 0; r < 16; ++r)
+            {
+                const int sw = (r >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK;
+                const half* row = core_a_ptr + r * TILESIZE_K;
+                half2 a01 = *reinterpret_cast<const half2*>(row + ((kc ^ sw) * 8) + koff);
+                half2 a23 = *reinterpret_cast<const half2*>(row + (((kc + 1) ^ sw) * 8) + koff);
+                #pragma unroll
+                for (int b = 0; b < FRAGS_N_PER_WARP; ++b)
+                {
+                    core_ch[b][r] = __hfma2(a01, frag_b[buf][b][0], core_ch[b][r]);
+                    core_ch[b][r] = __hfma2(a23, frag_b[buf][b][1], core_ch[b][r]);
+                }
+            }
+
+            // Fold the fp16 partials into the fp32 accumulators every 4 k-tiles (64 k), like the
+            // decode GEMV's CORE path; folding every tile would cost as much as the hfma2s
+            if (++core_fold == 4)
+            {
+                core_fold = 0;
+                #pragma unroll
+                for (int b = 0; b < FRAGS_N_PER_WARP; ++b)
+                    #pragma unroll
+                    for (int r = 0; r < 16; ++r)
+                    {
+                        core_acc[b][r] += __low2float(core_ch[b][r]) + __high2float(core_ch[b][r]);
+                        core_ch[b][r] = __float2half2_rn(0.0f);
+                    }
+            }
+            return;
+        }
         if constexpr (TILEBLOCKS_M == 1)
         {
             #pragma unroll
