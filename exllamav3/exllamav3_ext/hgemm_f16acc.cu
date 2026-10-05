@@ -12,6 +12,7 @@
 
 #include <cuda_fp16.h>
 #include "hgemm.cuh"
+#include <ATen/ops/empty.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
@@ -559,9 +560,78 @@ int hgemm_f16acc_status(int device)
     return f16acc::enabled(device) ? 1 : 0;
 }
 
-// Reconstruct-path GEMM: the fp16-accumulator kernel where it pays, else cuBLAS
+// fp32 SGEMM fallback for sm_75 GeForce (TU117/TU116, no usable tensor cores).
+//
+// cuBLAS's only fp16 GEMM path on sm_75 is the Volta s884 tensor-op kernel (profiled as
+// cutlass_70_tensorop_f16_s884gemm / volta_s884gemm). The mma.sync.884 it issues is emulated
+// on the CUDA cores of TU117/TU116 and the GEMM runs at ~0.4 TFLOP/s (measured: 409 GFLOP/s
+// at M=512 K=2048 N=8192). fp32 SGEMM is 2-4x faster on the same shapes (1.6-2.6 TFLOP/s
+// measured), so the reconstruct GEMM is routed through fp32 and the result cast back. The
+// fp16 -> fp32 casts of the activations and the materialized weights cost ~10% of the GEMM.
+// EXL3_PREFILL_HGEMM=0/1 forces fp16/fp32; unset = fp32 only where the CUDA-core GEMV probe
+// reports no usable tensor cores (the same decision decode uses).
+static bool recon_fp32_enabled(int device)
+{
+    const char* env = std::getenv("EXL3_PREFILL_HGEMM");
+    if (env && std::strcmp(env, "0") == 0) return false;
+    if (env && std::strcmp(env, "1") == 0) return true;
+    return g_get_gemv_core(device) == 1;
+}
+
+static bool hgemm_recon_fp32(const at::Tensor& a, const at::Tensor& b, const at::Tensor& c)
+{
+    if (a.dtype() != at::kHalf || b.dtype() != at::kHalf) return false;
+    if (c.dtype() != at::kHalf && c.dtype() != at::kFloat) return false;
+    if (a.dim() != 2 || b.dim() != 2 || c.dim() != 2) return false;
+    if (!a.is_cuda() || a.device() != b.device() || a.device() != c.device()) return false;
+    int device = a.device().index();
+    if (device < 0 || device >= MAX_DEVICES) return false;
+    if (!recon_fp32_enabled(device)) return false;
+
+    int size_k = a.size(-1);
+    int size_m = a.size(0);
+    int size_n = b.size(-1);
+    if (b.size(0) != size_k || c.size(0) != size_m || c.size(1) != size_n) return false;
+    int64_t c_stride_m = c.stride(-2);
+    if (c_stride_m < size_n || c_stride_m > std::numeric_limits<int>::max()) return false;
+
+    const at::cuda::OptionalCUDAGuard device_guard(a.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    auto af = a.to(at::kFloat);
+    auto bf = b.to(at::kFloat);
+    auto cf = at::empty({size_m, size_n}, a.options().dtype(at::kFloat));
+
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetStream(handle, stream);
+    cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST);
+    int dev; cudaGetDevice(&dev);
+    void* ws = DevCtx::instance().get_ws(dev);
+    cublasSetWorkspace(handle, ws, WORKSPACE_SIZE);
+
+    float alpha_ = 1.0f;
+    float beta_ = 0.0f;
+    auto r = cublasSgemm
+    (
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        size_n, size_m, size_k,
+        &alpha_, (const float*) bf.data_ptr(), size_n,
+                 (const float*) af.data_ptr(), size_k,
+        &beta_,  (float*) cf.data_ptr(), size_n
+    );
+    cublas_check(r);
+    cuda_check(cudaPeekAtLastError());
+
+    c.copy_(cf);
+    return true;
+}
+
+// Reconstruct-path GEMM: the fp16-accumulator kernel where it pays, else the fp32 fallback
+// where fp16 is emulated (sm_75 GeForce), else cuBLAS
 void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c)
 {
     if (hgemm_f16acc_try(a, b, c)) return;
+    if (hgemm_recon_fp32(a, b, c)) return;
     hgemm(a, b, c);
 }
