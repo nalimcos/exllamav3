@@ -113,8 +113,10 @@ void hgemm_batched
     at::Tensor c
 )
 {
-    // Reconstruct-path GEMM: the fp16-accumulator kernel where it pays (GeForce), else cuBLAS
+    // Reconstruct-path GEMM: the fp16-accumulator kernel where it pays (GeForce), else the fp32
+    // fallback where fp16 MMA is emulated (sm_75 GeForce), else cuBLAS
     if (hgemm_f16acc_try(a, w, c)) return;
+    if (hgemm_batched_fp32(a, w, c)) return;
 
     const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();

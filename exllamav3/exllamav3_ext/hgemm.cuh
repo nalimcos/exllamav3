@@ -33,3 +33,4 @@ bool hgemm_f16acc_try(const at::Tensor& a, const at::Tensor& b, at::Tensor& c);
 void hgemm_f16acc(at::Tensor a, at::Tensor b, at::Tensor c);
 int hgemm_f16acc_status(int device);
 void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c);
+bool hgemm_batched_fp32(const at::Tensor& a, const at::Tensor& w, const at::Tensor& c);

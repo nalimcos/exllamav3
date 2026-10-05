@@ -627,6 +627,63 @@ static bool hgemm_recon_fp32(const at::Tensor& a, const at::Tensor& b, const at:
     return true;
 }
 
+// Batched counterpart of the fp32 fallback above: a[B,m,k] @ w[B,k,n] -> c[B,m,n] through
+// strided-batched fp32 SGEMM. Used by the batched expert reconstruct path (hgemm_batched),
+// which otherwise lands on the same emulated Volta s884 fp16 kernel as hgemm_recon did.
+bool hgemm_batched_fp32(const at::Tensor& a, const at::Tensor& w, const at::Tensor& c)
+{
+    if (a.dtype() != at::kHalf || w.dtype() != at::kHalf) return false;
+    if (c.dtype() != at::kHalf && c.dtype() != at::kFloat) return false;
+    if (a.dim() != 3 || w.dim() != 3 || c.dim() != 3) return false;
+    if (!a.is_cuda() || a.device() != w.device() || a.device() != c.device()) return false;
+    if (!a.is_contiguous() || !w.is_contiguous() || !c.is_contiguous()) return false;
+    int device = a.device().index();
+    if (device < 0 || device >= MAX_DEVICES) return false;
+    if (!recon_fp32_enabled(device)) return false;
+
+    int batch = a.size(0);
+    int size_m = a.size(1);
+    int size_k = a.size(2);
+    int size_n = w.size(2);
+    if (!batch || !size_m || !size_n || !size_k) return true;  // nothing to do
+    if (w.size(0) != batch || w.size(1) != size_k) return false;
+    if (c.size(0) != batch || c.size(1) != size_m || c.size(2) != size_n) return false;
+
+    const at::cuda::OptionalCUDAGuard device_guard(a.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    auto af = a.to(at::kFloat).contiguous();
+    auto wf = w.to(at::kFloat).contiguous();
+    auto cf = at::empty({batch, size_m, size_n}, a.options().dtype(at::kFloat));
+
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetStream(handle, stream);
+    cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST);
+    int dev; cudaGetDevice(&dev);
+    void* ws = DevCtx::instance().get_ws(dev);
+    cublasSetWorkspace(handle, ws, WORKSPACE_SIZE);
+
+    float alpha_ = 1.0f;
+    float beta_ = 0.0f;
+    auto r = cublasGemmStridedBatchedEx
+    (
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        size_n, size_m, size_k,
+        &alpha_, (const float*) wf.data_ptr(), CUDA_R_32F, size_n, (long long) size_k * size_n,
+                 (const float*) af.data_ptr(), CUDA_R_32F, size_k, (long long) size_m * size_k,
+        &beta_,  (float*) cf.data_ptr(), CUDA_R_32F, size_n, (long long) size_m * size_n,
+        batch,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT
+    );
+    cublas_check(r);
+    cuda_check(cudaPeekAtLastError());
+
+    c.copy_(cf);
+    return true;
+}
+
 // Reconstruct-path GEMM: the fp16-accumulator kernel where it pays, else the fp32 fallback
 // where fp16 is emulated (sm_75 GeForce), else cuBLAS
 void hgemm_recon(at::Tensor a, at::Tensor b, at::Tensor c)
