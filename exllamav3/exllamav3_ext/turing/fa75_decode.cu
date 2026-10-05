@@ -37,6 +37,13 @@ __device__ __forceinline__ float fad_had32(float x, int lane)
     return x;
 }
 
+// Occupancy tuning note (GTX 1650 Max-Q, sm_75): this 256-thread / 8-warp / BLOCK_N=32 kernel runs
+// 1 CTA/SM (37696 B smem is the cap, not the 128 registers) yet beats every higher-occupancy variant
+// measured: 512-thread 16-warp (2 warps per head, dim-split with a cross-warp S reduction) 0.50 vs
+// 0.42 ms @ctx 16384 bsz1; a 256-thread head-local PV that drops the softmax->PV barrier (127 regs,
+// 37120 B) and a BLOCK_N=16 variant (80-106 regs, 2-3 CTA/SM) are both slower too. More resident
+// warps do not lower the per-tile cost, so the kernel is instruction-throughput bound rather than
+// latency/occupancy bound, and exp2 softmax (folded via log2 e) is neutral. Keep BLOCK_N=32 here.
 template <int BLOCK_N>
 __global__ void __launch_bounds__(256, 1)
 fa75_decode_kernel
