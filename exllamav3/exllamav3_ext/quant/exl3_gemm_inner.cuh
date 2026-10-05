@@ -351,7 +351,14 @@ void exl3_gemm_kernel_inner
             dq_dispatch<bits, cb, half_k>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
         }
 
-        __syncthreads();
+        // The barrier below retires the shared A/B stage this load read. The mma path copies A
+        // into registers here, so its shared reads are all done and the barrier is placed before
+        // advance1(). CORE reads A in matmul, i.e. after this point, so it takes the barrier at
+        // the end of matmul instead (see matmul); skipping it here keeps one barrier per k-tile.
+        // On sm_75 the global->shared "async" copy is a synchronous store, so without the barrier
+        // on the read side a fast warp's next-tile store can land in the stage a slow warp is
+        // still reading, which is exactly the decode run-to-run non-reproducibility this fixes.
+        if constexpr (!CORE) __syncthreads();
         advance1();
     };
 
@@ -1067,6 +1074,10 @@ void exl3_gemm_kernel_inner
                         core_ch[b][r] = __float2half2_rn(0.0f);
                     }
             }
+            // Retire the shared A/B stage this matmul (and the preceding load_frags, which read
+            // the B tile) consumed, before the next iteration's global->shared store overwrites
+            // it. The mma path takes this barrier at the end of load_frags instead; see there.
+            __syncthreads();
             return;
         }
         if constexpr (TILEBLOCKS_M == 1)

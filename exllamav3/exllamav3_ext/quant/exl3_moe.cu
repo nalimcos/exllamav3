@@ -14,18 +14,20 @@ namespace cg = cooperative_groups;
 #include <cstring>
 
 // EXL3_MOE_GEMM_CORE: the fused MoE's inner GEMM. "1" selects the sm_75 CUDA-core (__hfma2)
-// inner loop, "0" the emulated-mma one, "auto" follows the CUDA-core GEMV probe (the same
-// GTX 16-series parts the decode path avoids the mma on). Unset is "0": the CORE kernel matches
-// the mma one numerically (<= 1e-4 relative RMS on the first MoE layer) and is 1.3-1.5x faster
-// on the MoE term (+10.5% prefill at chunk 4096), but greedy decode is not reproducible run to
-// run with it enabled while both mma tilings are, so it stays opt-in until that is understood.
-// The env is read per call (the probe itself is cached) so a process can A/B the two paths.
+// inner loop, "0" the emulated-mma one, unset or "auto" follows the CUDA-core GEMV probe (the
+// same GTX 16-series parts the decode path avoids the mma on), so tensor-core-less devices get
+// it automatically. The CORE kernel matches the mma one numerically (<= 1e-4 relative RMS on the
+// first MoE layer) and is 1.3-1.5x faster on the MoE term (+10.5% prefill at chunk 4096). It
+// reads the shared A tile in matmul rather than into registers, so it needs a barrier after that
+// read before the next tile's global->shared store; with it (see exl3_gemm_inner.cuh) decode is
+// bit-reproducible run to run. The env is read per call (the probe itself is cached) so a process
+// can A/B the two paths.
 static int moe_core_enabled(int device)
 {
     const char* env = std::getenv("EXL3_MOE_GEMM_CORE");
+    if (env && std::strcmp(env, "0") == 0) return 0;
     if (env && std::strcmp(env, "1") == 0) return 1;
-    if (env && std::strcmp(env, "auto") == 0) return g_get_gemv_core(device) == 1;
-    return 0;
+    return g_get_gemv_core(device) == 1;
 }
 
 int exl3_moe_max_concurrency(int device)

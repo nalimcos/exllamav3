@@ -40,17 +40,16 @@ MTILE_T1, MTILE_T2 = 16, 32
 def _moe_gemm_core(device):
     """True when the fused MoE's inner GEMM runs the sm_75 CUDA-core (__hfma2) instance.
 
-    EXL3_MOE_GEMM_CORE=1 selects it, "auto" follows the CUDA-core GEMV probe (no usable tensor
-    cores, i.e. GTX 16-series), anything else (including unset) leaves it off. Only used to skip
-    the wide-row tier split, which exists only for the mma instances; the host makes the actual
-    kernel selection. Unset is off because the CORE kernel, while numerically matching the mma
-    one, makes greedy decode non-reproducible run to run; see the host comment.
+    EXL3_MOE_GEMM_CORE=1 selects it, "0" forces the mma one, unset or "auto" follows the
+    CUDA-core GEMV probe (no usable tensor cores, i.e. GTX 16-series), matching the host's
+    default. Only used to skip the wide-row tier split, which exists only for the mma instances;
+    the host makes the actual kernel selection.
     """
     env = os.environ.get("EXL3_MOE_GEMM_CORE")
+    if env == "0":
+        return False
     if env == "1":
         return True
-    if env != "auto":
-        return False
     try:
         from exllamav3.ext import exllamav3_ext as ext
         return ext.g_get_gemv_core(torch.device(device).index) == 1
