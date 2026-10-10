@@ -124,6 +124,7 @@ bool exl3_gemv_try_launch
     int mode = force ? 2 : exl3_gemv_env_mode();
     if (mode == 0) return false;
     int cc = DevCtx::instance().get_cc(device);
+    if (exl3_no_tc(cc)) return false;
     // if (cc != CC_AMPERE) return false;
     int mmode = size_m == 1 ? 0 : 1;
     int num_sms = DevCtx::instance().get_num_sms(device);

@@ -126,6 +126,8 @@ static void moe_coop_smem_optin(void* kernel, int smem)
 
 void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int cb, int device, cudaStream_t stream)
 {
+    // No tensor cores on Maxwell: the coop MoE (dp4a decode) cannot run
+    if (exl3_no_tc(DevCtx::instance().get_cc(device))) return;
     MoeCoopParams p = p_in;
     { static int dbg = std::getenv("EXL3_MOE_COOP_DBG") ? atoi(std::getenv("EXL3_MOE_COOP_DBG")) : 0; p.dbg = dbg; }
     const int slots = p.bsz * p.topk;

@@ -115,6 +115,9 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int K, bool mu
 
     switch(cc)
     {
+        case CC_MAXWELL:
+            // No tensor cores: no EXL3 GEMM shape; exl3_gemm.cu declines to cuBLAS
+            return 0;
         case CC_OLD:
         case CC_AMPERE:
             if (mod_256 && K <= 4)
