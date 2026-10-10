@@ -266,8 +266,6 @@ bool exl3_gemv_int8
 
     int device;
     cudaGetDevice(&device);
-    // No tensor cores on Maxwell: the dp4a int8-GEMV cannot run (belt-and-suspenders with the 80 KB smem check below)
-    if (exl3_no_tc(DevCtx::instance().get_cc(device))) return false;
     // Half-integer rates take the gate of the integer rate above them
     if (K < 1 || K + (half_k ? 1 : 0) > exl3_gemv_int8_max_k(device)) return false;
 

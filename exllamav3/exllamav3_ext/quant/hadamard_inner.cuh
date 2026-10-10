@@ -327,7 +327,7 @@ void had_hf_r_128_guad_inner
         half2 neg_x = __hneg2(x);
         half2 e = EXL3_H2EXP(neg_x);
         half2 sum = __hadd2(one, e);
-        half2 r = EXL3_H2RCp(sum);
+        half2 r = EXL3_H2RCP(sum);
         half2 result = __hmul2(x, r);
         return result;
     };

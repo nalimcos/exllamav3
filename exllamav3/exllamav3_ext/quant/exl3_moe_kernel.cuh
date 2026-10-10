@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cuda/atomic>
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
 #include <stdio.h>
@@ -395,14 +396,14 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 
     // Retire group; last group out resets the scheduler for the next launch. The increment must order each
     // group's earlier ticket grabs before the last group's reset (plain atomics are relaxed, so without this a
-    // straggler's in-flight grab could land after the reset and leak into the next launch). On sm_70+ the
+    // straggler's in-flight grab could land after the reset and leak into the next launch). On sm_60+ the
     // acq_rel increment does that; on Maxwell there are no ordered atomics, so a fence publishes the grabs.
     if (block_idx == 0 && threadIdx.x == 0)
     {
         int retired;
 #if EXL3_MAXWELL
         // release: publish this group's earlier ticket grabs before the increment. atomicAdd is unscoped on
-        // sm_50 (red.global.add); the fence replaces the acq_rel ordering that sm_70+ provides
+        // sm_50 (red.global.add); the fence provides the acq_rel ordering
         __threadfence();
         retired = atomicAdd(&sched[1], 1);
         if (retired == num_groups - 1)

@@ -1,9 +1,11 @@
 #pragma once
 
-// Plain C++ equivalents of the integer and bit-field PTX instructions used in the kernels. The CUDA
-// build keeps its inline PTX (ptx.cuh, codebook.cuh, exl3_gemv_int8_kernel.cuh); these replace it on
-// ROCm, where inline PTX does not exist. They are always defined so tests/test_ptx_portable.py can check
-// each one against the PTX instruction it stands in for on an NVIDIA device.
+// Plain C++ stand-ins for the integer and bit-field PTX instructions used in the kernels: the CUDA
+// build keeps its inline PTX (ptx.cuh, codebook.cuh, exl3_gemv_int8_kernel.cuh), these replace it on
+// ROCm, where inline PTX does not exist. Always defined, so tests/test_ptx_portable.py can check each
+// one against the PTX instruction it stands in for on an NVIDIA device. The fp16 section below is
+// CUDA-only: portable fused-half-FMA / exp / reciprocal forms for Maxwell, where those intrinsics
+// (sm_53+) are not declared.
 
 #include <cstdint>
 #include "arch.cuh"
@@ -72,7 +74,8 @@ __device__ __forceinline__ int exl3_dp4a_us(uint32_t a, uint32_t b, int c)
 // The fused half FMA and the half exp / reciprocal intrinsics are sm_53+ in CUDA; on Maxwell
 // (sm_50/sm_52) they are not declared, so the kernels that use them cannot compile. These portable
 // forms stand in for them on EXL3_MAXWELL only: the fused forms are a two-step multiply+add (one extra
-// rounding) and the transcendental forms round-trip through fp32. Exact enough for a compile-only gate.
+// rounding) and the transcendental forms round-trip through fp32. They execute at runtime on Maxwell;
+// only the mma/ldmatrix stubs in ptx.cuh are compile-only.
 __device__ __forceinline__ half exl3_hfma(half a, half b, half c)
 {
     return __hadd(__hmul(a, b), c);
@@ -103,15 +106,23 @@ __device__ __forceinline__ half2 exl3_h2rcp(half2 a)
 
 // Call-site selectors: the sm_53+ intrinsic on sm_53+ (and ROCm), the portable form on Maxwell
 #if EXL3_MAXWELL
+    #define EXL3_HFMA(a, b, c) exl3_hfma(a, b, c)
     #define EXL3_HFMA2(a, b, c) exl3_hfma2(a, b, c)
     #define EXL3_HEXP(x) exl3_hexp(x)
     #define EXL3_H2EXP(x) exl3_h2exp(x)
-    #define EXL3_HRCp(x) exl3_hrcp(x)
-    #define EXL3_H2RCp(x) exl3_h2rcp(x)
+    #define EXL3_HRCP(x) exl3_hrcp(x)
+    #define EXL3_H2RCP(x) exl3_h2rcp(x)
 #else
+    #define EXL3_HFMA(a, b, c) __hfma(a, b, c)
     #define EXL3_HFMA2(a, b, c) __hfma2(a, b, c)
     #define EXL3_HEXP(x) hexp(x)
     #define EXL3_H2EXP(x) h2exp(x)
-    #define EXL3_HRCp(x) hrcp(x)
-    #define EXL3_H2RCp(x) h2rcp(x)
+    #define EXL3_HRCP(x) hrcp(x)
+    #define EXL3_H2RCP(x) h2rcp(x)
+#endif
+// dp4a is sm_61+; the portable byte-sum stands in on Maxwell and ROCm
+#if defined(USE_ROCM) || EXL3_MAXWELL
+    #define EXL3_DP4A(a, b, c) exl3_dp4a_us(a, b, c)
+#else
+    #define EXL3_DP4A(a, b, c) __dp4a(a, b, c)
 #endif

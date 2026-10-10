@@ -45,7 +45,7 @@ __device__ __forceinline__ void mma_ab_h(const FragB& a01, const FragB& a23, con
     a.elems[3] = a23.elems[1];
     ptx_mma_m16n8k16(a, b, c);
 #elif EXL3_MAXWELL
-    // compile-only; no tensor cores on Maxwell - host decline (exl3_no_tc) prevents launch
+    // no tensor cores on Maxwell; exl3_no_tc keeps this path unlaunched
 #else
     const uint32_t* a0 = reinterpret_cast<const uint32_t*>(&a01);
     const uint32_t* a1 = reinterpret_cast<const uint32_t*>(&a23);
@@ -87,24 +87,13 @@ __device__ __forceinline__ half2 decode_pair_cb2_dp4a_(uint32_t x0, uint32_t x1)
     x0 *= 0x83DCD12Du;
     x1 *= 0x83DCD12Du;
     uint32_t sum0, sum1;
-#if EXL3_MAXWELL
-    // no dp4a on Maxwell (sm_61+); portable C++ byte-sum
-    sum0 = (uint32_t) exl3_dp4a_us(x0, 0x01010101u, 0x6400);
-    sum1 = (uint32_t) exl3_dp4a_us(x1, 0x01010101u, 0x6400);
-#else
-    sum0 = __dp4a(x0, 0x01010101u, 0x6400u);
-    sum1 = __dp4a(x1, 0x01010101u, 0x6400u);
-#endif
+    sum0 = EXL3_DP4A(x0, 0x01010101u, 0x6400u);
+    sum1 = EXL3_DP4A(x1, 0x01010101u, 0x6400u);
     half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
     half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
     half_uint16 h0((uint16_t) sum0);
     half_uint16 h1((uint16_t) sum1);
-#if EXL3_MAXWELL
-    // __hfma2 is sm_53+; portable two-step form on Maxwell
-    return exl3_hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
-#else
-    return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
-#endif
+    return EXL3_HFMA2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
 }
 
 template <int cb>

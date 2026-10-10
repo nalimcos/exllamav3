@@ -57,12 +57,7 @@ __device__ __forceinline__ void qt_frac_step
             if (pre_state >= 0 && in_edge_idx != pre_state) min_err2 = inf2;
         }
         else
-#if EXL3_MAXWELL
-            // __hfma2 is sm_53+; portable two-step form on Maxwell
-            min_err2 = exl3_hfma2(dh2, dh2, __half2half2(costs_in[in_edge_idx]));
-#else
-            min_err2 = __hfma2(dh2, dh2, __half2half2(costs_in[in_edge_idx]));
-#endif
+            min_err2 = EXL3_HFMA2(dh2, dh2, __half2half2(costs_in[in_edge_idx]));
         int min_in_edge0 = in_edge_idx;
         int min_in_edge1 = in_edge_idx;
 
@@ -83,11 +78,7 @@ __device__ __forceinline__ void qt_frac_step
                 if (pre_state >= 0 && in_edge_idx != pre_state) err2 = inf2;
             }
             else
-#if EXL3_MAXWELL
-                err2 = exl3_hfma2(dh2, dh2, __half2half2(costs_in[in_edge_idx]));
-#else
-                err2 = __hfma2(dh2, dh2, __half2half2(costs_in[in_edge_idx]));
-#endif
+                err2 = EXL3_HFMA2(dh2, dh2, __half2half2(costs_in[in_edge_idx]));
             if (__hlt(__low2half(err2), __low2half(min_err2)))
             {
                 min_err2 = __halves2half2(__low2half(err2), __high2half(min_err2));

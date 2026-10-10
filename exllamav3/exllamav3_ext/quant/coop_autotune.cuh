@@ -17,15 +17,14 @@
 // Non-cooperative launch of a whole-grid-co-resident kernel, with the grid bounded to the max co-resident
 // block count. The co-residency bound is MANDATORY: a bare volatile+fence spin (group_barrier) deadlocks if a
 // block is evicted, so bounding the grid to maxb * num_sms guarantees every block is resident and the barrier
-// always terminates. GEMM already launches at grid = num_sms (within the bound).
-// Used by later workstreams (B/C/F); provided here as the non-coop launch primitive (no caller in A).
+// always terminates.
 inline cudaError_t exl3_launch_grid_bounded(void* kernel, int* grid, dim3 block, void** args, size_t smem, cudaStream_t stream, int device)
 {
     int maxb = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb, kernel, block.x, smem);
     int num_sms = 0;
     cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
-    *grid = (*grid < maxb * num_sms) ? *grid : maxb * num_sms;
+    if (*grid > maxb * num_sms) *grid = maxb * num_sms;
     return cudaLaunchKernel(kernel, dim3(*grid), block, args, smem, stream);
 }
 

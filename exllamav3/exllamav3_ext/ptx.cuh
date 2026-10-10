@@ -1,5 +1,4 @@
 #pragma once
-#include <cuda/atomic>
 #include "arch.cuh"
 #include "ptx_portable.cuh"
 
@@ -35,8 +34,7 @@ __device__ inline void ptx_mma_m8n8k4
 )
 {
 #if EXL3_MAXWELL
-    // compile-only; no tensor cores on Maxwell - host decline (exl3_no_tc) guarantees this is never
-    // launched, so the fragment is never read
+    // no tensor cores on Maxwell; exl3_no_tc keeps this path unlaunched
 #else
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
@@ -85,8 +83,7 @@ __device__ inline void ptx_mma_m16n8k16
 #if defined(USE_ROCM)
     exl3_mma_m16n8k16_f32(frag_a, frag_b, frag_c);
 #elif EXL3_MAXWELL
-    // compile-only; no tensor cores on Maxwell - host decline (exl3_no_tc) guarantees this is never
-    // launched, so the fragment is never read
+    // no tensor cores on Maxwell; exl3_no_tc keeps this path unlaunched
 #else
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
@@ -140,8 +137,7 @@ __device__ inline void ptx_mma_m16n8k16
 #if defined(USE_ROCM)
     exl3_mma_m16n8k16_f16(frag_a, frag_b, frag_c);
 #elif EXL3_MAXWELL
-    // compile-only; no tensor cores on Maxwell - host decline (exl3_no_tc) guarantees this is never
-    // launched, so the fragment is never read
+    // no tensor cores on Maxwell; exl3_no_tc keeps this path unlaunched
 #else
     const uint32_t* a = reinterpret_cast<const uint32_t*>(&frag_a);
     const uint32_t* b = reinterpret_cast<const uint32_t*>(&frag_b);
@@ -213,8 +209,7 @@ __device__ inline void barrier_acquire
         while (state != stage);
     }
     __syncthreads();
-    // volatile + fence replaces ld.global.acquire.gpu (sm_70+); the fence orders every thread's
-    // post-barrier reads after the wait
+    // the fence gives acquire ordering: it orders every thread's post-barrier reads after the wait
     __threadfence();
 #else
     if (threadIdx.x == 0)
@@ -252,8 +247,8 @@ __device__ inline void barrier_release
         __hip_atomic_fetch_add(lock, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
 #elif EXL3_MAXWELL
-    // __threadfence() publishes this block's writes before the counter is read (replaces fence.acq_rel.gpu);
-    // atomicAdd is a relaxed device atomic (sm_50), replacing red.relaxed.gpu
+    // __threadfence() publishes this block's writes before the counter is read (release ordering);
+    // atomicAdd is a relaxed device atomic (sm_50)
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0)
@@ -376,8 +371,7 @@ __device__ inline void ldsm4(FragA& frag_a, const void* smem_ptr)
 #if defined(USE_ROCM)
     exl3_ldsm4(frag_a, smem_ptr);
 #elif EXL3_MAXWELL
-    // compile-only; no ldmatrix on Maxwell - host decline (exl3_no_tc) guarantees this is never
-    // launched, so the fragment is never read
+    // no ldmatrix on Maxwell; exl3_no_tc keeps this path unlaunched
 #else
     uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
@@ -486,7 +480,7 @@ __device__ __forceinline__ uint64_t globaltimer_ns()
 __device__ __forceinline__ void stg_wt_u32(uint32_t* p, uint32_t v)
 {
 #if EXL3_MAXWELL
-    // st.wt compiles on sm_50, but the plan calls for plain + fence on Maxwell
+    // plain store + fence on Maxwell
     *p = v;
     __threadfence();
 #else
@@ -497,7 +491,7 @@ __device__ __forceinline__ void stg_wt_u32(uint32_t* p, uint32_t v)
 __device__ __forceinline__ void stg_wt_u128(uint4* p, const uint4 v)
 {
 #if EXL3_MAXWELL
-    // st.wt compiles on sm_50, but the plan calls for plain + fence on Maxwell
+    // plain store + fence on Maxwell
     *p = v;
     __threadfence();
 #else
@@ -510,7 +504,7 @@ __device__ __forceinline__ void stg_wt_u128(uint4* p, const uint4 v)
 __device__ __forceinline__ uint32_t ldg_cv_u32(const uint32_t* p)
 {
 #if EXL3_MAXWELL
-    // ld.cv compiles on sm_50, but the plan calls for plain + fence on Maxwell
+    // plain load + fence on Maxwell
     uint32_t v = *p;
     __threadfence();
     return v;
@@ -524,7 +518,7 @@ __device__ __forceinline__ uint32_t ldg_cv_u32(const uint32_t* p)
 __device__ __forceinline__ uint4 ldg_cv_u128(const uint4* p)
 {
 #if EXL3_MAXWELL
-    // ld.cv compiles on sm_50, but the plan calls for plain + fence on Maxwell
+    // plain load + fence on Maxwell
     uint4 v = *p;
     __threadfence();
     return v;
@@ -540,7 +534,7 @@ __device__ __forceinline__ uint4 ldg_cv_u128(const uint4* p)
 __device__ __forceinline__ uint32_t ldg_acquire_sys_u32(const uint32_t* p)
 {
 #if EXL3_MAXWELL
-    // volatile load + sys-fence replaces ld.global.acquire.sys (sm_70+)
+    // volatile load + sys-fence: acquire ordering at system scope
     uint32_t v = *(volatile uint32_t*) p;
     __threadfence_system();
     return v;
@@ -555,7 +549,7 @@ __device__ __forceinline__ uint32_t ldg_acquire_sys_u32(const uint32_t* p)
 __device__ __forceinline__ uint64_t ldg_acquire_sys_u64(const uint64_t* p)
 {
 #if EXL3_MAXWELL
-    // volatile load + sys-fence replaces ld.global.acquire.sys (sm_70+)
+    // volatile load + sys-fence: acquire ordering at system scope
     uint64_t v = *(volatile uint64_t*) p;
     __threadfence_system();
     return v;
@@ -569,7 +563,7 @@ __device__ __forceinline__ uint64_t ldg_acquire_sys_u64(const uint64_t* p)
 __device__ __forceinline__ void stg_release_sys_u32(uint32_t* p, uint32_t v)
 {
 #if EXL3_MAXWELL
-    // sys-fence + volatile store replaces st.global.release.sys
+    // sys-fence + volatile store: release ordering at system scope
     __threadfence_system();
     *(volatile uint32_t*) p = v;
 #else
@@ -580,7 +574,7 @@ __device__ __forceinline__ void stg_release_sys_u32(uint32_t* p, uint32_t v)
 __device__ __forceinline__ void stg_release_sys_u64(uint64_t* p, uint64_t v)
 {
 #if EXL3_MAXWELL
-    // sys-fence + volatile store replaces st.global.release.sys
+    // sys-fence + volatile store: release ordering at system scope
     __threadfence_system();
     *(volatile uint64_t*) p = v;
 #else
@@ -663,7 +657,7 @@ __device__ inline void group_barrier
         int* counter = &barrier_counters_sense[group_id * 2];
         volatile int* sense = &barrier_counters_sense[group_id * 2 + 1];
 
-        // Release: publish this block's pre-barrier writes before the arrival (replaces the acq_rel fetch_add)
+        // Release: publish this block's pre-barrier writes before the arrival
         __threadfence();
         int old_sense = *sense;
         int old = atomicAdd(counter, 1);  // red.global.add, unscoped (sm_50); the scoped form needs sm_60
@@ -677,7 +671,7 @@ __device__ inline void group_barrier
         {
             while (*sense == old_sense) exl3_sleep(32);
         }
-        // Acquire: order this block's post-barrier reads after the wait/flip (replaces the acquire load)
+        // Acquire: order this block's post-barrier reads after the wait/flip
         __threadfence();
     }
 

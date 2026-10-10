@@ -15,7 +15,7 @@ __device__ __forceinline__ half _silu(half x)
     half neg_x = __hneg(x);
     half e = EXL3_HEXP(neg_x);
     half sum = __hadd(one, e);
-    half r = EXL3_HRCp(sum);
+    half r = EXL3_HRCP(sum);
     half result = __hmul(x, r);
     return result;
 }
@@ -27,7 +27,7 @@ __device__ __forceinline__ half2 _silu(half2 x)
     half2 neg_x = __hneg2(x);
     half2 e = EXL3_H2EXP(neg_x);
     half2 sum = __hadd2(one, e);
-    half2 r = EXL3_H2RCp(sum);
+    half2 r = EXL3_H2RCP(sum);
     half2 result = __hmul2(x, r);
     return result;
 }
@@ -137,7 +137,7 @@ __device__ __forceinline__ half2 _sigmoid(half2 x)
     half2 neg_x = __hneg2(x);
     half2 e = EXL3_H2EXP(neg_x);
     half2 sum = __hadd2(one, e);
-    return EXL3_H2RCp(sum);
+    return EXL3_H2RCP(sum);
 }
 
 

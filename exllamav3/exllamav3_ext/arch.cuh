@@ -6,17 +6,18 @@
 //
 //   Maxwell (sm_50/sm_52)  -> EXL3_MAXWELL. Has no tensor cores at all (no mma, no ldmatrix),
 //                             no dp4a (sm_61+), no cp.async (sm_80+), and no ordered atomics
-//                             (acquire/release/scoped, sm_70+). The host declines every
-//                             tensor-core / dp4a / cooperative path (exl3_no_tc), so the device
-//                             bodies are compile-only stubs; ptx.cuh supplies the ordered-atomic
-//                             and async-copy fallbacks (volatile + __threadfence, sync store).
+//                             (acquire/release/scoped, sm_60+). The host declines the tensor-core
+//                             paths (exl3_no_tc) and their device bodies are compile-only stubs;
+//                             the dp4a and fp16 math instead run on portable forms. ptx.cuh supplies
+//                             the ordered-atomic and async-copy fallbacks (volatile + __threadfence,
+//                             sync store).
 //   Turing (sm_75)         -> EXL3_SM75. Has tensor cores but only the k=8 mma and no cp.async:
 //                             ptx.cuh issues two mma.m16n8k8 and falls back to synchronous 16 B
 //                             smem stores (the pipeline's __syncthreads already order the reads).
 //
-// Both tiers also cap dynamic shared memory at 64 KB per block; that is a host-side launch
-// parameter resolved per device at runtime (DevCtx::get_smem_max), so shapes that do not fit
-// are filtered out of kernel selection rather than failing at launch.
+// Both tiers also cap dynamic shared memory below the 90 KB the sm_86 kernels request; the cap
+// is a host-side launch parameter resolved per device at runtime (DevCtx::get_smem_max), so
+// shapes that do not fit are filtered out of kernel selection rather than failing at launch.
 //
 // ldmatrix, __nanosleep and __dp4a are sm_75-capable but NOT Maxwell-capable, so each is gated
 // on EXL3_MAXWELL separately (see ptx.cuh / the quant kernels). tanh.approx.f32 needs no gate.

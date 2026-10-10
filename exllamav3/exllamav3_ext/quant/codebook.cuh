@@ -44,24 +44,13 @@ __device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
     // asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum0) : "r"(x0), "r"(0), "r"(acc) : );
     // asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum1) : "r"(x1), "r"(0), "r"(acc) : );
     uint32_t sum0, sum1;
-#if EXL3_MAXWELL
-    // no dp4a on Maxwell (sm_61+); portable C++ byte-sum
-    sum0 = (uint32_t) exl3_dp4a_us(x0, 0x01010101u, (int) acc);
-    sum1 = (uint32_t) exl3_dp4a_us(x1, 0x01010101u, (int) acc);
-#else
-    sum0 = __dp4a(x0, 0x01010101u, acc);
-    sum1 = __dp4a(x1, 0x01010101u, acc);
-#endif
+    sum0 = EXL3_DP4A(x0, 0x01010101u, acc);
+    sum1 = EXL3_DP4A(x1, 0x01010101u, acc);
     half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));  //  0.00677 = 1/147.7
     half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));  // -10.39 = (-1024.0 - 510.0) * k_inv_h
     half_uint16 h0((uint16_t) sum0);
     half_uint16 h1((uint16_t) sum1);
-#if EXL3_MAXWELL
-    // __hfma2 is sm_53+; portable two-step form on Maxwell
-    return exl3_hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
-#else
-    return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
-#endif
+    return EXL3_HFMA2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
 }
 
 // Ditto mcg (cb 1)
@@ -105,21 +94,11 @@ __device__ inline half decode_3inst(uint32_t x)
         // uint32_t sum;
         // asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum) : "r"(x), "r"(0), "r"(acc) : );
         uint32_t sum;
-#if EXL3_MAXWELL
-        // no dp4a on Maxwell (sm_61+); portable C++ byte-sum
-        sum = (uint32_t) exl3_dp4a_us(x, 0x01010101u, (int) acc);
-#else
-        sum = __dp4a(x, 0x01010101u, acc);
-#endif
+        sum = EXL3_DP4A(x, 0x01010101u, acc);
         const __half k_inv_h = __ushort_as_half(0x1eee);  //  0.00677 = 1/147.7
         const __half k_bias_h = __ushort_as_half(0xc931);  // -10.39 = (-1024.0 - 510.0) * k_inv_h
         half_uint16 h((uint16_t) sum);
-#if EXL3_MAXWELL
-        // __hfma is sm_53+; portable two-step form on Maxwell
-        return exl3_hfma(h.as_half, k_inv_h, k_bias_h);
-#else
-        return __hfma(h.as_half, k_inv_h, k_bias_h);
-#endif
+        return EXL3_HFMA(h.as_half, k_inv_h, k_bias_h);
     }
 }
 

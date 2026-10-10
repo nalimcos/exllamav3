@@ -25,14 +25,15 @@
 #define WORKSPACE_SIZE (16*1024*1024)
 
 #define MAX_DEVICES 16
-#define CC_MAXWELL    0
-#define CC_OLD        1
-#define CC_AMPERE     2
-#define CC_ADA        3
-#define CC_HOPPER     4
-#define CC_BLACKWELL  5
+// 0 is reserved as the "not cached yet" sentinel of the DevCtx cc cache; tiers start at 1
+#define CC_MAXWELL    1
+#define CC_OLD        2
+#define CC_AMPERE     3
+#define CC_ADA        4
+#define CC_HOPPER     5
+#define CC_BLACKWELL  6
 
-// Maxwell has no tensor cores: decline every mma GEMM/GEMV, the dp4a int8-GEMV and the coop MoE.
+// Maxwell has no tensor cores: decline every mma GEMM/GEMV and the coop MoE.
 inline bool exl3_no_tc(int cc) { return cc == CC_MAXWELL; }
 
 // Singleton to manage context for each device. Stores device attributes and a large-enough lock buffer per device
