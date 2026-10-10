@@ -1,4 +1,6 @@
 
+#include "ptx_portable.cuh"
+
 __device__ inline half2 clamp_half2_to_finite(half2 v)
 {
     const half2 max_h2 = __float2half2_rn(65504.0f);
@@ -11,9 +13,9 @@ __device__ __forceinline__ half _silu(half x)
 {
     half one = __float2half(1.0f);
     half neg_x = __hneg(x);
-    half e = hexp(neg_x);
+    half e = EXL3_HEXP(neg_x);
     half sum = __hadd(one, e);
-    half r = hrcp(sum);
+    half r = EXL3_HRCp(sum);
     half result = __hmul(x, r);
     return result;
 }
@@ -23,9 +25,9 @@ __device__ __forceinline__ half2 _silu(half2 x)
 {
     half2 one = __float2half2_rn(1.0f);
     half2 neg_x = __hneg2(x);
-    half2 e = h2exp(neg_x);
+    half2 e = EXL3_H2EXP(neg_x);
     half2 sum = __hadd2(one, e);
-    half2 r = h2rcp(sum);
+    half2 r = EXL3_H2RCp(sum);
     half2 result = __hmul2(x, r);
     return result;
 }
@@ -133,9 +135,9 @@ __device__ __forceinline__ half2 _sigmoid(half2 x)
 {
     half2 one = __float2half2_rn(1.0f);
     half2 neg_x = __hneg2(x);
-    half2 e = h2exp(neg_x);
+    half2 e = EXL3_H2EXP(neg_x);
     half2 sum = __hadd2(one, e);
-    return h2rcp(sum);
+    return EXL3_H2RCp(sum);
 }
 
 

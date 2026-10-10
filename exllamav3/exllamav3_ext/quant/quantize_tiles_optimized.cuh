@@ -155,7 +155,7 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
                                 err = __half2half2(H_INF);
                         }
                         else
-                            err = __hfma2(d, d, __half2half2(temp_costs_inc[pred]));
+                            err = EXL3_HFMA2(d, d, __half2half2(temp_costs_inc[pred]));
                         if (c == 0 || __hlt(__low2half(err), __low2half(best)))
                         {
                             best = __halves2half2(__low2half(err), __high2half(best));
@@ -250,7 +250,7 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
                                 err = __half2half2(H_INF);
                         }
                         else
-                            err = __hfma2(d, d, __half2half2(temp_costs_inc[pred]));
+                            err = EXL3_HFMA2(d, d, __half2half2(temp_costs_inc[pred]));
                         if (c == 0 || __hlt(__low2half(err), __low2half(best)))
                         {
                             best = __halves2half2(__low2half(err), __high2half(best));
@@ -326,7 +326,7 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
                                 err = __half2half2(H_INF);
                         }
                         else
-                            err = __hfma2(d, d, __half2half2(temp_costs_inc[pred]));
+                            err = EXL3_HFMA2(d, d, __half2half2(temp_costs_inc[pred]));
 
                         best0 = min(best0, ((uint32_t)__half_as_ushort(__low2half(err)) << 16) | pred);
                         best1 = min(best1, ((uint32_t)__half_as_ushort(__high2half(err)) << 16) | pred);
@@ -415,7 +415,7 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
                     half2 decoded2;
                     decoded2 = __ldg(lut + ((out_edge_idx) >> 1));
                     half2 dh2 = __hsub2(decoded2, w2);
-                    half2 min_err2 = __hfma2(dh2, dh2, __half2half2(temp_costs_inc[in_edge_idx]));
+                    half2 min_err2 = EXL3_HFMA2(dh2, dh2, __half2half2(temp_costs_inc[in_edge_idx]));
                     int min_in_edge0 = in_edge_idx;
                     int min_in_edge1 = in_edge_idx;
                     uint32_t best0 = ((uint32_t)__half_as_ushort(__low2half(min_err2)) << 16) | in_edge_idx;
@@ -428,7 +428,7 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
                         in_edge_idx = state0 >> K;
                         decoded2 = __ldg(lut + ((state0) >> 1));
                         dh2 = __hsub2(decoded2, w2);
-                        half2 err2 = __hfma2(dh2, dh2, __half2half2(temp_costs_inc[in_edge_idx]));
+                        half2 err2 = EXL3_HFMA2(dh2, dh2, __half2half2(temp_costs_inc[in_edge_idx]));
                         best0 =
                             min(best0, ((uint32_t)__half_as_ushort(__low2half(err2)) << 16) | in_edge_idx);
                         best1 =
@@ -500,7 +500,7 @@ __global__ __launch_bounds__(qt_optimized_threads(K, cb), 1) void quantize_tiles
                                 err = __half2half2(H_INF);
                         }
                         else
-                            err = __hfma2(d, d, __half2half2(temp_costs_inc[pred]));
+                            err = EXL3_HFMA2(d, d, __half2half2(temp_costs_inc[pred]));
 
                         best0 = c == 0
                                     ? (((uint32_t)__half_as_ushort(__low2half(err)) << 16) | pred)

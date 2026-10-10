@@ -393,18 +393,32 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         ticket = sched[2 + group_idx];
     }
 
-    // Retire group; last group out resets the scheduler for the next launch. The acq_rel increment orders each
+    // Retire group; last group out resets the scheduler for the next launch. The increment must order each
     // group's earlier ticket grabs before the last group's reset (plain atomics are relaxed, so without this a
-    // straggler's in-flight grab could land after the reset and leak into the next launch)
+    // straggler's in-flight grab could land after the reset and leak into the next launch). On sm_70+ the
+    // acq_rel increment does that; on Maxwell there are no ordered atomics, so a fence publishes the grabs.
     if (block_idx == 0 && threadIdx.x == 0)
     {
+        int retired;
+#if EXL3_MAXWELL
+        // release: publish this group's earlier ticket grabs before the increment. atomicAdd is unscoped on
+        // sm_50 (red.global.add); the fence replaces the acq_rel ordering that sm_70+ provides
+        __threadfence();
+        retired = atomicAdd(&sched[1], 1);
+        if (retired == num_groups - 1)
+        {
+            sched[0] = 0;
+            sched[1] = 0;
+        }
+#else
         cuda::atomic_ref<int, cuda::thread_scope_device> next_ticket(sched[0]);
         cuda::atomic_ref<int, cuda::thread_scope_device> retired_groups(sched[1]);
-        int retired = retired_groups.fetch_add(1, cuda::memory_order_acq_rel);
+        retired = retired_groups.fetch_add(1, cuda::memory_order_acq_rel);
         if (retired == num_groups - 1)
         {
             next_ticket.store(0, cuda::memory_order_relaxed);
             retired_groups.store(0, cuda::memory_order_relaxed);
         }
+#endif
     }
 }

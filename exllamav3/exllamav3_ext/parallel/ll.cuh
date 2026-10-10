@@ -18,7 +18,7 @@ __device__ __forceinline__ uint32_t synced_read_uint32
         packed = ldg_acquire_sys_u64(p);
         uint32_t got_cookie = uint32_t(packed >> 32);
         if (cookie == got_cookie) break;
-        __nanosleep(sleep);
+        exl3_sleep(sleep);
         if (sleep < SYNC_MAX_SLEEP) sleep *= 2;
         else
         {

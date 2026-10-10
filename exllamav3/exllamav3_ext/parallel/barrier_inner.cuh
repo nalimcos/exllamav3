@@ -44,7 +44,7 @@ __device__ __forceinline__ void pg_barrier_inner
 
                 if (pending == pending_t)
                 {
-                    __nanosleep(sleep);
+                    exl3_sleep(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                     else *abort_flag = check_timeout(ctx, deadline, "barrier");
                     if (*abort_flag) break;
@@ -63,7 +63,7 @@ __device__ __forceinline__ void pg_barrier_inner
             uint64_t sleep = SYNC_MIN_SLEEP;
             while (ldg_cv_u32(epoch_ptr) == epoch)
             {
-                __nanosleep(sleep);
+                exl3_sleep(sleep);
                 if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                 else *abort_flag = check_timeout(ctx, deadline, "barrier");
                 if (*abort_flag) break;

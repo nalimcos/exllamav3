@@ -42,7 +42,7 @@ __global__ void moe_flag_wait_kernel(uint32_t* flag, uint32_t value, uint32_t* a
     {
         uint32_t v = (uint32_t) ldg_acquire_sys_u32(flag);
         if ((int32_t)(v - value) >= 0) return;
-        __nanosleep(sleep);
+        exl3_sleep(sleep);
         waited += sleep;
         if (sleep < MOE_SLEEP_MAX) sleep <<= 1;
         if (waited > MOE_WAIT_TIMEOUT_NS)

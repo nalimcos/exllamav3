@@ -90,7 +90,7 @@ void pg_broadcast_kernel
                         pending &= (pending - 1);
                         sleep = SYNC_MIN_SLEEP;
                     }
-                    else __nanosleep(sleep);
+                    else exl3_sleep(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                     else *abort_flag = check_timeout(ctx, deadline, "broadcast");
                     if (*abort_flag) break;
@@ -130,7 +130,7 @@ void pg_broadcast_kernel
                 uint64_t sleep = SYNC_MIN_SLEEP;
                 while (ldg_acquire_sys_u32(broadcast_stages_ptr + src_device) <= stage)
                 {
-                    __nanosleep(sleep);
+                    exl3_sleep(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                     else *abort_flag = check_timeout(ctx, deadline, "broadcast");
                     if (*abort_flag) break;
@@ -233,7 +233,7 @@ void pg_broadcast_ll_kernel
         uint32_t sleep = SYNC_MIN_SLEEP;
         while ((cookie_s = ldg_acquire_sys_u32(&ctx->broadcast_ll_epoch)) == sequence)
         {
-            __nanosleep(sleep);
+            exl3_sleep(sleep);
             if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
             else *abort_flag = check_timeout(ctx, deadline, "pg_broadcast_ll_kernel sequence");
             if (*abort_flag) break;
@@ -302,7 +302,7 @@ void pg_broadcast_ll_kernel
                         pending &= pending - 1;
                         sleep = SYNC_MIN_SLEEP;
                     }
-                    else __nanosleep(sleep);
+                    else exl3_sleep(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                     else *abort_flag = check_timeout(ctx, deadline, "pg_broadcast_ll_kernel acknowledgement");
                     if (*abort_flag) break;

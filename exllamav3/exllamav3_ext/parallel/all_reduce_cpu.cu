@@ -347,7 +347,7 @@ void pg_all_reduce_cpu_kernel
                 uint32_t ep = (uint32_t)ldg_acquire_sys_u32(&ctx->cpusum_stage_cpu);
                 s_cpu_seen = ep;
                 if (ep >= target) break;
-                __nanosleep(sleep);
+                exl3_sleep(sleep);
                 if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                 else if (check_timeout(ctx, deadline, "pg_all_reduce_cpu_kernel"))
                 {
@@ -505,7 +505,7 @@ void pg_all_reduce_cpu_recv_kernel
         {
             uint32_t ep = (uint32_t)ldg_acquire_sys_u32(&ctx->cpusum_stage_cpu);
             if (ep >= cc) break;
-            __nanosleep(sleep);
+            exl3_sleep(sleep);
             if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
             else if (check_timeout(ctx, deadline, "pg_all_reduce_cpu_recv_kernel"))
             {

@@ -226,7 +226,12 @@ void quantize_tiles_kernel
                     decoded2 = decode_3inst_2<cb>(out_edge_idx, out_edge_idx + 1);
                 }
                 half2 dh2 = __hsub2(decoded2, w2);
+#if EXL3_MAXWELL
+                // __hfma2 is sm_53+; portable two-step form on Maxwell
+                half2 min_err2 = exl3_hfma2(dh2, dh2, __half2half2(temp_costs_inc[in_edge_idx]));
+#else
                 half2 min_err2 = __hfma2(dh2, dh2, __half2half2(temp_costs_inc[in_edge_idx]));
+#endif
                 int min_in_edge0 = in_edge_idx;
                 int min_in_edge1 = in_edge_idx;
 
@@ -256,7 +261,11 @@ void quantize_tiles_kernel
                         decoded2 = decode_3inst_2<cb>(state0, state0 + 1);
                     }
                     dh2 = __hsub2(decoded2, w2);
+#if EXL3_MAXWELL
+                    half2 err2 = exl3_hfma2(dh2, dh2, __half2half2(temp_costs_inc[in_edge_idx]));
+#else
                     half2 err2 = __hfma2(dh2, dh2, __half2half2(temp_costs_inc[in_edge_idx]));
+#endif
                     if (__hlt(__low2half(err2), __low2half(min_err2)))
                     {
                         min_err2 = __halves2half2(__low2half(err2), __high2half(min_err2));

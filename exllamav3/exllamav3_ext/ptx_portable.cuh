@@ -6,6 +6,7 @@
 // each one against the PTX instruction it stands in for on an NVIDIA device.
 
 #include <cstdint>
+#include "arch.cuh"
 
 // lop3.b32 d, a, b, c, 0x6a: the lookup table 0x6a is (a & b) ^ c (with a = 0xf0, b = 0xcc, c = 0xaa,
 // (0xf0 & 0xcc) ^ 0xaa = 0x6a)
@@ -63,3 +64,54 @@ __device__ __forceinline__ int exl3_dp4a_us(uint32_t a, uint32_t b, int c)
         d += static_cast<int>((a >> (8 * i)) & 0xffu) * static_cast<int>(static_cast<int8_t>(b >> (8 * i)));
     return d;
 }
+
+#if !defined(USE_ROCM)
+#include <cuda_fp16.h>
+#include <cmath>
+
+// The fused half FMA and the half exp / reciprocal intrinsics are sm_53+ in CUDA; on Maxwell
+// (sm_50/sm_52) they are not declared, so the kernels that use them cannot compile. These portable
+// forms stand in for them on EXL3_MAXWELL only: the fused forms are a two-step multiply+add (one extra
+// rounding) and the transcendental forms round-trip through fp32. Exact enough for a compile-only gate.
+__device__ __forceinline__ half exl3_hfma(half a, half b, half c)
+{
+    return __hadd(__hmul(a, b), c);
+}
+__device__ __forceinline__ half2 exl3_hfma2(half2 a, half2 b, half2 c)
+{
+    return __hadd2(__hmul2(a, b), c);
+}
+__device__ __forceinline__ half exl3_hexp(half x)
+{
+    return __float2half(expf(__half2float(x)));
+}
+__device__ __forceinline__ half2 exl3_h2exp(half2 a)
+{
+    return __halves2half2(__float2half(expf(__half2float(__low2half(a)))),
+                          __float2half(expf(__half2float(__high2half(a)))));
+}
+__device__ __forceinline__ half exl3_hrcp(half x)
+{
+    return __float2half(1.0f / __half2float(x));
+}
+__device__ __forceinline__ half2 exl3_h2rcp(half2 a)
+{
+    return __halves2half2(__float2half(1.0f / __half2float(__low2half(a))),
+                          __float2half(1.0f / __half2float(__high2half(a))));
+}
+#endif
+
+// Call-site selectors: the sm_53+ intrinsic on sm_53+ (and ROCm), the portable form on Maxwell
+#if EXL3_MAXWELL
+    #define EXL3_HFMA2(a, b, c) exl3_hfma2(a, b, c)
+    #define EXL3_HEXP(x) exl3_hexp(x)
+    #define EXL3_H2EXP(x) exl3_h2exp(x)
+    #define EXL3_HRCp(x) exl3_hrcp(x)
+    #define EXL3_H2RCp(x) exl3_h2rcp(x)
+#else
+    #define EXL3_HFMA2(a, b, c) __hfma2(a, b, c)
+    #define EXL3_HEXP(x) hexp(x)
+    #define EXL3_H2EXP(x) h2exp(x)
+    #define EXL3_HRCp(x) hrcp(x)
+    #define EXL3_H2RCp(x) h2rcp(x)
+#endif

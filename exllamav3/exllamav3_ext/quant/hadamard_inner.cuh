@@ -1,5 +1,6 @@
 #pragma once
 #include "../compat.cuh"
+#include "../ptx_portable.cuh"
 
 #define ACT_SILU 0
 #define ACT_GELU 1
@@ -324,9 +325,9 @@ void had_hf_r_128_guad_inner
     {
         half2 one = __float2half2_rn(1.0f);
         half2 neg_x = __hneg2(x);
-        half2 e = h2exp(neg_x);
+        half2 e = EXL3_H2EXP(neg_x);
         half2 sum = __hadd2(one, e);
-        half2 r = h2rcp(sum);
+        half2 r = EXL3_H2RCp(sum);
         half2 result = __hmul2(x, r);
         return result;
     };

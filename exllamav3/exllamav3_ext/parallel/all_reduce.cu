@@ -75,7 +75,7 @@ void pg_all_reduce_kernel
             uint32_t sleep = SYNC_MIN_SLEEP;
             while ((int) ldg_acquire_sys_u32(stage_ptr) < min_stage)
             {
-                __nanosleep(sleep);
+                exl3_sleep(sleep);
                 if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                 else *abort_flag = check_timeout(ctx, deadline, "all_reduce");
                 if (*abort_flag) break;
@@ -166,7 +166,7 @@ void pg_all_reduce_kernel
                 }
                 else
                 {
-                    __nanosleep(sleep);
+                    exl3_sleep(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                     else *abort_flag = check_timeout(ctx, deadline, "all_reduce (1)");
                     if (*abort_flag) break;
@@ -205,7 +205,7 @@ void pg_all_reduce_kernel
                 }
                 else
                 {
-                    __nanosleep(sleep);
+                    exl3_sleep(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                     else *abort_flag = check_timeout(ctx, deadline, "all_reduce (2)");
                     if (*abort_flag) break;

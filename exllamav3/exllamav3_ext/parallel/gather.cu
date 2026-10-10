@@ -79,7 +79,7 @@ void pg_gather_kernel
             uint32_t sleep = SYNC_MIN_SLEEP;
             while ((int) ldg_acquire_sys_u32(stage_ptr) < min_stage)
             {
-                __nanosleep(sleep);
+                exl3_sleep(sleep);
                 if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                 else *abort_flag = check_timeout(ctx, deadline, "gather (0)");
                 if (*abort_flag) break;
@@ -172,7 +172,7 @@ void pg_gather_kernel
                 }
                 else
                 {
-                    __nanosleep(sleep);
+                    exl3_sleep(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                     else *abort_flag = check_timeout(ctx, deadline, "gather (1)");
                     if (*abort_flag) break;
@@ -222,7 +222,7 @@ void pg_gather_kernel
             }
             else
             {
-                __nanosleep(sleep);
+                exl3_sleep(sleep);
                 if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                 else *abort_flag = check_timeout(ctx, deadline, "gather (2)");
                 if (*abort_flag) break;
@@ -296,7 +296,7 @@ void pg_gather_small_kernel
                 uint64_t deadline = sync_deadline();
                 while (!*abort_flag && ldg_acquire_sys_u32(ctx->gather_stage_produced + src_rank) < 1)
                 {
-                    __nanosleep(sleep);
+                    exl3_sleep(sleep);
                     if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                     else *abort_flag = check_timeout(ctx, deadline, "gather_small");
                 }
