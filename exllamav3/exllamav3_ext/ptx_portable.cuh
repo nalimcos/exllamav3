@@ -1,7 +1,7 @@
 #pragma once
 
 // Plain C++ stand-ins for the integer and bit-field PTX instructions used in the kernels: the CUDA
-// build keeps its inline PTX (ptx.cuh, codebook.cuh, exl3_gemv_int8_kernel.cuh), these replace it on
+// build keeps its inline PTX (ptx.cuh, codebook.cuh), these replace it on
 // ROCm, where inline PTX does not exist. Always defined, so tests/test_ptx_portable.py can check each
 // one against the PTX instruction it stands in for on an NVIDIA device. The fp16 section below is
 // CUDA-only: portable fused-half-FMA / exp / reciprocal forms for Maxwell, where those intrinsics
@@ -71,6 +71,14 @@ __device__ __forceinline__ int exl3_dp4a_us(uint32_t a, uint32_t b, int c)
 #include <cuda_fp16.h>
 #include <cmath>
 
+// dp4a.u32.s32 as inline PTX: the __dp4a intrinsic is overload-ambiguous for (u32, u32, int) args
+__device__ __forceinline__ int exl3_dp4a_us_asm(uint32_t a, uint32_t b, int c)
+{
+    int d;
+    asm ("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+
 // The fused half FMA and the half exp / reciprocal intrinsics are sm_53+ in CUDA; on Maxwell
 // (sm_50/sm_52) they are not declared, so the kernels that use them cannot compile. These portable
 // forms stand in for them on EXL3_MAXWELL only: the fused forms are a two-step multiply+add (one extra
@@ -124,5 +132,5 @@ __device__ __forceinline__ half2 exl3_h2rcp(half2 a)
 #if defined(USE_ROCM) || EXL3_MAXWELL
     #define EXL3_DP4A(a, b, c) exl3_dp4a_us(a, b, c)
 #else
-    #define EXL3_DP4A(a, b, c) __dp4a(a, b, c)
+    #define EXL3_DP4A(a, b, c) exl3_dp4a_us_asm(a, b, c)
 #endif
