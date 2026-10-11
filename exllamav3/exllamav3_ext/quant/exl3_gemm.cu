@@ -359,6 +359,16 @@ int exl3_gemm_gr
     );
     if (!kernel) return 0;
 
+    // Maxwell: request only the per-shape smem (not the 48 KB device max) so the bounded launch's
+    // occupancy query sees the real footprint. Shape 8 at K=4 is 14400 B -> 3 blocks/SM (512-thread
+    // block) -> 75% occupancy; the 48 KB request would read as 1 block/SM (25%). Clamped to smem_max.
+    size_t smem_launch = smem_max;
+    if (cc == CC_MAXWELL)
+    {
+        int need = exl3_gemm_shape_smem(shape_idx, K, half_k);
+        if (need > 0 && need < smem_max) smem_launch = need;
+    }
+
     // Launch
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
@@ -372,7 +382,7 @@ int exl3_gemm_gr
         num_sms,
         block_dim,
         kernelArgs,
-        smem_max,
+        smem_launch,
         stream
     );
     add_graph_args((void*) kernel);

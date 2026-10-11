@@ -67,9 +67,12 @@ void exl3_gemm_kernel_inner
     static_assert(TILESIZE_M >= 16 && TILESIZE_M % 16 == 0, "Invalid kernel params");
     static_assert(TILESIZE_K % 16 == 0, "Invalid kernel params");
     static_assert(TILESIZE_N % 128 == 0, "Invalid kernel params");
+    // The Maxwell fp32 FMA inner builds a 2^bits-float dequant LUT in shared memory (exl3_dq_lut_build);
+    // the mma path allocates none. Must match the lut_bytes term in exl3_gemm_smem_bytes.
+    constexpr int lut_size = EXL3_MAXWELL ? (1 << bits) : 0;   // floats
     static_assert
     (
-        SMEM_MAX >= SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size,
+        SMEM_MAX >= SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size + 4 * lut_size,
         "Invalid kernel params (insufficient shared memory for shape)"
     );
     // The host filters shapes by asking exl3_gemm_smem_bytes() what this layout costs; if that
@@ -79,7 +82,7 @@ void exl3_gemm_kernel_inner
     (
         exl3_gemm_smem_bytes(TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES,
                              bits, half_k, shmem_out_had)
-            == SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size,
+            == SH_STAGES * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size + 4 * lut_size,
         "exl3_gemm_smem_bytes() disagrees with the kernel's shared memory layout"
     );
 
@@ -88,6 +91,8 @@ void exl3_gemm_kernel_inner
     half* sh_a = shared;
     uint16_t* sh_b = (uint16_t*) (sh_a + SH_STAGES * sh_a_stage_size);
     float* sh_c = (float*) (sh_b + sh_b_stage_size * SH_STAGES);
+    // fp32 dequant LUT (Maxwell FMA path only); lut[code] = float(decode_3inst<cb>(code))
+    float* lut = sh_c + sh_c_size;
 
     // Thread index
     int t = threadIdx.x % EXL3_GEMM_BASE_THREADS;
@@ -228,6 +233,14 @@ void exl3_gemm_kernel_inner
     #if EXL3_GEMM_H_ACC
         register FragC_h frag_c_h[TILEBLOCKS_M][FRAGS_N_PER_WARP];
     #endif
+    // Maxwell fp32 FMA path: the dequantized B fragment is fp32 (a LUT load per weight), not the
+    // half2 the mma path feeds to the tensor cores. The mma B fragment is 4 values (b[0][0], b[0][1],
+    // b[1][0], b[1][1]); same per-lane (k, column) mapping.
+    using FragB_f32 = Vec<float, 4>;
+    register FragB_f32 frag_b_f32[FRAG_STAGES][FRAGS_N_PER_WARP];
+    // The shared A stage a fragment's B was loaded from, stashed in load_frags so the FMA reads A from
+    // the same stage as that B (sh1_a_ptr advances after load_frags, so it must not be read live)
+    half* maxwell_a_ptr[FRAG_STAGES];
 
     auto advance2 = [&] ()
     {
@@ -293,7 +306,10 @@ void exl3_gemm_kernel_inner
     {
         if (!slice1_iters) return;
 
-        // A fragments (XOR-swizzled shared memory layout)
+        // A fragments (XOR-swizzled shared memory layout). The Maxwell FMA matmul reads A straight from the
+        // swizzled shared tile, so no ldmatrix fragment is loaded; stash the stage for the FMA (it must
+        // not read sh1_a_ptr live, which advances after this point).
+        if constexpr (!EXL3_MAXWELL)
         {
             int r = (lane_id % 8) + 8 * ((lane_id / 8) % 2);
             int base_c = lane_id / 16 + sub_k * 2;
@@ -305,15 +321,22 @@ void exl3_gemm_kernel_inner
                 ldsm4(frag_a[TILEBLOCKS_M == 1 ? buf : m], (int4*) sh1_a_ptr + R * A_COLS + c_swizzled);
             }
         }
+        else
+        {
+            maxwell_a_ptr[buf] = sh1_a_ptr;
+        }
 
-        // B fragments
+        // B fragments: half2 for the mma path, fp32 (a LUT load per weight) for the Maxwell FMA path
         #pragma unroll
         for (int n2 = 0; n2 < FRAGS_N_PER_WARP; n2 += 2)
         {
             int sub_n2 = warp_id * FRAGS_N_PER_WARP / 2 + n2 / 2;
             const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * TILE_U16);
 
-            dq_dispatch<bits, cb, half_k>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
+            if constexpr (EXL3_MAXWELL)
+                exl3_dq_dispatch_f32<bits, cb, half_k>(shb, lane_id << 3, lut, frag_b_f32[buf][n2], frag_b_f32[buf][n2 + 1]);
+            else
+                dq_dispatch<bits, cb, half_k>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
         }
 
         __syncthreads();
@@ -892,7 +915,82 @@ void exl3_gemm_kernel_inner
     // Perform tensor core matmul on current tile
     auto matmul = [&] (int buf)
     {
-        if constexpr (TILEBLOCKS_M == 1)
+        if constexpr (EXL3_MAXWELL)
+        {
+            // fp32 FMA matmul (no tensor cores), accumulating DIRECTLY in fp32 (frag_c). Output layout
+            // matches the mma C fragment the downstream reduce/write expects: a lane owns rows g = lane/4
+            // and g+8, columns 2t and 2t+1 (t = lane%4) per n-block.
+            //
+            // B is the fp32 dequantized fragment in the mma B layout (column g = lane/4, k = 2t..); the mma
+            // C columns 2t/2t+1 are not the lane's own B column, so they are gathered across the warp (the
+            // same lane routing the mma does internally). A is read straight from the swizzled shared tile
+            // (fp16 storage, cvt -> fp32 lossless). The lane's k-range is koff = 2t (+8); the four lanes of a
+            // (lane/4) group cover the whole k=16 and are summed with a warp shuffle.
+            const int t = lane_id & 3;
+            const int g = lane_id >> 2;
+            const int kc = sub_k * 2;   // int4 column of the 16-half k-half this sub_k owns
+            const int sw0 = (g >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK;
+            const int sw1 = ((g + 8) >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK;
+            const half* row0 = maxwell_a_ptr[buf] + g * TILESIZE_K;
+            const half* row1 = maxwell_a_ptr[buf] + (g + 8) * TILESIZE_K;
+            #pragma unroll
+            for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
+            {
+                // Gather the mma C columns (2t, 2t+1) for all k from the dequantized B fragment. b_c[j] =
+                // B[j][2t], b_d[j] = B[j][2t+1], j = 0..15 (the 8 k-pairs as even/odd float2 pairs)
+                float2 b_c[8], b_d[8];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i)
+                {
+                    b_c[i].x     = __shfl_xor_sync(0xffffffffu, frag_b_f32[buf][n][0], 8 * t + i);
+                    b_c[i].y     = __shfl_xor_sync(0xffffffffu, frag_b_f32[buf][n][1], 8 * t + i);
+                    b_c[4 + i].x = __shfl_xor_sync(0xffffffffu, frag_b_f32[buf][n][2], 8 * t + i);
+                    b_c[4 + i].y = __shfl_xor_sync(0xffffffffu, frag_b_f32[buf][n][3], 8 * t + i);
+                    b_d[i].x     = __shfl_xor_sync(0xffffffffu, frag_b_f32[buf][n][0], 8 * t + 4 + i);
+                    b_d[i].y     = __shfl_xor_sync(0xffffffffu, frag_b_f32[buf][n][1], 8 * t + 4 + i);
+                    b_d[4 + i].x = __shfl_xor_sync(0xffffffffu, frag_b_f32[buf][n][2], 8 * t + 4 + i);
+                    b_d[4 + i].y = __shfl_xor_sync(0xffffffffu, frag_b_f32[buf][n][3], 8 * t + 4 + i);
+                }
+                // A rows g and g+8 for all k, from the swizzled shared tile (fp16 -> fp32)
+                float2 a0[8], a1[8];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i)
+                {
+                    a0[i]     = __half22float2(*(const half2*) (row0 + ((kc + 0) ^ sw0) * 8 + 2 * i));
+                    a0[4 + i] = __half22float2(*(const half2*) (row0 + ((kc + 1) ^ sw0) * 8 + 2 * i));
+                    a1[i]     = __half22float2(*(const half2*) (row1 + ((kc + 0) ^ sw1) * 8 + 2 * i));
+                    a1[4 + i] = __half22float2(*(const half2*) (row1 + ((kc + 1) ^ sw1) * 8 + 2 * i));
+                }
+                // Four mma C elements: dot of each A row against the two B columns
+                float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i)
+                {
+                    c0 = fmaf(a0[i].x, b_c[i].x, c0);
+                    c0 = fmaf(a0[i].y, b_c[i].y, c0);
+                    c1 = fmaf(a0[i].x, b_d[i].x, c1);
+                    c1 = fmaf(a0[i].y, b_d[i].y, c1);
+                    c2 = fmaf(a1[i].x, b_c[i].x, c2);
+                    c2 = fmaf(a1[i].y, b_c[i].y, c2);
+                    c3 = fmaf(a1[i].x, b_d[i].x, c3);
+                    c3 = fmaf(a1[i].y, b_d[i].y, c3);
+                }
+                // Warp k-reduce: the four (lane%4) lanes split the k=16 range for the same (row, col)
+                c0 += __shfl_xor_sync(0xffffffffu, c0, 1);
+                c0 += __shfl_xor_sync(0xffffffffu, c0, 2);
+                c1 += __shfl_xor_sync(0xffffffffu, c1, 1);
+                c1 += __shfl_xor_sync(0xffffffffu, c1, 2);
+                c2 += __shfl_xor_sync(0xffffffffu, c2, 1);
+                c2 += __shfl_xor_sync(0xffffffffu, c2, 2);
+                c3 += __shfl_xor_sync(0xffffffffu, c3, 1);
+                c3 += __shfl_xor_sync(0xffffffffu, c3, 2);
+                frag_c[0][n][0] += c0;
+                frag_c[0][n][1] += c1;
+                frag_c[0][n][2] += c2;
+                frag_c[0][n][3] += c3;
+            }
+        }
+        else if constexpr (TILEBLOCKS_M == 1)
         {
             #pragma unroll
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
@@ -919,6 +1017,14 @@ void exl3_gemm_kernel_inner
                 }
         }
     };
+
+    // Build the fp32 dequant LUT once per block (Maxwell FMA path). Every thread fills the same 2^bits
+    // entries; the barrier makes the table visible before the dequant reads it in load_frags.
+    if constexpr (EXL3_MAXWELL)
+    {
+        exl3_dq_lut_build<cb, bits>(lut);
+        __syncthreads();
+    }
 
     // Start global to shared pipeline
     #pragma unroll

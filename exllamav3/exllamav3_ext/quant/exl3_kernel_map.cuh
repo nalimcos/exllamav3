@@ -118,16 +118,20 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 #define EXL3_GEMM_SHAPE_5     32,     32,    128,     3,     3
 #define EXL3_GEMM_SHAPE_6     48,     32,    128,     3,     3
 #define EXL3_GEMM_SHAPE_7     64,     32,    128,     3,     3
+// Maxwell (48 KB): the 16x32x128 tile at SH_STAGES=2 is the occupancy-tuned shape (3 blocks/SM =
+// 75% on the 512-thread block, see the 48 KB ladder in maxwell-design/workstream-b-design.md). It
+// is selected for CC_MAXWELL and also offered to the autotuner; other tiers never pick it.
+#define EXL3_GEMM_SHAPE_8     16,     32,    128,     2,     3
 
-#define EXL3_GEMM_TILESIZE_M  0, 16, 16, 16, 16, 32, 48, 64
-#define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16, 32, 32, 32
-#define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512, 128, 128, 128
-#define EXL3_GEMM_BLOCKDIM    0, 256, 512, 512, 256, 512, 512, 512
+#define EXL3_GEMM_TILESIZE_M  0, 16, 16, 16, 16, 32, 48, 64, 16
+#define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16, 32, 32, 32, 32
+#define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512, 128, 128, 128, 128
+#define EXL3_GEMM_BLOCKDIM    0, 256, 512, 512, 256, 512, 512, 512, 512
 
-#define EXL3_GEMM_NUM_SHAPES 7
+#define EXL3_GEMM_NUM_SHAPES 8
 #define EXL3_GEMM_FOREACH_SHAPE(X, ...) \
     X(1, __VA_ARGS__) X(2, __VA_ARGS__) X(3, __VA_ARGS__) X(4, __VA_ARGS__) \
-    X(5, __VA_ARGS__) X(6, __VA_ARGS__) X(7, __VA_ARGS__)
+    X(5, __VA_ARGS__) X(6, __VA_ARGS__) X(7, __VA_ARGS__) X(8, __VA_ARGS__)
 
 #endif
 
@@ -195,7 +199,9 @@ __host__ __device__ constexpr int exl3_gemm_smem_bytes(
     int sh_a_stage_size = tilesize_m * tilesize_k;                             // halfs
     int sh_c_size = 4 * EXL3_GEMM_BASE_THREADS * frags_n_per_warp * tileblocks_m;   // floats
     if (sh_c_had > sh_c_size) sh_c_size = sh_c_had;
-    return sh_stages * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size;
+    // The Maxwell fp32 FMA inner builds a 2^bits-float dequant LUT in shared memory; the mma path does not
+    int lut_bytes = EXL3_MAXWELL ? 4 * (1 << bits) : 0;
+    return sh_stages * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size + lut_bytes;
 #endif
 }
 

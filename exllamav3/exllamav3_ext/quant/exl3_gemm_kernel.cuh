@@ -12,9 +12,10 @@
 #endif
 #include "exl3_devctx.cuh"
 
-// Whole-grid barrier. On ROCm the kernels are plain launches (EXL3_COOP_LAUNCH, coop_autotune.cuh) and sync
-// through a device counter; every block is resident (the grid is at most one block per multiprocessor)
-#if defined(USE_ROCM)
+// Whole-grid barrier. On ROCm and Maxwell the kernels are plain launches (EXL3_COOP_LAUNCH,
+// coop_autotune.cuh) and sync through a device counter; every block is resident (the grid is bounded to
+// the co-resident count). The other CUDA tiers use the cooperative grid.sync().
+#if defined(USE_ROCM) || EXL3_MAXWELL
     #define EXL3_GRID_SYNC() group_barrier(0, gridDim.x * gridDim.y * gridDim.z, locks + EXL3_GRID_BARRIER_OFFSET)
 #else
     #define EXL3_GRID_SYNC() grid.sync()

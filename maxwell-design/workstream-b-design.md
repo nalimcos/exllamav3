@@ -204,6 +204,51 @@ Verify M10 smem opt-in (GM107: 48 KB max / 32 KB default) — the host filter ha
 
 ---
 
+## 48 KB ladder (finalized)
+
+Concrete numbers for the shipped Maxwell shape set. The per-shape shared-memory footprint is
+
+    SH_STAGES * (2*sh_a_stage + 2*sh_b_stage) + 4*sh_c_size + 4*lut_size
+
+where the `2*` / `4*` are the half/uint16/float -> byte conversions and `lut_size = 1<<bits`
+floats (the Maxwell fp32 dequant LUT; the mma path allocates none). `sh_b_stage` grows with the
+bitrate (`TILE_U16 = 16*K`) and the LUT grows `2..256` floats over K=1..8.
+
+Shape 8 (16x32x128, SH_STAGES=2, FRAG_STAGES=3) — the CC_MAXWELL default:
+
+| K  | smem     | blocks/SM (512-thread) | occupancy (2048 max threads/SM) |
+|----|----------|------------------------|----------------------------------|
+| 1  | 11272 B  | 4                      | 100%                             |
+| 2  | 12304 B  | 3                      | 75%                              |
+| 3  | 13344 B  | 3                      | 75%                              |
+| 4  | 14400 B  | 3                      | 75%                              |
+| 5  | 15488 B  | 3                      | 75%                              |
+| 6  | 16640 B  | 2                      | 50%                              |
+| 7  | 17920 B  | 2                      | 50%                              |
+| 8  | 19456 B  | 2                      | 50%                              |
+
+At K=4 the per-shape smem is 14400 B -> 3 blocks/SM -> 75% occupancy. That is the value the
+per-shape smem request (Fix 1) feeds to `cudaOccupancyMaxActiveBlocksPerMultiprocessor`; the 48 KB
+device-max request would read as 1 block/SM (25%).
+
+Why SH_STAGES=2 (not 4): `cp.async` is a synchronous load on Maxwell (no async overlap), so latency
+hiding is occupancy-based. Higher occupancy (3 blocks, 75%) beats a deeper pipeline (2 blocks, 50%);
+the extra stage does not overlap the synchronous tile load.
+
+Why shape 3 (16x32x256, SH_STAGES=4) is excluded: it overflows the 48 KB budget at K>=7 (49664 B at
+K=7, 54272 B at K=8) and, even where it fits (K<=6), runs at 1 block/SM (25%) — far below shape 8's
+3 blocks (75%). It is never returned by `select_gemm_shape` for CC_MAXWELL.
+
+Two distinct mechanisms gate the launch:
+
+- The host shape filter (`exl3_gemm_shape_compat` vs `get_smem_request` = 48 KB on Maxwell) decides
+  WHICH shapes are candidates.
+- The per-shape smem request (Fix 1) sets the OCCUPANCY: it is the value `exl3_launch_grid_bounded`
+  passes to `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, so the grid bound reflects the real
+  footprint (3 blocks/SM for shape 8) rather than the 48 KB device max (1 block/SM).
+
+---
+
 ## CPU dequant unit tests
 
 `tests/test_maxwell_dequant.py` is a pure-Python/NumPy pytest that replicates the exact

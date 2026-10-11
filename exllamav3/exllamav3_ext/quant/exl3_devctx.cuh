@@ -14,12 +14,12 @@
 #define MOE_MAX_GROUPS 64
 #define MOE_SCHED_OFFSET (MAX_TILES_C + 2 * MAX_BARRIERS)
 #define MOE_SCHED_INTS (2 + MOE_MAX_GROUPS)
-#if defined(USE_ROCM)
-    // Whole-grid barrier of the EXL3 GEMM kernels (counter + sense), which ROCm launches without the
-    // cooperative launch (see EXL3_COOP_LAUNCH in coop_autotune.cuh)
-    #define EXL3_GRID_BARRIER_OFFSET (MOE_SCHED_OFFSET + MOE_SCHED_INTS)
-    #define EXL3_GRID_BARRIER_INTS 2
-#endif
+// Whole-grid barrier of the EXL3 GEMM kernels (counter + sense). ROCm and Maxwell launch without the
+// cooperative launch (see EXL3_COOP_LAUNCH in coop_autotune.cuh) and synchronize through this device
+// barrier (EXL3_GRID_SYNC in exl3_gemm_kernel.cuh); the other CUDA tiers use grid.sync() and do not
+// touch it, but the buffer is always allocated so the offset is uniform.
+#define EXL3_GRID_BARRIER_OFFSET (MOE_SCHED_OFFSET + MOE_SCHED_INTS)
+#define EXL3_GRID_BARRIER_INTS 2
 
 // Workspace size
 #define WORKSPACE_SIZE (16*1024*1024)
