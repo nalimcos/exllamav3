@@ -328,3 +328,12 @@ __device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB&
         dq4<bits, cb>(ptr, idx + 4, frag1);
     }
 }
+
+// fp32 dequant of a K-bit code via the shared LUT (exl3_dq_lut_build, codebook.cuh): one smem load.
+// This is the per-weight dequant the fp32 GEMM/GEMV call on Maxwell, replacing the half2
+// decode_3inst_2 the mma path uses. The bit-extraction above (dq_dispatch) is unchanged; the
+// consumer extracts the raw K-bit code and feeds it here.
+__device__ __forceinline__ float exl3_dq_lut(const float* lut, uint32_t code)
+{
+    return lut[code];
+}

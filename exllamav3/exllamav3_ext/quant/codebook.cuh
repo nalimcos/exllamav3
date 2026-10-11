@@ -147,6 +147,21 @@ __device__ inline float decode_3inst_f_diff(uint64_t x, float d)
     return __half2float(decode_3inst<cb>(x)) - d;
 }
 
+// fp32 dequant LUT. For a given (K, cb) the codebook is a fixed table of 2^K values; instead of
+// running the 3-instruction decode per weight, a block builds the table once in shared memory and
+// each weight does a single load. lut[code] = float(decode_3inst<cb>(code)) -- the exact fp16
+// codebook result upcast to fp32, so the fp32 GEMM/GEMV dequant is bit-identical to the half path.
+// Max size is 2^8 = 256 floats (1 KB); for K < 8 only the first 2^K entries are valid. The same
+// math is replicated in tests/test_maxwell_dequant.py (the CPU unit test).
+template <int cb, int K>
+__device__ __forceinline__ void exl3_dq_lut_build(float* lut)
+{
+    constexpr int N = 1 << K;
+    #pragma unroll
+    for (int code = 0; code < N; ++code)
+        lut[code] = decode_3inst_f<cb>(code);
+}
+
 // "2MAD" procedural codebook, much more overhead than 3INST, slightly better distribution at 2bpw
 // Not used currently
 
