@@ -91,10 +91,10 @@ __device__ __forceinline__ void exl3_dq_codes_4(const uint32_t* ptr, int idx, ui
     }
 }
 
-// Shared bit-extraction: the 8 raw K-bit code words (w0..w7) at a dequant offset, one shf/BFE pass.
+// Shared bit-extraction: the 8 16-bit sliding windows (w0..w7) at a dequant offset, one shf/BFE pass.
 // This is the single extraction the half2 dq_dispatch and the fp32 exl3_dq_dispatch_f32 both consume;
-// only the decode differs (decode_3inst_2 vs exl3_dq_lut). Bits 5..8 reuse exl3_dq_codes_4. Each word
-// holds its K-bit code in the low 16 bits; the consumers re-mask with & 0xffff (a no-op where the
+// only the decode differs (decode_3inst_2 vs decode_3inst_f). Bits 5..8 reuse exl3_dq_codes_4. Each
+// window holds its 16 bits in the low 16 bits; the consumers re-mask with & 0xffff (a no-op where the
 // source already masked).
 template <int bits, bool half_k = false>
 __device__ __forceinline__ void exl3_dq_codes(const uint32_t* ptr, int idx, uint32_t& w0, uint32_t& w1, uint32_t& w2, uint32_t& w3, uint32_t& w4, uint32_t& w5, uint32_t& w6, uint32_t& w7)
@@ -161,14 +161,6 @@ __device__ __forceinline__ void exl3_dq_codes(const uint32_t* ptr, int idx, uint
     }
 }
 
-// fp32 dequant of a K-bit code via the shared LUT (exl3_dq_lut_build, codebook.cuh): one smem load.
-// This is the per-weight dequant the fp32 GEMM/GEMV call on Maxwell, replacing the half2
-// decode_3inst_2 the mma path uses.
-__device__ __forceinline__ float exl3_dq_lut(const float* lut, uint32_t code)
-{
-    return lut[code];
-}
-
 // half2 B-fragment dequant (the mma path). Shared bit-extraction (exl3_dq_codes) + the half2
 // decode_3inst_2 per code pair.
 template <int bits, int cb, bool half_k = false>
@@ -183,20 +175,22 @@ __device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB&
 }
 
 // fp32 B-fragment dequant for the Maxwell FMA GEMM. Same shared bit-extraction as dq_dispatch
-// (exl3_dq_codes), but each extracted K-bit code becomes a fp32 LUT load (exl3_dq_lut) instead of a
-// half2 decode_3inst_2. The codes land where dq_dispatch would: frag0 (n-block n2) = the mma B
-// fragment (w0..w3), frag1 (n-block n2+1) = the next block (w4..w7).
+// (exl3_dq_codes), but each extracted 16-bit sliding window is dequantized PROCEDURALLY with
+// decode_3inst_f<cb> (fp32, bit-identical to the half path) instead of a half2 decode_3inst_2. The
+// window spans 16/K consecutive K-bit codes, so it takes up to 2^16 values and a LUT is infeasible.
+// The windows land where dq_dispatch would: frag0 (n-block n2) = the mma B fragment (w0..w3),
+// frag1 (n-block n2+1) = the next block (w4..w7).
 template <int bits, int cb, bool half_k = false>
-__device__ __forceinline__ void exl3_dq_dispatch_f32(const uint32_t* ptr, int idx, const float* lut, Vec<float, 4>& frag0, Vec<float, 4>& frag1)
+__device__ __forceinline__ void exl3_dq_dispatch_f32(const uint32_t* ptr, int idx, Vec<float, 4>& frag0, Vec<float, 4>& frag1)
 {
     uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
     exl3_dq_codes<bits, half_k>(ptr, idx, w0, w1, w2, w3, w4, w5, w6, w7);
-    frag0[0] = exl3_dq_lut(lut, w0 & 0xffff);
-    frag0[1] = exl3_dq_lut(lut, w1 & 0xffff);
-    frag0[2] = exl3_dq_lut(lut, w2 & 0xffff);
-    frag0[3] = exl3_dq_lut(lut, w3 & 0xffff);
-    frag1[0] = exl3_dq_lut(lut, w4 & 0xffff);
-    frag1[1] = exl3_dq_lut(lut, w5 & 0xffff);
-    frag1[2] = exl3_dq_lut(lut, w6 & 0xffff);
-    frag1[3] = exl3_dq_lut(lut, w7 & 0xffff);
+    frag0[0] = decode_3inst_f<cb>(w0 & 0xffff);
+    frag0[1] = decode_3inst_f<cb>(w1 & 0xffff);
+    frag0[2] = decode_3inst_f<cb>(w2 & 0xffff);
+    frag0[3] = decode_3inst_f<cb>(w3 & 0xffff);
+    frag1[0] = decode_3inst_f<cb>(w4 & 0xffff);
+    frag1[1] = decode_3inst_f<cb>(w5 & 0xffff);
+    frag1[2] = decode_3inst_f<cb>(w6 & 0xffff);
+    frag1[3] = decode_3inst_f<cb>(w7 & 0xffff);
 }

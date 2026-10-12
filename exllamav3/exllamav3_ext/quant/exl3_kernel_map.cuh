@@ -235,9 +235,7 @@ __host__ __device__ constexpr int exl3_gemm_smem_bytes(
     int sh_a_stage_size = tilesize_m * tilesize_k;                             // halfs
     int sh_c_size = 4 * EXL3_GEMM_BASE_THREADS * frags_n_per_warp * tileblocks_m;   // floats
     if (sh_c_had > sh_c_size) sh_c_size = sh_c_had;
-    // The Maxwell fp32 FMA inner builds a 2^bits-float dequant LUT in shared memory; the mma path does not
-    int lut_bytes = EXL3_MAXWELL ? 4 * (1 << bits) : 0;
-    return sh_stages * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size + lut_bytes;
+    return sh_stages * (2 * sh_a_stage_size + 2 * sh_b_stage_size) + 4 * sh_c_size;
 #endif
 }
 

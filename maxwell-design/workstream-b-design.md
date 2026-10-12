@@ -1,7 +1,7 @@
 # Workstream B — Dequant core + dense prefill GEMM for Maxwell
 
 Scope: make `exl3_gemm` actually run on Maxwell (M40 CC5.2, M10 CC5.0). This is the
-dequant core (a shared fp32, K-dependent LUT) plus the dense prefill GEMM (fp32 FMA),
+dequant core (a procedural fp32 dequant, no LUT) plus the dense prefill GEMM (fp32 FMA),
 the synchronization rework it needs, and the shared-memory tile/stage ladder. The dequant
 core is also the substrate Workstream C (GEMV) reuses.
 
@@ -50,52 +50,46 @@ path. Workstream B makes `exl3_gemm` actually run on Maxwell.
 
 ---
 
-## Dequant core (fp32, K-dependent LUT)
+## Dequant core (procedural fp32, no LUT)
 
 ### Design
 
-One shared-memory LUT per (K, cb), size `2^K` floats:
+The dequant input is a **16-bit sliding window**, NOT a K-bit code. `decode_3inst<cb>(x)`
+depends on ALL 16 bits of x, and the extractor (`exl3_dq_codes`) produces 16-bit windows
+(BFE16) each spanning 16/K consecutive K-bit stored codes. So the dequant input takes up to
+2^16 = 65536 distinct values.
 
-    lut[code] = float( decode_3inst<cb>(code) )
+A LUT is infeasible:
 
-The table is built by calling the EXISTING `decode_3inst<cb>` / `decode_3inst_2` and
-upcasting the half result to float (`decode_3inst_f`). This guarantees the LUT holds the
-exact fp16 codebook values: it replicates the fp16 roundings of the mul1 path (cb2) and
-the lop3/hadd of cb0/cb1, bit-for-bit. It UNIFIES all three codebooks (cb0/cb1/cb2) into
-one `lut[code]` lookup — no per-cb ALU decode path is needed on the hot loop.
+- A `2^K` LUT (sized for a K-bit code) is undersized — indexing it with the full 16-bit
+  window reads out of bounds for most weights.
+- A `2^16` LUT is 65536 floats = 256 KB, far over the 48 KB shared-memory budget.
 
-- Built once per block, in shared memory, by running the existing dequant math for each
-  code `0 .. 2^K - 1`. Max size is `2^8 = 256` floats (1 KB) at K=8.
-- Per weight in the consumer (GEMM/GEMV): extract the K-bit code (bit-extraction via
-  `dq_dispatch`, unchanged), then `w = lut[code]` (1 LDS) and `acc += a * w` (1 FMA).
-  This is the "1 LUT-load + 1 FMA per weight" the plan requires.
-- K-dependent size: K <= 4 gives a LUT of <= 16 floats (64 B); K > 4 grows up to 256
-  (1 KB). Both fit in shared memory.
+So the dequant is the **procedural ALU byte-sum** (the plan's "ALU byte-sum" option): the
+existing `decode_3inst<cb>` math (IMUL + portable byte-sum `EXL3_DP4A` + scale) run in fp16
+and upcast to float (`decode_3inst_f<cb>`), one per weight. This is bit-identical to the
+half path — same fp16 double-rounding for mul1 (cb2), same lop3/hadd for cb0/cb1 — so the
+fp32 GEMM dequant is exact, not a fresh fp32 `byte_sum * k_inv + k_bias` (which drifts by
+one fp16 ulp and is not fp16-representable).
 
-The LUT value table must match the EXACT fp16 codebook math, not a fresh fp32
-`byte_sum * k_inv + k_bias`: the fresh fp32 form drifts by one fp16 ulp (for cb2, 255 of
-256 codes differ and the result is not fp16-representable). Every LUT value is an fp16
-result upcast to fp32, so every value is exactly fp16-representable — a property the CPU
-test asserts.
+The bit-extraction (shf/BFE16) is SHARED with the non-Maxwell mma path (the H1 refactor,
+`exl3_dq_codes`); only the decode differs (`decode_3inst_f` here vs `decode_3inst_2` there).
 
 ### Implementation (shipped)
 
-- `exl3_dq_lut_build<cb, K>(float* lut)` in `quant/codebook.cuh`: fills
-  `lut[code] = decode_3inst_f<cb>(code)` for `code < 2^K`. Device-only, unrolled.
-- `exl3_dq_lut(lut, code)` in `quant/exl3_dq.cuh`: the fp32 dequant of a K-bit code,
-  one shared-memory load. This is what the GEMM/GEMV call.
-- `decode_3inst` / `decode_3inst_2` are unchanged (the source of truth); the LUT is a
-  precomputation over them, not a replacement. `decode_3inst_2` stays intact for the
-  non-Maxwell mma path.
-- Bit-extraction (`dq_dispatch`, shf/bfe) is unchanged.
+- `decode_3inst_f<cb>(x)` in `quant/codebook.cuh`: the procedural fp32 dequant,
+  `__half2float(decode_3inst<cb>(x))`. Bit-identical to the half path.
+- `exl3_dq_dispatch_f32` in `quant/exl3_dq.cuh`: shared bit-extraction (`exl3_dq_codes`) +
+  `decode_3inst_f<cb>` per weight. No LUT. This is what the GEMM calls.
+- `decode_3inst` / `decode_3inst_2` are unchanged (the source of truth). `decode_3inst_2`
+  stays intact for the non-Maxwell mma path.
+- The LUT (`exl3_dq_lut_build`, `exl3_dq_lut`) is removed.
 
-### Documented alternative (not implemented — no GPU to profile)
+### ALU-bound on Maxwell (no dp4a)
 
-For K <= 2 the shared-memory LUT has bank conflicts (K=1 -> 16-way, K=2 -> 8-way). There,
-the portable ALU byte-sum (`exl3_dp4a_us`, on the integer pipe, overlapping fp32) can win.
-Ship LUT-for-all-K as the base; add a K<=2 -> ALU dispatch only if on-hardware profiling
-shows the dequant is the bottleneck. Do NOT use `__constant__` memory: random per-lane
-access serializes.
+Maxwell has no `dp4a`, so the byte-sum runs on the portable loop `exl3_dp4a_us` (~16 INT
+ops/weight) on the integer pipe, overlapping the fp32 FMA. The B dequant is amortized over
+the 16 M-rows per k-tile (each extracted window dequantizes once and feeds all 16 rows).
 
 ---
 
@@ -118,24 +112,26 @@ Do NOT port the gtx16-full MoE CORE inner. It is MoE-hardcoded:
 16-row accumulators, fp16-out.
 
 Instead, in the EXISTING dense `exl3_gemm_inner.cuh`, REPLACE ONLY the `matmul` lambda
-(mma -> fp32 FMA) and the B-dequant (half2 -> fp32 LUT). Keep the existing M-slab loop,
-input/output Hadamard, split-k (`barrier_acquire`/`barrier_release`), `c_fp32` output, and
-the double-buffered pipeline — they are arch-independent and already present. This is a
-matmul-swap, not a merge.
+(mma -> fp32 FMA) and the B-dequant (half2 -> fp32 procedural decode). Keep the existing
+M-slab loop, input/output Hadamard, split-k (`barrier_acquire`/`barrier_release`), `c_fp32`
+output, and the double-buffered pipeline — they are arch-independent and already present.
+This is a matmul-swap, not a merge.
 
 The fp32 FMA inner loop reads A straight from the swizzled shared tile for the full k=16 range
-(both the `kc` and `kc+1` int4 columns, `kc = sub_k*2`) and dequantizes B to fp32 via the LUT.
-The mma C columns are not the lane's own B column, so B is gathered across the warp with
-`__shfl_xor_sync` (the mma's lane routing) and the k=16 dot is summed back across the four
-`(lane%4)` lanes with a `__shfl_xor_sync` k-reduce. Against the gtx16 CORE path it differs in:
+(both the `kc` and `kc+1` int4 columns, `kc = sub_k*2`) and dequantizes B to fp32 procedurally
+(`decode_3inst_f` per weight). The mma C columns are not the lane's own B column, so B is
+gathered across the warp with `__shfl_xor_sync` (the mma's lane routing, mask `lane_id ^ (8*t+i)`);
+with the full-A read each lane computes the FULL `C[g][2t]` over the whole k=16 range, so there
+is NO k-reduce (the four `(lane%4)` lanes hold four different columns, not a k-split of one).
+Against the gtx16 CORE path it differs in:
 
 - A is cvt fp16 -> fp32 in-loop (no fp16 FMA).
-- B is dequantized to fp32 via the LUT.
+- B is dequantized to fp32 procedurally (`decode_3inst_f` per weight, no LUT).
 - Accumulation is DIRECT fp32 (drop the fp16 partial + fold — more accurate than the gtx16
   fp16-partial CORE, matches `EXL3_GEMM_H_ACC = 0`).
 
 Per lane per k-tile: 128 fp32 FMA (the same count as the fp16 `__hfma2` version — fp32 does
-NOT halve the count) + ~64 A-cvt + ~8 LUT+FMA dequant (amortized over 16 rows).
+NOT halve the count) + ~64 A-cvt + ~8 procedural dequant (amortized over 16 rows).
 
 A is stored fp16 in shared memory (storage only) and cvt -> fp32 in the loop: this halves
 the A smem footprint versus fp32-in-smem, and the cvt is lossless. B stays quantized in
@@ -221,11 +217,11 @@ Verify M10 smem opt-in (GM107: 48 KB max / 32 KB default) — the host filter ha
 
 Concrete numbers for the shipped Maxwell shape set. The per-shape shared-memory footprint is
 
-    SH_STAGES * (2*sh_a_stage + 2*sh_b_stage) + 4*sh_c_size + 4*lut_size
+    SH_STAGES * (2*sh_a_stage + 2*sh_b_stage) + 4*sh_c_size
 
-where the `2*` / `4*` are the half/uint16/float -> byte conversions and `lut_size = 1<<bits`
-floats (the Maxwell fp32 dequant LUT; the mma path allocates none). `sh_b_stage` grows with the
-bitrate (`TILE_U16 = 16*K`) and the LUT grows `2..256` floats over K=1..8.
+where the `2*` / `4*` are the half/uint16/float -> byte conversions. There is no LUT term: the
+dequant is procedural (no shared-memory table). `sh_b_stage` grows with the bitrate
+(`TILE_U16 = 16*K`).
 
 Shape 8 (16x32x128, SH_STAGES=2, FRAG_STAGES=3) — the CC_MAXWELL default. The "max blocks/SM" and
 "max occupancy" columns are what the occupancy query could support for that smem footprint; the
@@ -233,27 +229,27 @@ persistent `num_sms` grid makes the RESIDENT occupancy 1 block/SM (25%) regardle
 
 | K  | smem     | max blocks/SM (512-thread) | max occupancy (2048 threads/SM) |
 |----|----------|---------------------------|----------------------------------|
-| 1  | 11272 B  | 4                         | 100%                             |
-| 2  | 12304 B  | 3                         | 75%                              |
-| 3  | 13344 B  | 3                         | 75%                              |
-| 4  | 14400 B  | 3                         | 75%                              |
-| 5  | 15488 B  | 3                         | 75%                              |
-| 6  | 16640 B  | 2                         | 50%                              |
-| 7  | 17920 B  | 2                         | 50%                              |
-| 8  | 19456 B  | 2                         | 50%                              |
+| 1  | 11264 B  | 4                         | 100%                             |
+| 2  | 12288 B  | 4                         | 100%                             |
+| 3  | 13312 B  | 3                         | 75%                              |
+| 4  | 14336 B  | 3                         | 75%                              |
+| 5  | 15360 B  | 3                         | 75%                              |
+| 6  | 16384 B  | 3                         | 75%                              |
+| 7  | 17408 B  | 2                         | 50%                              |
+| 8  | 18432 B  | 2                         | 50%                              |
 
-At K=4 the per-shape smem is 14400 B -> the occupancy query rates 3 blocks/SM (75%). That is the
+At K=4 the per-shape smem is 14336 B -> the occupancy query rates 3 blocks/SM (75%). That is the
 value the per-shape smem request (Fix 1) feeds to `cudaOccupancyMaxActiveBlocksPerMultiprocessor`;
 the 48 KB device-max request would read as 1 block/SM (25%). Resident occupancy is 1 block/SM
 either way, because the persistent grid caps it there.
 
 Why SH_STAGES=2 (not 4): `cp.async` is a synchronous load on Maxwell (no async overlap), so the
 smem footprint is the only thing the occupancy query can trade. SH_STAGES=2 leaves the most headroom
-and the highest query rating (3 blocks/SM at K<=5); the extra stage of SH_STAGES=4 only lowers that
-rating (2 blocks/SM) and does not overlap the synchronous tile load.
+and the highest query rating (4 blocks/SM at K<=2, 3 blocks/SM at K<=6); the extra stage of
+SH_STAGES=4 only lowers that rating and does not overlap the synchronous tile load.
 
-Why shape 3 (16x32x256, SH_STAGES=4) is excluded: it overflows the 48 KB budget at K>=7 (49664 B at
-K=7, 54272 B at K=8) and, even where it fits (K<=6), the occupancy query rates it 1 block/SM (25%)
+Why shape 3 (16x32x256, SH_STAGES=4) is excluded: it overflows the 48 KB budget at K=8 (53248 B)
+and, even where it fits (K<=7, exactly 48 KB at K=7), the occupancy query rates it 1 block/SM (25%)
 — far below shape 8's 3 blocks (75%). It is never returned by `select_gemm_shape` for CC_MAXWELL.
 
 Two distinct mechanisms gate the launch:
@@ -270,20 +266,23 @@ Two distinct mechanisms gate the launch:
 ## CPU dequant unit tests
 
 `tests/test_maxwell_dequant.py` is a pure-Python/NumPy pytest that replicates the exact
-fp16 codebook math (byte-sum / lop3 / scale for cb0/cb1/cb2) and checks the LUT value
-table against the per-code decode, across K=1..8 and cb=0/1/2.
+fp16 codebook math (byte-sum / lop3 / scale for cb0/cb1/cb2) and checks the procedural
+dequant `decode_3inst_f<cb>(x)` against the reference over the FULL 16-bit window space
+(0..0xFFFF), across cb=0/1/2.
 
-Scope: it tests the code -> value MAPPING (the LUT table), NOT the CUDA bit-extraction
-(shf/bfe) — that path is architecture-dependent and is validated on-hardware. It matches
-the EXACT fp16 math (the fp32-upcasted values), not a fresh fp32 formula. The module
-imports only `numpy` and `pytest` (no `torch.cuda`, no CUDA tensors, no device skip).
+Scope: it tests the window -> value MAPPING (the procedural dequant), NOT the CUDA
+bit-extraction (shf/bfe) — that path is architecture-dependent and is validated on-hardware.
+It matches the EXACT fp16 math (the fp32-upcasted values), not a fresh fp32 formula. Testing
+all 65536 windows is the exhaustive check: every window the extractor can produce is covered,
+for every K. The module imports only `numpy` and `pytest` (no `torch.cuda`, no CUDA tensors,
+no device skip).
 
 Assertions:
 
-- `test_lut_matches_decode`: the vectorized LUT build equals the scalar per-code decode,
-  exactly, for every code (two independent code paths, so it is not circular).
-- `test_lut_values_are_fp16`: every LUT value round-trips through fp16 (it is an fp16
-  result upcast to fp32, not a fresh fp32 value).
+- `test_dequant_matches_reference_all_windows`: every dequant value over all 65536 windows is
+  fp16-representable (an fp16 result upcast to fp32, not a fresh fp32 value).
+- `test_dequant_matches_scalar_reference`: a representative spread of 16-bit windows matches an
+  independent scalar reference (Python big-int IMUL), so the vectorized path is not circular.
 - `test_cb2_differs_from_fresh_fp32`: the mul1 path is not a fresh fp32
   `byte_sum*k_inv+k_bias` (which is not fp16-representable).
-- `test_anchor_values`: frozen code -> value pairs guard against accidental changes.
+- `test_anchor_values`: frozen window -> value pairs guard against accidental changes.
