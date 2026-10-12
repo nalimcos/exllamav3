@@ -135,9 +135,45 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 
 #endif
 
-// Instance lists, indexed by shape (slot 0 unused). Shape 1 is not currently selected anywhere
-#define EXL3_GEMM_INST(S, _bits, _half, _c_fp32, cb)  exl3_gemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_##S>,
-#define EXL3_MGEMM_INST(S, _bits, _half, _c_fp32, cb) exl3_mgemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_##S>,
+// Instance lists, indexed by shape (slot 0 unused). Shape 1 is not currently selected anywhere.
+// The per-shape kernel reference routes through EXL3_GEMM_INST_SHAPE_S / EXL3_MGEMM_INST_SHAPE_S so
+// a backend can drop specific shapes: on Maxwell the FMA matmul is dense-only (TILEBLOCKS_M == 1,
+// asserted in exl3_gemm_inner.cuh), so the multi-row tiles (shapes 5..7) are not instantiated there;
+// the selectors never return them for CC_MAXWELL.
+#define EXL3_GEMM_INST(S, _bits, _half, _c_fp32, cb)  EXL3_GEMM_INST_SHAPE_##S(_bits, _half, _c_fp32, cb),
+#define EXL3_MGEMM_INST(S, _bits, _half, _c_fp32, cb) EXL3_MGEMM_INST_SHAPE_##S(_bits, _half, _c_fp32, cb),
+
+#define EXL3_GEMM_INST_SHAPE_1(_bits, _half, _c_fp32, cb)  exl3_gemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_1>
+#define EXL3_GEMM_INST_SHAPE_2(_bits, _half, _c_fp32, cb)  exl3_gemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_2>
+#define EXL3_GEMM_INST_SHAPE_3(_bits, _half, _c_fp32, cb)  exl3_gemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_3>
+#define EXL3_GEMM_INST_SHAPE_4(_bits, _half, _c_fp32, cb)  exl3_gemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+#define EXL3_GEMM_INST_SHAPE_5(_bits, _half, _c_fp32, cb)  exl3_gemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_5>
+#define EXL3_GEMM_INST_SHAPE_6(_bits, _half, _c_fp32, cb)  exl3_gemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_6>
+#define EXL3_GEMM_INST_SHAPE_7(_bits, _half, _c_fp32, cb)  exl3_gemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_7>
+#define EXL3_GEMM_INST_SHAPE_8(_bits, _half, _c_fp32, cb)  exl3_gemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_8>
+#define EXL3_MGEMM_INST_SHAPE_1(_bits, _half, _c_fp32, cb) exl3_mgemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_1>
+#define EXL3_MGEMM_INST_SHAPE_2(_bits, _half, _c_fp32, cb) exl3_mgemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_2>
+#define EXL3_MGEMM_INST_SHAPE_3(_bits, _half, _c_fp32, cb) exl3_mgemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_3>
+#define EXL3_MGEMM_INST_SHAPE_4(_bits, _half, _c_fp32, cb) exl3_mgemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+#define EXL3_MGEMM_INST_SHAPE_5(_bits, _half, _c_fp32, cb) exl3_mgemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_5>
+#define EXL3_MGEMM_INST_SHAPE_6(_bits, _half, _c_fp32, cb) exl3_mgemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_6>
+#define EXL3_MGEMM_INST_SHAPE_7(_bits, _half, _c_fp32, cb) exl3_mgemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_7>
+#define EXL3_MGEMM_INST_SHAPE_8(_bits, _half, _c_fp32, cb) exl3_mgemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_8>
+
+#if EXL3_MAXWELL
+    #undef EXL3_GEMM_INST_SHAPE_5
+    #undef EXL3_GEMM_INST_SHAPE_6
+    #undef EXL3_GEMM_INST_SHAPE_7
+    #undef EXL3_MGEMM_INST_SHAPE_5
+    #undef EXL3_MGEMM_INST_SHAPE_6
+    #undef EXL3_MGEMM_INST_SHAPE_7
+    #define EXL3_GEMM_INST_SHAPE_5(_bits, _half, _c_fp32, cb)  nullptr
+    #define EXL3_GEMM_INST_SHAPE_6(_bits, _half, _c_fp32, cb)  nullptr
+    #define EXL3_GEMM_INST_SHAPE_7(_bits, _half, _c_fp32, cb)  nullptr
+    #define EXL3_MGEMM_INST_SHAPE_5(_bits, _half, _c_fp32, cb) nullptr
+    #define EXL3_MGEMM_INST_SHAPE_6(_bits, _half, _c_fp32, cb) nullptr
+    #define EXL3_MGEMM_INST_SHAPE_7(_bits, _half, _c_fp32, cb) nullptr
+#endif
 
 #define EXL3_GEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
     nullptr, EXL3_GEMM_FOREACH_SHAPE(EXL3_GEMM_INST, _bits, false, _c_fp32, cb)

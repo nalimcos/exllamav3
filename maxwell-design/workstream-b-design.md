@@ -123,8 +123,11 @@ input/output Hadamard, split-k (`barrier_acquire`/`barrier_release`), `c_fp32` o
 the double-buffered pipeline — they are arch-independent and already present. This is a
 matmul-swap, not a merge.
 
-The fp32 FMA inner loop borrows the gtx16 CORE path's read-A-from-swizzled-shared structure
-(`koff = 2*(lane_id&3)`, `kc = sub_k*2`, a01/a23 half2 reads) but:
+The fp32 FMA inner loop reads A straight from the swizzled shared tile for the full k=16 range
+(both the `kc` and `kc+1` int4 columns, `kc = sub_k*2`) and dequantizes B to fp32 via the LUT.
+The mma C columns are not the lane's own B column, so B is gathered across the warp with
+`__shfl_xor_sync` (the mma's lane routing) and the k=16 dot is summed back across the four
+`(lane%4)` lanes with a `__shfl_xor_sync` k-reduce. Against the gtx16 CORE path it differs in:
 
 - A is cvt fp16 -> fp32 in-loop (no fp16 FMA).
 - B is dequantized to fp32 via the LUT.
@@ -173,8 +176,9 @@ barrier and the split-k lock's co-residency requirement are satisfied.
 
 ## 48 KB tile/stage ladder
 
-Shared memory is not binding (there is headroom), but `SH_STAGES` tunes occupancy. The
-shared-memory footprint is
+Shared memory is not binding (there is headroom), but `SH_STAGES` sets the smem footprint, and
+that footprint is what the occupancy query (`cudaOccupancyMaxActiveBlocksPerMultiprocessor`)
+sees. The shared-memory footprint is
 
     SH_STAGES * (2*sh_a_stage + 2*sh_b_stage) + 4*sh_c_size
 
@@ -186,19 +190,28 @@ stage, the C tile). For the 16x32x128 tile at K=4 (`TILE_U16 = 64`):
 - `sh_c_size`  = 2048 floats = 8192 B
 - per stage = 1024 + 2048 = 3072 B
 
-| SH_STAGES | total | blocks/SM (512-thread block) | occupancy (2048 max threads/SM) |
-|-----------|-------|------------------------------|----------------------------------|
-| 2         | 14 KB | 3                            | 75%                               |
-| 3         | 17 KB | 2                            | 50%                               |
-| 4         | 20 KB | 2                            | 50%                               |
+| SH_STAGES | total | max blocks/SM (512-thread block) | max occupancy (2048 threads/SM) |
+|-----------|-------|----------------------------------|----------------------------------|
+| 2         | 14 KB | 3                                | 75%                               |
+| 3         | 17 KB | 2                                | 50%                               |
+| 4         | 20 KB | 2                                | 50%                               |
+
+These are the values the hardware COULD support (the occupancy query), not the achieved
+occupancy: the dense GEMM is a PERSISTENT kernel, launched with a `num_sms` grid (1 block/SM),
+and `exl3_launch_grid_bounded` only REDUCES the grid, never increases it. So resident occupancy
+is 1 block/SM = 512 threads = 25% (out of 2048 max threads/SM), the same as the non-Maxwell path.
+`SH_STAGES=2` minimizes the smem footprint (leaves headroom) and sets the occupancy query to 3
+blocks/SM; reaching 3 blocks/SM resident would require a NON-persistent grid (`maxb * num_sms`
+blocks, each doing a subset of the M-slabs) — a follow-up optimization, not verifiable without a
+Maxwell GPU.
 
 `cp.async` is a synchronous load on Maxwell (no async overlap), so latency hiding is
-occupancy-based: prefer higher occupancy. SH_STAGES=2 (75%) beats SH_STAGES=4 (50%). The
-shape filter (`exl3_gemm_shape_compat` vs `get_smem_request` = 48 KB on Maxwell) already
-gates shapes; a Maxwell shape set must be enabled in `select_gemm_shape` (the forced path
-currently `case CC_MAXWELL: return 0`; the autotune path filters by smem). The ladder
-derives the choice: pick `SH_STAGES` that maximizes blocks/SM while keeping >= 2 for the
-double-buffered pipeline.
+occupancy-based: prefer the smaller footprint the occupancy query rates higher. The shape filter
+(`exl3_gemm_shape_compat` vs `get_smem_request` = 48 KB on Maxwell) already gates shapes; a
+Maxwell shape set must be enabled in `select_gemm_shape` (the forced path currently
+`case CC_MAXWELL: return 0`; the autotune path filters by smem). The ladder derives the choice:
+pick `SH_STAGES` that maximizes the query's blocks/SM while keeping >= 2 for the double-buffered
+pipeline.
 
 Verify M10 smem opt-in (GM107: 48 KB max / 32 KB default) — the host filter handles it.
 
@@ -214,38 +227,43 @@ where the `2*` / `4*` are the half/uint16/float -> byte conversions and `lut_siz
 floats (the Maxwell fp32 dequant LUT; the mma path allocates none). `sh_b_stage` grows with the
 bitrate (`TILE_U16 = 16*K`) and the LUT grows `2..256` floats over K=1..8.
 
-Shape 8 (16x32x128, SH_STAGES=2, FRAG_STAGES=3) — the CC_MAXWELL default:
+Shape 8 (16x32x128, SH_STAGES=2, FRAG_STAGES=3) — the CC_MAXWELL default. The "max blocks/SM" and
+"max occupancy" columns are what the occupancy query could support for that smem footprint; the
+persistent `num_sms` grid makes the RESIDENT occupancy 1 block/SM (25%) regardless.
 
-| K  | smem     | blocks/SM (512-thread) | occupancy (2048 max threads/SM) |
-|----|----------|------------------------|----------------------------------|
-| 1  | 11272 B  | 4                      | 100%                             |
-| 2  | 12304 B  | 3                      | 75%                              |
-| 3  | 13344 B  | 3                      | 75%                              |
-| 4  | 14400 B  | 3                      | 75%                              |
-| 5  | 15488 B  | 3                      | 75%                              |
-| 6  | 16640 B  | 2                      | 50%                              |
-| 7  | 17920 B  | 2                      | 50%                              |
-| 8  | 19456 B  | 2                      | 50%                              |
+| K  | smem     | max blocks/SM (512-thread) | max occupancy (2048 threads/SM) |
+|----|----------|---------------------------|----------------------------------|
+| 1  | 11272 B  | 4                         | 100%                             |
+| 2  | 12304 B  | 3                         | 75%                              |
+| 3  | 13344 B  | 3                         | 75%                              |
+| 4  | 14400 B  | 3                         | 75%                              |
+| 5  | 15488 B  | 3                         | 75%                              |
+| 6  | 16640 B  | 2                         | 50%                              |
+| 7  | 17920 B  | 2                         | 50%                              |
+| 8  | 19456 B  | 2                         | 50%                              |
 
-At K=4 the per-shape smem is 14400 B -> 3 blocks/SM -> 75% occupancy. That is the value the
-per-shape smem request (Fix 1) feeds to `cudaOccupancyMaxActiveBlocksPerMultiprocessor`; the 48 KB
-device-max request would read as 1 block/SM (25%).
+At K=4 the per-shape smem is 14400 B -> the occupancy query rates 3 blocks/SM (75%). That is the
+value the per-shape smem request (Fix 1) feeds to `cudaOccupancyMaxActiveBlocksPerMultiprocessor`;
+the 48 KB device-max request would read as 1 block/SM (25%). Resident occupancy is 1 block/SM
+either way, because the persistent grid caps it there.
 
-Why SH_STAGES=2 (not 4): `cp.async` is a synchronous load on Maxwell (no async overlap), so latency
-hiding is occupancy-based. Higher occupancy (3 blocks, 75%) beats a deeper pipeline (2 blocks, 50%);
-the extra stage does not overlap the synchronous tile load.
+Why SH_STAGES=2 (not 4): `cp.async` is a synchronous load on Maxwell (no async overlap), so the
+smem footprint is the only thing the occupancy query can trade. SH_STAGES=2 leaves the most headroom
+and the highest query rating (3 blocks/SM at K<=5); the extra stage of SH_STAGES=4 only lowers that
+rating (2 blocks/SM) and does not overlap the synchronous tile load.
 
 Why shape 3 (16x32x256, SH_STAGES=4) is excluded: it overflows the 48 KB budget at K>=7 (49664 B at
-K=7, 54272 B at K=8) and, even where it fits (K<=6), runs at 1 block/SM (25%) — far below shape 8's
-3 blocks (75%). It is never returned by `select_gemm_shape` for CC_MAXWELL.
+K=7, 54272 B at K=8) and, even where it fits (K<=6), the occupancy query rates it 1 block/SM (25%)
+— far below shape 8's 3 blocks (75%). It is never returned by `select_gemm_shape` for CC_MAXWELL.
 
 Two distinct mechanisms gate the launch:
 
 - The host shape filter (`exl3_gemm_shape_compat` vs `get_smem_request` = 48 KB on Maxwell) decides
   WHICH shapes are candidates.
-- The per-shape smem request (Fix 1) sets the OCCUPANCY: it is the value `exl3_launch_grid_bounded`
-  passes to `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, so the grid bound reflects the real
-  footprint (3 blocks/SM for shape 8) rather than the 48 KB device max (1 block/SM).
+- The per-shape smem request (Fix 1) sets the OCCUPANCY QUERY: it is the value
+  `exl3_launch_grid_bounded` passes to `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, so the grid
+  bound reflects the real footprint (3 blocks/SM for shape 8) rather than the 48 KB device max
+  (1 block/SM). The persistent grid then caps resident occupancy at 1 block/SM.
 
 ---
 

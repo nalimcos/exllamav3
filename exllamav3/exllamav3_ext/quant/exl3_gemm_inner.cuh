@@ -237,10 +237,12 @@ void exl3_gemm_kernel_inner
     // half2 the mma path feeds to the tensor cores. The mma B fragment is 4 values (b[0][0], b[0][1],
     // b[1][0], b[1][1]); same per-lane (k, column) mapping.
     using FragB_f32 = Vec<float, 4>;
-    register FragB_f32 frag_b_f32[FRAG_STAGES][FRAGS_N_PER_WARP];
+    // Maxwell-only arrays; sized to 1 on other arches so they are eliminated (the FMA branch that
+    // reads them is compile-discarded there).
+    register FragB_f32 frag_b_f32[EXL3_MAXWELL ? FRAG_STAGES : 1][FRAGS_N_PER_WARP];
     // The shared A stage a fragment's B was loaded from, stashed in load_frags so the FMA reads A from
     // the same stage as that B (sh1_a_ptr advances after load_frags, so it must not be read live)
-    half* maxwell_a_ptr[FRAG_STAGES];
+    half* maxwell_a_ptr[EXL3_MAXWELL ? FRAG_STAGES : 1];
 
     auto advance2 = [&] ()
     {
@@ -917,15 +919,17 @@ void exl3_gemm_kernel_inner
     {
         if constexpr (EXL3_MAXWELL)
         {
+            static_assert(!EXL3_MAXWELL || TILEBLOCKS_M == 1, "Maxwell FMA matmul requires TILESIZE_M == 16");
             // fp32 FMA matmul (no tensor cores), accumulating DIRECTLY in fp32 (frag_c). Output layout
             // matches the mma C fragment the downstream reduce/write expects: a lane owns rows g = lane/4
             // and g+8, columns 2t and 2t+1 (t = lane%4) per n-block.
             //
-            // B is the fp32 dequantized fragment in the mma B layout (column g = lane/4, k = 2t..); the mma
-            // C columns 2t/2t+1 are not the lane's own B column, so they are gathered across the warp (the
-            // same lane routing the mma does internally). A is read straight from the swizzled shared tile
-            // (fp16 storage, cvt -> fp32 lossless). The lane's k-range is koff = 2t (+8); the four lanes of a
-            // (lane/4) group cover the whole k=16 and are summed with a warp shuffle.
+            // A is read straight from the swizzled shared tile for the FULL k=16 range (both the kc and
+            // kc+1 int4 columns), cvt fp16 -> fp32 lossless. B is the fp32 dequantized fragment in the mma B
+            // layout; the mma C columns 2t/2t+1 are not the lane's own B column, so they are gathered across
+            // the warp with __shfl_xor_sync (the same lane routing the mma does internally). The k=16 dot is
+            // partitioned across the four (lane%4) lanes of a (lane/4) group and summed back with a
+            // __shfl_xor_sync k-reduce.
             const int t = lane_id & 3;
             const int g = lane_id >> 2;
             const int kc = sub_k * 2;   // int4 column of the 16-half k-half this sub_k owns

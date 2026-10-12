@@ -116,17 +116,12 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int K, bool mu
     switch(cc)
     {
         case CC_MAXWELL:
-            // fp32 FMA GEMM (no tensor cores). Shape 8 (16x32x128, SH_STAGES=2) is the occupancy-tuned
-            // default (48 KB ladder: 3 blocks/SM = 75% at K=4). Where a wider tile was wanted (the old
-            // shape-3 branch), fall back to shape 2 (SH_STAGES=4), gated to the 48 KB budget. The 256-wide
-            // shape 3 overflows 48 KB at K>=7 and runs at 1 block/SM (25%) even where it fits, so it is
-            // excluded.
-            if (mod_256 && K <= 4 && size_n > 2048 && size_k > 2048)
-            {
-                int device;
-                cudaGetDevice(&device);
-                if (exl3_gemm_shape_smem(2, K, false) <= DevCtx::instance().get_smem_request(device)) return 2;
-            }
+            // fp32 FMA GEMM (no tensor cores). Shape 8 (16x32x128, SH_STAGES=2) is the uniform choice:
+            // SH_STAGES=2 minimizes the smem footprint, which sets the occupancy query to the most
+            // blocks/SM the hardware could support (3 at K<=5) and leaves headroom under the 48 KB budget.
+            // Shape 2 is the same 16x32x128 tile with a deeper pipeline (SH_STAGES=4) -- a trade aimed at
+            // very long K that is not validated on Maxwell, so it is not selected. The 256-wide shape 3
+            // overflows 48 KB at K>=7 and runs at 1 block/SM (25%) even where it fits, so it is excluded.
             return 8;
         case CC_OLD:
         case CC_AMPERE:

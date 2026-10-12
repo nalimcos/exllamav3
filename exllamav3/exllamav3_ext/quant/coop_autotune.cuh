@@ -33,7 +33,7 @@ inline cudaError_t exl3_launch_grid_bounded(void* kernel, dim3 grid, int block, 
     if (maxb > 0 && total > maxb * num_sms)
     {
         int yz = grid.y * grid.z;
-        grid.x = (yz > 0) ? (maxb * num_sms) / yz : 0;
+        grid.x = (maxb * num_sms) / yz;
     }
     return cudaLaunchKernel(kernel, grid, block, args, smem, stream);
 }
