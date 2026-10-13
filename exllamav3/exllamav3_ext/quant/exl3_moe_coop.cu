@@ -126,8 +126,8 @@ static void moe_coop_smem_optin(void* kernel, int smem)
 
 void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int cb, int device, cudaStream_t stream)
 {
-    // No tensor cores on Maxwell: the coop MoE (dp4a decode) cannot run
-    if (exl3_no_tc(DevCtx::instance().get_cc(device))) return;
+    // The gemv_tile runs on Maxwell via the fp32 FMA path (Workstream C2); the multi-row MoE GEMM
+    // tiles (m32/m64) remain declined there (exl3_moe_inst_* return nullptr on CC_MAXWELL).
     MoeCoopParams p = p_in;
     { static int dbg = std::getenv("EXL3_MOE_COOP_DBG") ? atoi(std::getenv("EXL3_MOE_COOP_DBG")) : 0; p.dbg = dbg; }
     const int slots = p.bsz * p.topk;

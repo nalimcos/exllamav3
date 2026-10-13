@@ -376,11 +376,12 @@ __device__ __forceinline__ void gemv_tile
     const int myn = max(0, min(chunk, k_end - ks0));
     const size_t slice_stride = (size_t) ntiles * TWORDS;
 
-    // A fragment row of this lane: rows[lane / 4] of the run
-    const int r0 = lane >> 2;
-    const bool r0_ok = r0 < nrows;
-    const size_t a_row0 = r0_ok ? (size_t) rows[r0] * a_stride2 : 0;
-    const half2 hzero = __half2half2(__ushort_as_half(0));
+    // A fragment row of this lane (mma path): rows[lane / 4] of the run. The FMA (Maxwell) path
+    // reads every row on every lane per k-slice, so these are unused there.
+    [[maybe_unused]] const int r0 = lane >> 2;
+    [[maybe_unused]] const bool r0_ok = r0 < nrows;
+    [[maybe_unused]] const size_t a_row0 = r0_ok ? (size_t) rows[r0] * a_stride2 : 0;
+    [[maybe_unused]] const half2 hzero = __half2half2(__ushort_as_half(0));
 
     [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
     if constexpr (bits == 2)
@@ -422,8 +423,10 @@ __device__ __forceinline__ void gemv_tile
             for (int l = 0; l < LOADS; ++l)
                 pf[d][l] = ld_b(d, l);
 
-    FragC_h ch[WNT][2] = {};
-    float2 acc0[WNT][2] = {};
+    // mma: fp16 ch folded to fp32 acc0. FMA (Maxwell): direct fp32 per-row accumulators, no fold.
+    [[maybe_unused]] FragC_h ch[WNT][2] = {};
+    [[maybe_unused]] float2 acc0[WNT][2] = {};
+    [[maybe_unused]] float accm[WNT][2][ROWS] = {};
 
     for (int ib = 0; ib < myn; ib += PF)
     {
@@ -455,76 +458,167 @@ __device__ __forceinline__ void gemv_tile
                 __syncwarp();
             }
 
-            // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
+            // A fragment, k pairs (2(lane%4), +1) and (+8, +9) at a_col. FMA (Maxwell): every lane reads each
+            // row (CORE all-rows); mma: lane covers row lane/4.
             const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
-            FragB a01, a23;
-            a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
-            a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
-            a01[1] = hzero;
-            a23[1] = hzero;
+            [[maybe_unused]] FragB a01, a23;
+            [[maybe_unused]] float ar01_x[ROWS], ar01_y[ROWS], ar23_x[ROWS], ar23_y[ROWS];   // FMA all-rows
+            if constexpr (EXL3_MAXWELL)
+            {
+                #pragma unroll
+                for (int r = 0; r < ROWS; ++r)
+                {
+                    const bool ok = r < nrows;
+                    const size_t a_row = ok ? (size_t) rows[r] * a_stride2 : 0;
+                    ar01_x[r] = ok ? __low2float(A2[a_row + a_col]) : 0.0f;
+                    ar01_y[r] = ok ? __high2float(A2[a_row + a_col]) : 0.0f;
+                    ar23_x[r] = ok ? __low2float(A2[a_row + a_col + 4]) : 0.0f;
+                    ar23_y[r] = ok ? __high2float(A2[a_row + a_col + 4]) : 0.0f;
+                }
+            }
+            else
+            {
+                a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
+                a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
+                a01[1] = hzero;
+                a23[1] = hzero;
+            }
 
             #pragma unroll
             for (int t = 0; t < WNT; ++t)
             {
-                FragB f0, f1;
-                if constexpr (!REG)
+                if constexpr (EXL3_MAXWELL)
                 {
-                    dq_dispatch<bits, cb, HALF>(stage + t * TWORDS, lane << 3, f0, f1);
-                }
-                else if constexpr (bits == 4)
-                {
-                    uint32_t aw = __shfl_sync(0xffffffffu, bw[t], (lane + 31) & 31);
-                    exl3_gemv_ns::dq8_regs_4bits<cb>(aw, bw[t], f0, f1);
-                }
-                else if constexpr (bits == 2)
-                {
-                    const uint32_t w = bw[t >> 1];
-                    const int base = (t & 1) << 4;
-                    uint32_t bwv = __shfl_sync(0xffffffffu, w, base + x_src_b);
-                    uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
-                    exl3_gemv_ns::dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
-                }
-                else  // bits == 3
-                {
-                    uint32_t awv = __shfl_sync(0xffffffffu, bw[t], x_src_a);
-                    uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], x_src_b);
-                    exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
-                }
-
-                exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
-                exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
-            }
-
-            if ((d + 1) % FOLD == 0 || i + 1 == myn)
-            {
-                #pragma unroll
-                for (int t = 0; t < WNT; ++t)
-                    #pragma unroll
-                    for (int f = 0; f < 2; ++f)
+                    Vec<float,4> f0, f1;
+                    if constexpr (!REG)
                     {
-                        acc0[t][f].x += __low2float(ch[t][f][0]);
-                        acc0[t][f].y += __high2float(ch[t][f][0]);
-                        ch[t][f][0] = hzero;
+                        exl3_dq_dispatch_f32<bits, cb, HALF>(stage + t * TWORDS, lane << 3, f0, f1);
                     }
+                    else if constexpr (bits == 4)
+                    {
+                        uint32_t aw = __shfl_sync(0xffffffffu, bw[t], (lane + 31) & 31);
+                        exl3_gemv_ns::dq8_regs_4bits_f32<cb>(aw, bw[t], f0, f1);
+                    }
+                    else if constexpr (bits == 2)
+                    {
+                        const uint32_t w = bw[t >> 1];
+                        const int base = (t & 1) << 4;
+                        uint32_t bwv = __shfl_sync(0xffffffffu, w, base + x_src_b);
+                        uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
+                        exl3_gemv_ns::dq8_regs_2bits_f32<cb>(awv, bwv, lane << 3, f0, f1);
+                    }
+                    else  // bits == 3
+                    {
+                        uint32_t awv = __shfl_sync(0xffffffffu, bw[t], x_src_a);
+                        uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], x_src_b);
+                        exl3_gemv_ns::dq8_regs_3bits_f32<cb>(awv, bwv, x_s2, f0, f1);
+                    }
+
+                    // Direct per-lane fp32 FMA, no B-gather: column g = lane>>2 (f0) / g+8 (f1), k-pair lane&3
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; ++r)
+                    {
+                        accm[t][0][r] += ar01_x[r] * f0[0];
+                        accm[t][0][r] += ar01_y[r] * f0[1];
+                        accm[t][0][r] += ar23_x[r] * f0[2];
+                        accm[t][0][r] += ar23_y[r] * f0[3];
+                        accm[t][1][r] += ar01_x[r] * f1[0];
+                        accm[t][1][r] += ar01_y[r] * f1[1];
+                        accm[t][1][r] += ar23_x[r] * f1[2];
+                        accm[t][1][r] += ar23_y[r] * f1[3];
+                    }
+                }
+                else
+                {
+                    FragB f0, f1;
+                    if constexpr (!REG)
+                    {
+                        dq_dispatch<bits, cb, HALF>(stage + t * TWORDS, lane << 3, f0, f1);
+                    }
+                    else if constexpr (bits == 4)
+                    {
+                        uint32_t aw = __shfl_sync(0xffffffffu, bw[t], (lane + 31) & 31);
+                        exl3_gemv_ns::dq8_regs_4bits<cb>(aw, bw[t], f0, f1);
+                    }
+                    else if constexpr (bits == 2)
+                    {
+                        const uint32_t w = bw[t >> 1];
+                        const int base = (t & 1) << 4;
+                        uint32_t bwv = __shfl_sync(0xffffffffu, w, base + x_src_b);
+                        uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
+                        exl3_gemv_ns::dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
+                    }
+                    else  // bits == 3
+                    {
+                        uint32_t awv = __shfl_sync(0xffffffffu, bw[t], x_src_a);
+                        uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], x_src_b);
+                        exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
+                    }
+
+                    exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
+                    exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+                }
             }
+
+            // FOLD (mma path only): fold the fp16 ch into the fp32 accumulator. The FMA path accumulates directly.
+            if constexpr (!EXL3_MAXWELL)
+                if ((d + 1) % FOLD == 0 || i + 1 == myn)
+                {
+                    #pragma unroll
+                    for (int t = 0; t < WNT; ++t)
+                        #pragma unroll
+                        for (int f = 0; f < 2; ++f)
+                        {
+                            acc0[t][f].x += __low2float(ch[t][f][0]);
+                            acc0[t][f].y += __high2float(ch[t][f][0]);
+                            ch[t][f][0] = hzero;
+                        }
+                }
         }
     }
 
-    // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
-    // tile*16 + frag*8 + 2*(l%4) (+1)
-    if (r0_ok)
+    // Cross-warp reduction over the k splits. FMA (Maxwell): the CORE layout — lane l holds column
+    // g = l>>2 (f0) / g+8 (f1), split over the four k-pair lanes (l&3), reduced with shfl_xor, per row.
+    // mma: lane l holds row l/4, cols tile*16 + frag*8 + 2*(l%4) (+1), written directly.
+    if constexpr (EXL3_MAXWELL)
     {
-        const int c0 = 2 * (lane & 3);
-        float* red = sh_red + (wk * ROWS + r0) * TCOLS + wn * COLS;
+        float* red = sh_red + wk * ROWS * TCOLS + wn * COLS;
         #pragma unroll
-        for (int t = 0; t < WNT; ++t)
+        for (int r = 0; r < ROWS; ++r)
+            if (r < nrows)
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                {
+                    float v0 = accm[t][0][r];
+                    float v1 = accm[t][1][r];
+                    v0 += __shfl_xor_sync(0xffffffffu, v0, 1);
+                    v0 += __shfl_xor_sync(0xffffffffu, v0, 2);
+                    v1 += __shfl_xor_sync(0xffffffffu, v1, 1);
+                    v1 += __shfl_xor_sync(0xffffffffu, v1, 2);
+                    if ((lane & 3) == 0)
+                    {
+                        const int g = lane >> 2;
+                        red[r * TCOLS + t * 16 + g] = v0;
+                        red[r * TCOLS + t * 16 + g + 8] = v1;
+                    }
+                }
+    }
+    else
+    {
+        if (r0_ok)
+        {
+            const int c0 = 2 * (lane & 3);
+            float* red = sh_red + (wk * ROWS + r0) * TCOLS + wn * COLS;
             #pragma unroll
-            for (int f = 0; f < 2; ++f)
-            {
-                const int col = t * 16 + f * 8 + c0;
-                red[col + 0] = acc0[t][f].x;
-                red[col + 1] = acc0[t][f].y;
-            }
+            for (int t = 0; t < WNT; ++t)
+                #pragma unroll
+                for (int f = 0; f < 2; ++f)
+                {
+                    const int col = t * 16 + f * 8 + c0;
+                    red[col + 0] = acc0[t][f].x;
+                    red[col + 1] = acc0[t][f].y;
+                }
+        }
     }
     __syncthreads();
 
