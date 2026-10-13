@@ -9,6 +9,7 @@ namespace cg = cooperative_groups;
 #include "../util.cuh"
 #include "exl3_gemv_kernel.cuh"
 #include "exl3_devctx.cuh"
+#include "coop_autotune.cuh"
 #include <map>
 
 /*
@@ -54,6 +55,18 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
     if (mode == 2) return size_n <= 8192 ? 0 : 1;
     if (mode == 3) return 0;   // testing: force narrow config
     if (mode == 4) return 1;   // testing: force wide config
+
+    // Maxwell: the GEMV is the decode-speed lever (m <= 8, K 2..4) and is selected for every shape in
+    // range — a declined GEMV is dead code on the target, and the grid is capped at co-residency above
+    // so correctness holds regardless. CFG 0 (narrow) is the default: it has the register headroom the
+    // fp32 MMODE 1 per-row accumulators need. MMODE 0 uses the wide config for large-n / small-k FFN
+    // shapes, where its smaller block fits more blocks per SM.
+    if (cc == CC_MAXWELL)
+    {
+        if (size_m > 1) return 0;
+        if (size_n >= 8192 && size_k <= 4096) return 1;
+        return 0;
+    }
 
     // The narrow config wins (up to ~30%) whenever its grid fits in a single co-resident wave;
     // in the 1..2-wave zone the trailing partial wave costs more than the kernel gains unless
@@ -124,7 +137,6 @@ bool exl3_gemv_try_launch
     int mode = force ? 2 : exl3_gemv_env_mode();
     if (mode == 0) return false;
     int cc = DevCtx::instance().get_cc(device);
-    if (exl3_no_tc(cc)) return false;
     // if (cc != CC_AMPERE) return false;
     int mmode = size_m == 1 ? 0 : 1;
     int num_sms = DevCtx::instance().get_num_sms(device);
@@ -170,11 +182,11 @@ bool exl3_gemv_try_launch
     int grid = MIN(size_n / cols, max_blocks);
     if (grid < 1) return false;
 
-    cuda_check(cudaLaunchCooperativeKernel
+    cuda_check(EXL3_COOP_LAUNCH
     (
         kernel,
-        dim3(grid),
-        dim3(block_dim),
+        grid,
+        block_dim,
         kernel_args,
         0,
         stream
