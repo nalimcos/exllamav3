@@ -2399,7 +2399,7 @@ def fn_triton_varlen_attn(args: AttnArgs) -> torch.Tensor | None:
 def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
     if (
         args.q_cache is None or
-        args.q_len > 16 or
+        args.q_len > 8 or
         args.dim > 512 or
         args.dim % 32 != 0 or
         args.q.dtype != torch.float16 or
@@ -2427,7 +2427,7 @@ def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
 def fn_triton_paged_attn_prefill_qc(args: AttnArgs) -> torch.Tensor | None:
     if (
         args.q_cache is None or
-        (args.q_len <= 16 and not args.non_causal_spans) or
+        (args.q_len <= 8 and not args.non_causal_spans) or
         args.dim > 512 or
         args.dim % 32 != 0 or
         args.q.dtype != torch.float16

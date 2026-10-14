@@ -345,8 +345,12 @@ class BCAttn:
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
             BLOCK_ROWS = block_rows, BLOCK_N = block_n,
         )
-        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, split_warps, split_stages,
-                                  pointer_range_32 = self._pointer_range_32())
+        # Turing: fdq4 flash-decoding cubins in place of the Triton split/combine pair (4-bit K/V, head_dim 256)
+        from .fdq4 import bc_eligible as fdq4_eligible, bc_build as fdq4_build, h_blocks as fdq4_h_blocks
+        fdq4 = fdq4_build(self, bsz, q_len) if regime == 0 and fdq4_eligible(self, q_len, causal) else None
+        if fdq4 is None:
+            k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, split_warps, split_stages,
+                                      pointer_range_32 = self._pointer_range_32())
 
         sig_c = {
             "partial_o": "*fp32:16", "partial_ml": "*fp32:16", "out": "*fp16:16", "h32": "*fp16:16",
@@ -360,8 +364,11 @@ class BCAttn:
             n_q_heads = qh, n_kv_heads = kvh, head_dim = hd, HD_PAD = hd_pad, V_DIM = self.v_head_dim,
             BLOCK_ROWS = block_rows, ROWS_SUB = rows_sub, D_SUB = d_sub,
         )
-        k_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel, sig_c, consts_c, 4, 1)
-        k_combine.grid_y = (block_rows // rows_sub) * (hd_pad // d_sub)
+        if fdq4 is not None:
+            k_split, k_combine, programs, splits_cap, block_n, fd_rows = fdq4
+        else:
+            k_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel, sig_c, consts_c, 4, 1)
+            k_combine.grid_y = (block_rows // rows_sub) * (hd_pad // d_sub)
 
         k_update = None
         if not self.quant:
@@ -400,6 +407,11 @@ class BCAttn:
         # sparse kernels in _configure_qsa (same bucketed tags, so the footprint is the max)
         pn_o = programs * splits_cap * block_rows * hd_pad
         pn_ml = programs * splits_cap * block_rows * 2
+        if fdq4 is not None:
+            # fdq4's blocking packs more rows per program than decode_row_layout's (e.g. 48 vs 32 at q_len 8,
+            # group 6), so size the partials for its layout too
+            pn_o = max(pn_o, programs * splits_cap * fd_rows * hd_pad)
+            pn_ml = max(pn_ml, programs * splits_cap * fd_rows * 2)
         if regime == 1:
             pn_o, pn_ml = self._qsa_partial_sizes(bsz * q_len)
         partial_o = g_tensor_cache.get_bucketed(dev, pn_o, torch.float, "bca_po")
@@ -416,12 +428,16 @@ class BCAttn:
         if self.hidden_padded != self.hidden_size:
             yp = g_tensor_cache.get(dev, (R, self.hidden_padded), self.o_dtype or torch.half, "bca_yp")
 
+        # 1.6.1 launches the split/combine pair at (programs, splits_cap); the fdq4 cubins decode the program
+        # index with their own q/head blocking, so the grid must cover every (batch, kv head) block, the idle
+        # ones included
+        grid_programs = bsz * kvh * fdq4_h_blocks(q_len, group_size) if fdq4 is not None else programs
         self.bc.configure_slot(
             bsz, q_len, regime,
             q, kv, o, partial_o, partial_ml,
             gate_a, gate_b,
             k_split, k_combine, k_update,
-            block_n, splits_cap, programs,
+            block_n, splits_cap, grid_programs,
             xp, yp,
         )
 

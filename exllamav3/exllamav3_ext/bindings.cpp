@@ -13,6 +13,7 @@
 #include "turing/gdno75.cuh"
 #include "turing/gdnwy75.cuh"
 #include "turing/fa75.cuh"
+#include "turing/fdq4.cuh"
 #include "rope.cuh"
 #include "activation.cuh"
 #include "softcap.cuh"
@@ -225,6 +226,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gdnwy75_fwd", &gdnwy75_fwd, "gdnwy75_fwd");
     m.def("gdno75_fwd", &gdno75_fwd, "gdno75_fwd");
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
+    m.def("fdq4_decode", &fdq4_decode, "fdq4_decode");
+    m.def("fdq4_blocks_per_sm", &fdq4_blocks_per_sm, "fdq4_blocks_per_sm");
 #endif
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");

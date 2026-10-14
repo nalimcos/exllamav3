@@ -81,9 +81,12 @@ def attn_decode_config(device, hd_pad: int) -> tuple[int, int, int]:
 # 256 where the cutlass kernel is slow. Decode and draft verification stay on the Triton kernels, which read
 # the packed cache directly. EXL3_SDPA_PREFILL / EXL3_FA75 force either path on or off on any CUDA device
 
-# Gated-delta-rule fast paths on Turing (sm_75), where Triton runs their tl.dot products as scalar FMA:
+# Turing (sm_75) fast paths, where Triton runs their tl.dot products as scalar FMA:
 # EXL3_<NAME> if set, else the value here on sm_75 devices and off on every other architecture
 SM75_DEFAULTS = {
+    "FDQ4": True,            # flash-decoding straight from packed 4-bit K/V caches
+    "FDQ4_BLOCK": False,     # draft blocks (<= 16 rows: DFlash) through the fdq4 cubins (needs FDQ4)
+    "FD16": False,           # the fdq4 kernels over fp16 K/V (sliding-window state rings; needs FDQ4)
     "GDN_FP16": True,        # gated delta rule prefill on fp16 operands instead of bf16
     "GDN_O_TORCH": True,     # gated delta rule output stage as batched cuBLAS GEMMs
     "GDN_WY_CUDA": True,     # gated delta rule WY representation (kkt + solve_tril + w/u) on the gdnwy75 kernel
