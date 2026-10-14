@@ -81,6 +81,18 @@ def attn_decode_config(device, hd_pad: int) -> tuple[int, int, int]:
 # 256 where the cutlass kernel is slow. Decode and draft verification stay on the Triton kernels, which read
 # the packed cache directly. EXL3_SDPA_PREFILL / EXL3_FA75 force either path on or off on any CUDA device
 
+# Turing (sm_75) fast paths. GeForce Turing parts have no bf16 tensor cores, run fp32-accumulate HMMA at
+# half the fp16-accumulate rate, give a block 64 KB of shared memory, and Triton lowers tl.dot to scalar
+# FMA there, so several generic paths leave most of the chip idle. Each path below is switched by an
+# EXL3_<NAME> environment variable; when the variable is unset, it defaults to the value here on sm_75
+# devices and to 0 (upstream behaviour) on every other architecture.
+SM75_DEFAULTS = {
+    "GDN_FP16": 1,        # gated delta rule prefill on fp16 operands instead of bf16
+    "GDN_O_TORCH": 1,     # gated delta rule output stage as batched cuBLAS GEMMs
+    "GDN_WY_CUDA": 1,     # gated delta rule WY representation (kkt + solve_tril + w/u) on the gdnwy75 kernel
+    "GDN_O_CUDA": 1,      # gated delta rule output stage on the gdno75 kernel (before GDN_O_TORCH)
+}
+
 _cc_cache = {}
 
 
@@ -102,6 +114,22 @@ def _sm75_switch(name: str, device) -> bool:
     if env is not None:
         return env.strip().lower() not in ("0", "", "false", "off", "no")
     return compute_capability(device) == (7, 5)
+
+
+def turing_flag(name: str, device = None) -> int:
+    """
+    Level of the sm_75 fast path `name` for `device`: EXL3_<name> if set (0 disables, any other integer
+    is taken as given), else SM75_DEFAULTS[name] on sm_75 and 0 elsewhere.
+    """
+    env = os.environ.get("EXL3_" + name)
+    if env is not None:
+        try:
+            return int(env)
+        except ValueError:
+            return 0 if env.strip().lower() in ("", "false", "off", "no") else 1
+    if not torch.cuda.is_available():
+        return 0
+    return SM75_DEFAULTS.get(name, 0) if compute_capability(device) == (7, 5) else 0
 
 
 def sdpa_prefill(device) -> bool:

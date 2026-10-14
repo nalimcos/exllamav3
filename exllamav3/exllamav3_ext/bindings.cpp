@@ -10,6 +10,8 @@
 
 #include "norm.cuh"
 #include "hgemm.cuh"
+#include "turing/gdno75.cuh"
+#include "turing/gdnwy75.cuh"
 #include "turing/fa75.cuh"
 #include "rope.cuh"
 #include "activation.cuh"
@@ -220,6 +222,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 #if !defined(USE_ROCM)
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
+    m.def("gdnwy75_fwd", &gdnwy75_fwd, "gdnwy75_fwd");
+    m.def("gdno75_fwd", &gdno75_fwd, "gdno75_fwd");
     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
 #endif
     m.def("rope", &rope, "rope");

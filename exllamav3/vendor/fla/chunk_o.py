@@ -13,6 +13,7 @@ from .index import prepare_chunk_indices
 from .op import exp2
 from .utils import autotune_cache_kwargs
 from .utils import autotune
+from ...util.backend import turing_flag
 
 
 @triton.heuristics({
@@ -137,6 +138,42 @@ def chunk_fwd_kernel_o(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_t[:, None] & (o_v < V)[None, :])
 
 
+def chunk_fwd_o_bmm(q, k, v, h, g, scale, chunk_size: int = 64):
+    """
+    chunk_fwd_kernel_o as batched cuBLAS GEMMs (fp16 operands, fp32 accumulation), for Turing: Triton lowers
+    tl.dot to scalar FMA on sm_75 and this kernel also spills there (~0.3 TFLOPS). Same math as the kernel with
+    STATE_V_FIRST = False, USE_G, no g_gamma, no cu_seqlens:
+        o_c = scale * [ (q_c @ h_c) * exp2(g_c) + (tril(q_c @ k_c^T) * exp2(g_i - g_j)) @ v_c ]
+    """
+    B, T, H, K = q.shape
+    HV, V = v.shape[2], v.shape[3]
+    G = HV // H
+    BT = chunk_size
+    NT = (T + BT - 1) // BT
+    pad = NT * BT - T
+    def to_chunks(x, heads, d):
+        if pad:
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, pad))
+        return x.view(B, NT, BT, heads, d).permute(0, 1, 3, 2, 4)          # [B, NT, heads, BT, d]
+    qc = to_chunks(q.half(), H, K)
+    kc = to_chunks(k.half(), H, K)
+    vc = to_chunks(v.half(), HV, V).reshape(B * NT * HV, BT, V)
+    # Expand q/k heads to value heads (value head hv reads key head hv // G)
+    qc = qc.unsqueeze(3).expand(B, NT, H, G, BT, K).reshape(B * NT * HV, BT, K)
+    kc = kc.unsqueeze(3).expand(B, NT, H, G, BT, K).reshape(B * NT * HV, BT, K)
+    hc = h.half().reshape(B * NT * HV, K, V)
+    gc = g if not pad else torch.nn.functional.pad(g, (0, 0, 0, pad))
+    gc = gc.view(B, NT, BT, HV).permute(0, 1, 3, 2).reshape(B * NT * HV, BT).float()
+    o_inter = torch.bmm(qc, hc).float() * torch.exp2(gc).unsqueeze(-1)
+    A = torch.bmm(qc, kc.transpose(1, 2)).float()
+    A = torch.tril(A * torch.exp2(gc.unsqueeze(-1) - gc.unsqueeze(-2)))
+    o = (o_inter + torch.bmm(A.half(), vc).float()) * scale
+    o = o.view(B, NT, HV, BT, V).permute(0, 1, 3, 2, 4).reshape(B, NT * BT, HV, V)
+    if pad:
+        o = o[:, :T]
+    return o.to(v.dtype)
+
+
 def chunk_fwd_o(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -157,6 +194,20 @@ def chunk_fwd_o(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
         scale = k.shape[-1] ** -0.5
+
+    if g is not None and g_gamma is None and not state_v_first and cu_seqlens is None and chunk_indices is None:
+        if (
+            K == 128 and V == 128 and BT == 64 and q.dtype == torch.float16 and k.dtype == torch.float16 and
+            v.dtype == torch.float16 and h.dtype == torch.float16 and g.dtype == torch.float32 and
+            turing_flag("GDN_O_CUDA", q.device)
+        ):
+            # Turing: the whole output stage on HMMA in one kernel (gdno75), ~9x the batched-GEMM form
+            from ...ext import exllamav3_ext as ext
+            o = torch.empty_like(v)
+            ext.gdno75_fwd(q.contiguous(), k.contiguous(), v.contiguous(), h.contiguous(), g.contiguous(), o, scale)
+            return o
+        if turing_flag("GDN_O_TORCH", q.device):
+            return chunk_fwd_o_bmm(q, k, v, h, g, scale, BT)
 
     o = torch.empty_like(v)
     def grid(meta): return (triton.cdiv(V, meta['BV']), NT, B * HV)
