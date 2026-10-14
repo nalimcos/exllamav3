@@ -20,7 +20,7 @@
     #define EXL3_GRID_SYNC() grid.sync()
 #endif
 
-template<EXL3_GEMM_T_ARGS>
+template<EXL3_GEMM_T_ARGS, bool c_bf16>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
 void exl3_gemm_kernel(EXL3_GEMM_ARGS)
 {
@@ -52,12 +52,13 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
     while (size_m_ > 0)
     {
         exl3_gemm_kernel_inner
-        <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
+        <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, c_bf16, true>
         (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, size_n, locks, svh);
 
         A_ += TILESIZE_M * size_k;
-        if constexpr (c_fp32) C_ = (void*) (((float*) C_) + TILESIZE_M * size_n);
-        else                  C_ = (void*) (((half*) C_) + TILESIZE_M * size_n);
+        if constexpr (c_fp32)         C_ = (void*) (((float*) C_) + TILESIZE_M * size_n);
+        else if constexpr (c_bf16)    C_ = (void*) (((bfloat16*) C_) + TILESIZE_M * size_n);
+        else                          C_ = (void*) (((half*) C_) + TILESIZE_M * size_n);
         size_m_ -= TILESIZE_M;
 
         if (size_m_ > 0 || svh)
@@ -248,7 +249,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                 int lock_offs = blockIdx.z * size_n / 128;
 
                 exl3_gemm_kernel_inner
-                <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
+                <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false, false>
                 (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, n_j, locks + lock_offs, nullptr, n_stride_j);
             }
 

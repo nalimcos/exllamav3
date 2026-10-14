@@ -294,6 +294,13 @@ the path wherever its hard constraints allow (testing).
 Weight-extraction strategy inside the fp16 GEMV kernel: `-1` picks per bitrate (default), `0`
 forces shuffle extraction, `1` forces shared-memory staging. Testing only.
 
+### `EXL3_GEMV_SK` (default: `1`)
+
+Turing (sm_75) split-k variant of that GEMV, dispatched ahead of the block-per-group
+configurations for 1 <= m <= 16: the work space (column group x k-slice) is cut into equal
+ranges per block and per warp, so no partial last wave is left and no SM is idle, and 5-8 bpw
+output heads get a GEMV. `0` disables it. Not reached on other architectures.
+
 ### `EXL3_INT8_GEMV` (default: `2`)
 
 Fused int8-activation GEMV for tensors quantized with the mul1 codebook: one cooperative launch
@@ -315,6 +322,13 @@ where the int8 path's reduced per-weight compute no longer helps (and Ada is mar
 but on Hopper the fp16 kernel is throughput-bound at K = 6 as well. Values up to 8 can be forced
 to test the crossover on unmeasured parts; the MGEMM unfusing threshold below follows this cap
 automatically.
+
+### `EXL3_MGEMM` (default: `0` on sm_75, unset elsewhere)
+
+`0` unfuses every multi-projection GEMM, so each projection can take a GEMV (the fused kernel
+has no GEMV variant). Defaults to `0` on Turing, where the GEMV kernels are what makes decode
+fast; `1` restores the per-arch heuristic below (the two thresholds), which still returns
+unfused for mul1 tensors the int8 GEMV can take.
 
 ### `EXL3_MGEMM_K_THRESHOLD` (default: per-arch), `EXL3_MGEMM_N_THRESHOLD` (default: `8192`)
 

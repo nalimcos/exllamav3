@@ -1,5 +1,8 @@
 #pragma once
+#include <cuda_bf16.h>
 #include "../compat.cuh"
+
+using bfloat16 = __nv_bfloat16;
 
 #define ACT_SILU 0
 #define ACT_GELU 1
@@ -209,6 +212,73 @@ void had_ff_r_128_inner
 
     // Store
     ((float4*) output_ptr)[t] = v;
+}
+
+// Float vector, half scales, bfloat16 output: the fp32 body of had_ff_r_128_inner with a single
+// bf16 rounding at the store, so the result is bit-identical to the fp32 output downcast
+
+template <bool pre_scale, bool post_scale>
+inline __device__
+void had_fb_r_128_inner
+(
+    const float* __restrict__ input_ptr,
+    bfloat16* __restrict__ output_ptr,
+    const half* __restrict__ scale,
+    const float r_scale
+)
+{
+    int t = threadIdx.x & 31;
+
+    // Load
+    float4 v = ((float4*) input_ptr)[t];
+
+    // Pre scale
+    if constexpr (pre_scale)
+    {
+        int i = blockIdx.y * 32 + t;
+        half4 scales = ((half4*) scale)[i];
+        v.x *= __low2float(scales.x);
+        v.y *= __high2float(scales.x);
+        v.z *= __low2float(scales.y);
+        v.w *= __high2float(scales.y);
+    }
+
+    // 4 element had
+    float v0 = v.x;
+    float v1 = v.y;
+    float v2 = v.z;
+    float v3 = v.w;
+    float s0 = v0 + v1;
+    float d0 = v0 - v1;
+    float s1 = v2 + v3;
+    float d1 = v2 - v3;
+    v.x = s0 + s1;
+    v.y = d0 + d1;
+    v.z = s0 - s1;
+    v.w = d0 - d1;
+
+    // 32 element had, warp shuffle
+    shuffle_had_f2x32(v.x, v.y, t);
+    shuffle_had_f2x32(v.z, v.w, t);
+    v.x *= r_scale;
+    v.y *= r_scale;
+    v.z *= r_scale;
+    v.w *= r_scale;
+
+    // Post scale
+    if constexpr (post_scale)
+    {
+        int i = blockIdx.y * 32 + t;
+        half4 scales = ((half4*) scale)[i];
+        v.x *= __low2float(scales.x);
+        v.y *= __high2float(scales.x);
+        v.z *= __low2float(scales.y);
+        v.w *= __high2float(scales.y);
+    }
+
+    // Store
+    ((bfloat164*) output_ptr)[t] = bfloat164(
+        __float2bfloat16_rn(v.x), __float2bfloat16_rn(v.y), __float2bfloat16_rn(v.z), __float2bfloat16_rn(v.w));
 }
 
 // Float vector, half scales, half output

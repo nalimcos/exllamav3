@@ -1,7 +1,10 @@
 #pragma once
 
+#include <cuda_bf16.h>
 #include "../ptx.cuh"
 #include "exl3_dq.cuh"
+
+using bfloat16 = __nv_bfloat16;
 // EXL3_GEMM_BASE_THREADS, SMEM_MAX and exl3_gemm_smem_bytes(), the shared definition of this kernel's
 // shared memory footprint
 #include "exl3_kernel_map.cuh"
@@ -10,8 +13,10 @@
 // Accumulate MMA results in fp16 instead and fold into the fp32 accumulators once per k-slice: ~14%
 // faster at bsz 1 on RTX 3090 together with the codebook.cuh IMUL change (see benchmarks/exl3_m1_bench).
 // Max observed error vs fp32 accumulation is ~1% of output RMS at k=4096, well below quantization noise.
-// Only enabled for sm_86 for now; unvalidated on other archs where fp32-acc HMMA is also half rate.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860)
+// Enabled for sm_86 and for sm_75 (GeForce Turing also runs fp32-acc HMMA at half rate: measured 507 vs 987
+// FLOP/clk/SM on a 2080 Ti; decode +10% at 4K context, logits KL 8e-5 vs fp32 accumulation on Qwen3.8-27B
+// 4 bpw). Build with -DEXL3_NO_H_ACC_SM75 to keep fp32 accumulation on sm_75.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860 || (__CUDA_ARCH__ == 750 && !defined(EXL3_NO_H_ACC_SM75)))
     #define EXL3_GEMM_H_ACC 1
 #else
     #define EXL3_GEMM_H_ACC 0
@@ -22,7 +27,7 @@
 // is the fused-MoE prefill shape (32 / 64 rows per tile): TILEBLOCKS_M row fragments share each
 // dequantized B fragment instead of re-running the whole B pipeline per 16 rows, with A
 // single-buffered so the row fragments fit alongside the prefetched B fragments.
-template<EXL3_GEMM_T_ARGS, bool shmem_out_had>
+template<EXL3_GEMM_T_ARGS, bool c_bf16, bool shmem_out_had>
 inline __device__
 void exl3_gemm_kernel_inner
 (
@@ -218,6 +223,7 @@ void exl3_gemm_kernel_inner
 
     half* gl_c_ptr_16 = ((half*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
     float* gl_c_ptr_32 = ((float*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
+    bfloat16* gl_c_ptr_bf16 = ((bfloat16*) C) + slice_m * gl_c_stride_m + slice2_n * gl_c_stride_n;
 
     // TILEBLOCKS_M == 1 (dense / decode): A fragments double-buffered across the fragment stages,
     // as before. TILEBLOCKS_M > 1 (fused MoE prefill tiles): one A fragment per 16-row block,
@@ -241,6 +247,8 @@ void exl3_gemm_kernel_inner
             slice2_n++;
             if constexpr (c_fp32)
                 gl_c_ptr_32 += gl_c_stride_n;
+            else if constexpr (c_bf16)
+                gl_c_ptr_bf16 += gl_c_stride_n;
             else
                 gl_c_ptr_16 += gl_c_stride_n;
         }
@@ -618,6 +626,11 @@ void exl3_gemm_kernel_inner
                 float* had_out = gl_c_ptr_32 + row * size_n_stride + col * 128;
                 had_ff_r_128_inner<false, true>(had_in, had_out, post_scale_c, 0.088388347648f);
             }
+            else if constexpr (c_bf16)
+            {
+                bfloat16* had_out = gl_c_ptr_bf16 + row * size_n_stride + col * 128;
+                had_fb_r_128_inner<false, true>(had_in, had_out, post_scale_c, 0.088388347648f);
+            }
             else
             {
                 half* had_out = gl_c_ptr_16 + row * size_n_stride + col * 128;
@@ -645,6 +658,12 @@ void exl3_gemm_kernel_inner
                         frag_c[0][n][0] += *c_ptr++;
                         frag_c[0][n][1] += *c_ptr++;
                     }
+                    else if constexpr (c_bf16)
+                    {
+                        bfloat16* c_ptr = gl_c_ptr_bf16 + r0 * size_n_stride + (n0 + n) * 8 + c;
+                        frag_c[0][n][0] += __bfloat162float(*c_ptr++);
+                        frag_c[0][n][1] += __bfloat162float(*c_ptr++);
+                    }
                     else
                     {
                         half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n_stride + (n0 + n) * 8 + c);
@@ -660,6 +679,12 @@ void exl3_gemm_kernel_inner
                         float* c_ptr = gl_c_ptr_32 + r1 * size_n_stride + (n0 + n) * 8 + c;
                         frag_c[0][n][2] += *c_ptr++;
                         frag_c[0][n][3] += *c_ptr++;
+                    }
+                    else if constexpr (c_bf16)
+                    {
+                        bfloat16* c_ptr = gl_c_ptr_bf16 + r1 * size_n_stride + (n0 + n) * 8 + c;
+                        frag_c[0][n][2] += __bfloat162float(*c_ptr++);
+                        frag_c[0][n][3] += __bfloat162float(*c_ptr++);
                     }
                     else
                     {
@@ -689,6 +714,12 @@ void exl3_gemm_kernel_inner
                             frag_c[m][n][0] += *c_ptr++;
                             frag_c[m][n][1] += *c_ptr++;
                         }
+                        else if constexpr (c_bf16)
+                        {
+                            bfloat16* c_ptr = gl_c_ptr_bf16 + r0 * size_n_stride + (n0 + n) * 8 + c;
+                            frag_c[m][n][0] += __bfloat162float(*c_ptr++);
+                            frag_c[m][n][1] += __bfloat162float(*c_ptr++);
+                        }
                         else
                         {
                             half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n_stride + (n0 + n) * 8 + c);
@@ -704,6 +735,12 @@ void exl3_gemm_kernel_inner
                             float* c_ptr = gl_c_ptr_32 + r1 * size_n_stride + (n0 + n) * 8 + c;
                             frag_c[m][n][2] += *c_ptr++;
                             frag_c[m][n][3] += *c_ptr++;
+                        }
+                        else if constexpr (c_bf16)
+                        {
+                            bfloat16* c_ptr = gl_c_ptr_bf16 + r1 * size_n_stride + (n0 + n) * 8 + c;
+                            frag_c[m][n][2] += __bfloat162float(*c_ptr++);
+                            frag_c[m][n][3] += __bfloat162float(*c_ptr++);
                         }
                         else
                         {
@@ -736,6 +773,12 @@ void exl3_gemm_kernel_inner
                         *c_ptr++ = frag_c[0][n][0];
                         *c_ptr++ = frag_c[0][n][1];
                     }
+                    else if constexpr (c_bf16)
+                    {
+                        bfloat16* c_ptr = gl_c_ptr_bf16 + r0 * size_n_stride + (n0 + n) * 8 + c;
+                        *c_ptr++ = __float2bfloat16_rn(frag_c[0][n][0]);
+                        *c_ptr++ = __float2bfloat16_rn(frag_c[0][n][1]);
+                    }
                     else
                     {
                         half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n_stride + (n0 + n) * 8 + c);
@@ -750,6 +793,12 @@ void exl3_gemm_kernel_inner
                         float* c_ptr = gl_c_ptr_32 + r1 * size_n_stride + (n0 + n) * 8 + c;
                         *c_ptr++ = frag_c[0][n][2];
                         *c_ptr++ = frag_c[0][n][3];
+                    }
+                    else if constexpr (c_bf16)
+                    {
+                        bfloat16* c_ptr = gl_c_ptr_bf16 + r1 * size_n_stride + (n0 + n) * 8 + c;
+                        *c_ptr++ = __float2bfloat16_rn(frag_c[0][n][2]);
+                        *c_ptr++ = __float2bfloat16_rn(frag_c[0][n][3]);
                     }
                     else
                     {
@@ -778,6 +827,12 @@ void exl3_gemm_kernel_inner
                             *c_ptr++ = frag_c[m][n][0];
                             *c_ptr++ = frag_c[m][n][1];
                         }
+                        else if constexpr (c_bf16)
+                        {
+                            bfloat16* c_ptr = gl_c_ptr_bf16 + r0 * size_n_stride + (n0 + n) * 8 + c;
+                            *c_ptr++ = __float2bfloat16_rn(frag_c[m][n][0]);
+                            *c_ptr++ = __float2bfloat16_rn(frag_c[m][n][1]);
+                        }
                         else
                         {
                             half2* c_ptr = (half2*) (gl_c_ptr_16 + r0 * size_n_stride + (n0 + n) * 8 + c);
@@ -792,6 +847,12 @@ void exl3_gemm_kernel_inner
                             float* c_ptr = gl_c_ptr_32 + r1 * size_n_stride + (n0 + n) * 8 + c;
                             *c_ptr++ = frag_c[m][n][2];
                             *c_ptr++ = frag_c[m][n][3];
+                        }
+                        else if constexpr (c_bf16)
+                        {
+                            bfloat16* c_ptr = gl_c_ptr_bf16 + r1 * size_n_stride + (n0 + n) * 8 + c;
+                            *c_ptr++ = __float2bfloat16_rn(frag_c[m][n][2]);
+                            *c_ptr++ = __float2bfloat16_rn(frag_c[m][n][3]);
                         }
                         else
                         {

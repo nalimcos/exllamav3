@@ -132,17 +132,17 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 #endif
 
 // Instance lists, indexed by shape (slot 0 unused). Shape 1 is not currently selected anywhere
-#define EXL3_GEMM_INST(S, _bits, _half, _c_fp32, cb)  exl3_gemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_##S>,
+#define EXL3_GEMM_INST(S, _bits, _half, _c_fp32, _c_bf16, cb)  exl3_gemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_##S, _c_bf16>,
 #define EXL3_MGEMM_INST(S, _bits, _half, _c_fp32, cb) exl3_mgemm_kernel<_bits, _half, _c_fp32, cb, EXL3_GEMM_SHAPE_##S>,
 
-#define EXL3_GEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
-    nullptr, EXL3_GEMM_FOREACH_SHAPE(EXL3_GEMM_INST, _bits, false, _c_fp32, cb)
+#define EXL3_GEMM_KERNEL_INSTANCES(_bits, _c_fp32, _c_bf16, cb) \
+    nullptr, EXL3_GEMM_FOREACH_SHAPE(EXL3_GEMM_INST, _bits, false, _c_fp32, _c_bf16, cb)
 #define EXL3_MGEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
     nullptr, EXL3_GEMM_FOREACH_SHAPE(EXL3_MGEMM_INST, _bits, false, _c_fp32, cb)
 
 // Half-integer bitrates (bits + 0.5), mul1 codebook
 #define EXL3_GEMM_KERNEL_INSTANCES_H(_bits, _c_fp32) \
-    nullptr, EXL3_GEMM_FOREACH_SHAPE(EXL3_GEMM_INST, _bits, true, _c_fp32, 2)
+    nullptr, EXL3_GEMM_FOREACH_SHAPE(EXL3_GEMM_INST, _bits, true, _c_fp32, false, 2)
 #define EXL3_MGEMM_KERNEL_INSTANCES_H(_bits, _c_fp32) \
     nullptr, EXL3_GEMM_FOREACH_SHAPE(EXL3_MGEMM_INST, _bits, true, _c_fp32, 2)
 
@@ -223,6 +223,7 @@ __host__ __device__ constexpr int exl3_gemm_smem_bytes_for_shape(
 #define EXL3_KERNEL_EXTERNS_CB(K, cb) \
     extern fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b##K##_cb##cb[]; \
     extern fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b##K##_cb##cb[]; \
+    extern fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_bf16_b##K##_cb##cb[]; \
     extern fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b##K##_cb##cb[]; \
     extern fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp16_b##K##_cb##cb[]; \
 
@@ -233,11 +234,15 @@ __host__ __device__ constexpr int exl3_gemm_smem_bytes_for_shape(
 
 #define EXL3_KERNEL_INSTANCES_CB(K, cb) \
     fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp32_b##K##_cb##cb[] = { \
-        EXL3_GEMM_KERNEL_INSTANCES(K, true, cb) \
+        EXL3_GEMM_KERNEL_INSTANCES(K, true, false, cb) \
     }; \
     \
     fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_fp16_b##K##_cb##cb[] = { \
-        EXL3_GEMM_KERNEL_INSTANCES(K, false, cb) \
+        EXL3_GEMM_KERNEL_INSTANCES(K, false, false, cb) \
+    }; \
+    \
+    fp_exl3_gemm_kernel tfp_exl3_gemm_kernel_bf16_b##K##_cb##cb[] = { \
+        EXL3_GEMM_KERNEL_INSTANCES(K, false, true, cb) \
     }; \
     \
     fp_exl3_mgemm_kernel tfp_exl3_mgemm_kernel_fp32_b##K##_cb##cb[] = { \
@@ -256,6 +261,7 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
     const int size_n,
     const int bits,
     const bool c_fp32,
+    const bool c_bf16,
     const int force_shape_idx,
     int* out_block_dim,
     int* out_shape_idx,
@@ -282,5 +288,5 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
     const bool half_k = false
 );
 
-fp_exl3_gemm_kernel get_gemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb, bool half_k = false);
+fp_exl3_gemm_kernel get_gemm_kernel_ptr(int K, int shape_idx, bool c_fp32, bool c_bf16, int cb, bool half_k = false);
 fp_exl3_mgemm_kernel get_mgemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb, bool half_k = false);

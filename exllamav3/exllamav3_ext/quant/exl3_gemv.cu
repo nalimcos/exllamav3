@@ -8,6 +8,7 @@ namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
 #include "exl3_gemv_kernel.cuh"
+#include "exl3_gemv_sk_kernel.cuh"
 #include "exl3_devctx.cuh"
 #include <map>
 
@@ -33,6 +34,14 @@ static int exl3_gemv_env_mode()
     return atoi(env);
 }
 
+// sm_75 split-k GEMV (exl3_gemv_sk_kernel.cuh): EXL3_GEMV_SK = 0 disables it, unset/1 = on
+static int exl3_gemv_sk_env_mode()
+{
+    const char* env = std::getenv("EXL3_GEMV_SK");
+    if (!env) return 1;
+    return atoi(env);
+}
+
 // -1 = default per bits, 0 = force shuffle extraction, 1 = force smem staging (testing)
 static int exl3_gemv_env_smem()
 {
@@ -40,6 +49,10 @@ static int exl3_gemv_env_smem()
     if (!env) return -1;
     return atoi(env);
 }
+
+// sm_75 output-width boundaries, shared by the config rule and the split-k eligibility test
+static constexpr int SM75_GEMV_NARROW_N = 12288;  // narrow config up to this width, wide config above
+static constexpr int SM75_GEMV_SK_MIN_N = 2048;   // split-k needs at least this width when m > 1
 
 // -1: not eligible, 0: narrow config, 1: wide config. narrow_coresident = number of narrow-config
 // blocks that fit on the device at once (its grid is one block per 32 output columns)
@@ -54,6 +67,12 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
     if (mode == 2) return size_n <= 8192 ? 0 : 1;
     if (mode == 3) return 0;   // testing: force narrow config
     if (mode == 4) return 1;   // testing: force wide config
+
+    // Turing (sm_75, the only CC_OLD part EXL3 runs on): the block-pipelined GEMM is decode-bound there,
+    // while both GEMV configs reach 300-450 GB/s. Measured on an RTX 2080 Ti with Qwen3.8-27B 4 bpw at
+    // m = 1/4/8: narrow wins every shape up to n = 12288, wide wins n = 17408; per-token weight time
+    // 49.7 -> 34.1 ms
+    if (cc == CC_OLD) return size_n > SM75_GEMV_NARROW_N ? 1 : 0;
 
     // The narrow config wins (up to ~30%) whenever its grid fits in a single co-resident wave;
     // in the 1..2-wave zone the trailing partial wave costs more than the kernel gains unless
@@ -99,6 +118,7 @@ bool exl3_gemv_try_launch
     bool half_k,
     int cb,
     bool c_fp32,
+    bool c_bf16,
     bool has_su_sv,
     int device,
     cudaStream_t stream,
@@ -115,17 +135,21 @@ bool exl3_gemv_try_launch
     }
     else
     {
-        if (K < 2 || K > 4) return false;
-        if (K != 4 && cb == 0) return false;
+        if (K < 2 || K > 8) return false;      // 5-8 bpw: sm_75 split-k GEMV only (checked below)
+        if (K < 4 && cb == 0) return false;
     }
-    if (size_m > EXL3_GEMV_MAX_M) return false;
+    if (size_m > EXL3_GEMV_SK_MAX_M) return false;
     if (size_k % 128 || size_n % 128) return false;
 
     int mode = force ? 2 : exl3_gemv_env_mode();
     if (mode == 0) return false;
     int cc = DevCtx::instance().get_cc(device);
     // if (cc != CC_AMPERE) return false;
-    int mmode = size_m == 1 ? 0 : 1;
+    int mmode = size_m == 1 ? 0 : size_m <= EXL3_GEMV_MAX_M ? 1 : 2;
+    // 9 <= m <= 16 (verification of long draft blocks) only exists on the split-k kernel
+    const bool sk_eligible = cc == CC_OLD && !half_k && !force && exl3_gemv_sk_env_mode() != 0 &&
+                             (K > 4 || mmode == 2 || (size_n <= SM75_GEMV_NARROW_N && (size_m == 1 || size_n > SM75_GEMV_SK_MIN_N)));
+    if ((K > 4 || mmode == 2) && !sk_eligible) return false;
     int num_sms = DevCtx::instance().get_num_sms(device);
 
     // Cooperative launch: grids are capped at full co-residency (cached per kernel), and the
@@ -141,6 +165,42 @@ bool exl3_gemv_try_launch
         cache[kernel] = blocks_per_sm;
         return blocks_per_sm;
     };
+
+    // sm_75: the split-k GEMV, which balances the work per SM for any shape (the block-per-column-group kernels
+    // below leave a partial last wave at n = 5120 / 6144 / 10240 and idle SMs at n = 1024) and also covers 5-8 bpw
+    // (output heads). The wide config below stays a little faster for 4 bpw at n > 12288, and the narrow one for
+    // n <= 2048 at m > 1. Not taken for forced calls (exl3_gemv, testing)
+    if (sk_eligible)
+    {
+        void* sk_kernel = exl3_gemv_sk_select_kernel(K, cb, c_fp32, c_bf16, mmode);
+        if (sk_kernel)
+        {
+            const int pf = EXL3_GEMV_SK_PF(mmode);
+            const int threads = EXL3_GEMV_SK_THREADS_M(mmode, EXL3_GEMV_SK_WNT_M(mmode));
+            const int grid = occupancy(sk_kernel, threads) * num_sms;
+            const int warps = grid * (threads / 32);
+            const int cols = EXL3_GEMV_SK_WNT_M(mmode) * 16;
+            const int kslices = size_k / 16;
+            const int total = size_n / cols * kslices;
+            // Same geometry as the kernel: the block partials (grid x groups per block range x rows x cols) must fit
+            // the workspace
+            const int span_w = CEIL_DIVIDE(CEIL_DIVIDE(total, MAX(warps, 1)), pf) * pf;
+            const int max_gpb = CEIL_DIVIDE(span_w * (threads / 32), kslices) + 1;
+            const size_t ws_floats = (size_t) grid * max_gpb * EXL3_GEMV_SK_ROWS(mmode) * cols;
+            if (grid > 0 && size_n % cols == 0 && ws_floats <= EXL3_GEMV_SK_WS_FLOATS)
+            {
+                int* ws = (int*) DevCtx::instance().get_gemv_sk_ws(device);
+                void* args[10];
+                for (int i = 0; i < 10; ++i) args[i] = kernel_args[i];
+                args[6] = (void*) &ws;
+                cuda_check(cudaLaunchCooperativeKernel(sk_kernel, dim3(grid), dim3(threads), args, 0, stream));
+                if (launched_kernel) *launched_kernel = sk_kernel;
+                return true;
+            }
+        }
+    }
+    if (K > 4 || mmode == 2) return false;
+    if (c_bf16) return false;   // the non-SK GEMV has no bf16 output; fall through to the regular GEMM
 
     // Extraction style: shuffle by default, smem staging selectable per call for evaluation
     bool smem = exl3_gemv_env_smem() == 1;
@@ -259,7 +319,7 @@ void exl3_gemv
 
     bool ok = exl3_gemv_try_launch
     (
-        kernel_args, size_m, size_k, size_n, K, half_k, cb, c_fp32,
+        kernel_args, size_m, size_k, size_n, K, half_k, cb, c_fp32, false,
         true, device, stream, nullptr, true
     );
     TORCH_CHECK(ok, "exl3_gemv: call is not eligible for the GEMV kernel");

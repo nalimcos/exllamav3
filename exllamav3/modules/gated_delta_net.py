@@ -6,7 +6,7 @@ from ..model.config import Config
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear
 from ..ext import exllamav3_ext as ext
-from ..util.backend import QKV_SLICE
+from ..util.backend import QKV_SLICE, is_sm75
 from ..model.model_tp_alloc import TPAllocation
 from .gated_rmsnorm import GatedRMSNorm
 from ..cache import Cache
@@ -1157,7 +1157,7 @@ class GatedDeltaNet(Module):
         return qkv, z
 
 
-    def _bc_configure_slot(self, bsz: int, seqlen: int, history: bool, rsl = None):
+    def _bc_configure_slot(self, bsz: int, seqlen: int, history: bool, rsl = None, state_half: bool = False):
         """Allocate (or fetch, if already cached at this exact shape) the per-(bsz, seqlen)
         statics for the BC_GatedDeltaNetSplit graph slot and hand them to C++. Called at most
         once per (bsz, seqlen, history) combination per layer instance, and again for a
@@ -1165,7 +1165,18 @@ class GatedDeltaNet(Module):
         device = self.device
         f = self.fdim_qkv
         nv, hv = self.num_v_heads, self.v_head_dim
-        qkv             = g_tensor_cache.get(device, (bsz, seqlen, f), torch.float, "s_qkv")
+        # bf16 qkv GEMM output when the state is fp16 and the shape / weights match the bf16-identical path
+        # (the SK GEMV's single-pass bf16 store). sm_75 only: elsewhere the GEMM's k-split partials would
+        # round through bf16, which changes the result against the fp32 output + trunc_bf16 the fused op reads
+        qkv_dtype = torch.bfloat16 if (
+            is_sm75(device)
+            and state_half
+            and self.k_head_dim == 128 and self.v_head_dim == 128
+            and self.qkv_proj is not None
+            and self.qkv_proj.inner.bias is None
+            and self.fdim_qkv <= 12288
+        ) else torch.float
+        qkv             = g_tensor_cache.get(device, (bsz, seqlen, f), qkv_dtype, "s_qkv")
         z               = g_tensor_cache.get(device, (bsz, seqlen, nv, hv), torch.float, "s_z")
         ba              = g_tensor_cache.get(device, (bsz, seqlen, 2 * nv), torch.float, "s_ba")
         if history:
@@ -1294,7 +1305,7 @@ class GatedDeltaNet(Module):
                 if self.kda:
                     self._bc_configure_slot_kda(bsz, seqlen, save_history, rsl)
                 else:
-                    self._bc_configure_slot(bsz, seqlen, save_history, rsl)
+                    self._bc_configure_slot(bsz, seqlen, save_history, rsl, recurrent_state.dtype == torch.half)
             if save_history:
                 stage(bsz, seqlen)   # records the pass shape for the rewind (step 0 shares the one-token slot's rows)
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)

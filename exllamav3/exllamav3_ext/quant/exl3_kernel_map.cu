@@ -242,6 +242,14 @@ static fp_exl3_gemm_kernel* const tab_gemm_fp16[9][3] =
     EXL3_KERNEL_TABLE_ROW(fp16, 7), EXL3_KERNEL_TABLE_ROW(fp16, 8)
 };
 
+static fp_exl3_gemm_kernel* const tab_gemm_bf16[9][3] =
+{
+    { nullptr, nullptr, nullptr },
+    EXL3_KERNEL_TABLE_ROW(bf16, 1), EXL3_KERNEL_TABLE_ROW(bf16, 2), EXL3_KERNEL_TABLE_ROW(bf16, 3),
+    EXL3_KERNEL_TABLE_ROW(bf16, 4), EXL3_KERNEL_TABLE_ROW(bf16, 5), EXL3_KERNEL_TABLE_ROW(bf16, 6),
+    EXL3_KERNEL_TABLE_ROW(bf16, 7), EXL3_KERNEL_TABLE_ROW(bf16, 8)
+};
+
 static fp_exl3_mgemm_kernel* const tab_mgemm_fp32[9][3] =
 {
     { nullptr, nullptr, nullptr },
@@ -280,6 +288,7 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
     int size_n,
     int K,
     bool c_fp32,
+    bool c_bf16,
     int force_shape_idx,
     int* out_block_dim,
     int* out_shape_idx,
@@ -305,7 +314,7 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
         *num_sms = MAX(MIN(max_slices, *num_sms), 1);
     }
 
-    return get_gemm_kernel_ptr(K, shape_idx, c_fp32, cb, half_k);
+    return get_gemm_kernel_ptr(K, shape_idx, c_fp32, c_bf16, cb, half_k);
 }
 
 fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
@@ -347,14 +356,16 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
 }
 
 
-fp_exl3_gemm_kernel get_gemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb, bool half_k)
+fp_exl3_gemm_kernel get_gemm_kernel_ptr(int K, int shape_idx, bool c_fp32, bool c_bf16, int cb, bool half_k)
 {
     if (half_k)
     {
         TORCH_CHECK(K >= 1 && K <= 3 && cb == 2, "No kernel for half-integer GEMM bitrate (1.5, 2.5, 3.5 bpw with mul1 only)");
+        TORCH_CHECK(!c_bf16, "No kernel for half-integer GEMM bitrate with bfloat16 output");
         return (c_fp32 ? tab_gemm_fp32_h : tab_gemm_fp16_h)[K][shape_idx];
     }
     TORCH_CHECK(K >= 1 && K <= 8 && cb >= 0 && cb <= 2, "No kernel for GEMM shape");
+    if (c_bf16) return tab_gemm_bf16[K][cb][shape_idx];
     return (c_fp32 ? tab_gemm_fp32 : tab_gemm_fp16)[K][cb][shape_idx];
 }
 

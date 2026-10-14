@@ -61,6 +61,7 @@ uint64_t gemm_autotune_hash
     int size_n,
     int K,
     bool c_fp32,
+    bool c_bf16,
     int device,
     int cc,
     int max_num_sms,
@@ -81,6 +82,7 @@ uint64_t gemm_autotune_hash
     mix((uint64_t) size_n);
     mix((uint64_t) K);
     mix(c_fp32 ? 1ull : 0ull);
+    mix(c_bf16 ? 1ull : 0ull);
     mix((uint64_t) device);
     mix((uint64_t) cc);
     mix((uint64_t) max_num_sms);
@@ -104,7 +106,7 @@ uint64_t mgemm_autotune_hash
     bool half_k
 )
 {
-    uint64_t h = gemm_autotune_hash(size_m, size_k, size_n, K, c_fp32, device, cc, max_num_sms, cb, half_k);
+    uint64_t h = gemm_autotune_hash(size_m, size_k, size_n, K, c_fp32, false, device, cc, max_num_sms, cb, half_k);
     auto mix = [&] (uint64_t v)
     {
         h ^= v;
@@ -140,7 +142,8 @@ int exl3_gemm_gr
     TORCH_CHECK_DTYPE(A, kHalf);
     TORCH_CHECK_DTYPE(B, kShort);
     bool c_fp32 = C.dtype() == at::kFloat;
-    if (!c_fp32) TORCH_CHECK_DTYPE(C, kHalf);
+    bool c_bf16 = C.dtype() == at::kBFloat16;
+    if (!c_fp32 && !c_bf16) TORCH_CHECK_DTYPE(C, kHalf);
 
     // Get SU, optionally
     const half* suh_ptr = (const half*) OPTPTR(suh);
@@ -283,7 +286,7 @@ int exl3_gemm_gr
             void* gemv_kernel = nullptr;
             if (exl3_gemv_try_launch
             (
-                kernelArgs, size_m, size_k, size_n, K, half_k, cb, c_fp32,
+                kernelArgs, size_m, size_k, size_n, K, half_k, cb, c_fp32, c_bf16,
                 suh_ptr && A_had_ptr && svh_ptr,
                 device, stream, &gemv_kernel, false
             ))
@@ -310,7 +313,7 @@ int exl3_gemm_gr
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)
     {
-        uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k);
+        uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, c_bf16, device, cc, num_sms, cb, half_k);
 #if defined(USE_ROCM)
         autotune_key ^= 0x52444e4157313031ull;   // RDNA grid rules (below) tune separately
 #endif
@@ -326,7 +329,7 @@ int exl3_gemm_gr
         {
             if (!exl3_gemm_shape_compat(candidate_shape_idx, size_m, size_k, size_n, K, half_k)) continue;
 
-            fp_exl3_gemm_kernel candidate_kernel = get_gemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb, half_k);
+            fp_exl3_gemm_kernel candidate_kernel = get_gemm_kernel_ptr(K, candidate_shape_idx, c_fp32, c_bf16, cb, half_k);
             if (!candidate_kernel) continue;
 
             int tilesize_k = exl3_gemm_tilesize_k_g[candidate_shape_idx];
@@ -378,7 +381,7 @@ int exl3_gemm_gr
 
     kernel = select_exl3_gemm_kernel
     (
-        cc, size_m, size_k, size_n, K, c_fp32,
+        cc, size_m, size_k, size_n, K, c_fp32, c_bf16,
         force_shape_idx, &block_dim, &shape_idx,
         &num_sms, cb, half_k
     );

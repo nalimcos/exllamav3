@@ -1765,10 +1765,10 @@ void cuda_causal_conv1d_update
 // gated_delta_net_fused_op_2: mixed_qkv[b,f,s] = bf16(qkv[b,s,f]), and beta/g computed from the
 // packed ba projection (b = ba[..,:H], a = ba[..,H:])
 
-template <typename a_log_T>
+template <typename qkv_T, typename a_log_T>
 __global__ void gated_delta_net_fused_op_3_kernel
 (
-    const float* __restrict__ in_qkv,           // [B,S,F]
+    const qkv_T* __restrict__ in_qkv,          // [B,S,F]
     const float* __restrict__ in_ba,            // [B,S,2H]
     const bfloat16* __restrict__ in_dt_bias,    // [H]
     const a_log_T* __restrict__ in_a_log,       // [H]
@@ -1791,7 +1791,11 @@ __global__ void gated_delta_net_fused_op_3_kernel
         int row = idx / F;                      // b * S + s
         int b = row / S;
         int s = row % S;
-        out_mixed_qkv[((size_t) b * F + f) * S + s] = trunc_bf16(in_qkv[idx]);
+        // bf16 qkv: the GEMM already rounded to bf16, copy through; fp32 qkv: downcast here
+        if constexpr (std::is_same_v<qkv_T, bfloat16>)
+            out_mixed_qkv[((size_t) b * F + f) * S + s] = in_qkv[idx];
+        else
+            out_mixed_qkv[((size_t) b * F + f) * S + s] = trunc_bf16(in_qkv[idx]);
     }
     else
     {
@@ -1813,7 +1817,7 @@ __global__ void gated_delta_net_fused_op_3_kernel
 
 void gated_delta_net_fused_op_3_gr
 (
-    const at::Tensor& qkv,          // [B,S,F] float
+    const at::Tensor& qkv,          // [B,S,F] float or bfloat16
     const at::Tensor& ba,           // [B,S,2H] float
     const at::Tensor& dt_bias,      // [H] bfloat16
     const at::Tensor& a_log,        // [H] float or bfloat16
@@ -1827,7 +1831,7 @@ void gated_delta_net_fused_op_3_gr
     const at::cuda::OptionalCUDAGuard device_guard(qkv.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
-    TORCH_CHECK_DTYPE(qkv, kFloat);
+    TORCH_CHECK(qkv.dtype() == at::kFloat || qkv.dtype() == at::kBFloat16, "qkv must be float or bfloat16");
     TORCH_CHECK_DTYPE(ba, kFloat);
     TORCH_CHECK_DTYPE(dt_bias, kBFloat16);
     TORCH_CHECK_DTYPE(mixed_qkv, kBFloat16);
@@ -1845,6 +1849,7 @@ void gated_delta_net_fused_op_3_gr
     TORCH_CHECK(beta.numel() == B * S * H, "beta must be [B,S,H]");
     TORCH_CHECK(g.numel() == B * S * H, "g must be [B,S,H]");
 
+    bool qkv_bf16 = qkv.dtype() == at::kBFloat16;
     bool a_log_fp32 = a_log.dtype() == at::kFloat;
     bool a_log_bf16 = a_log.dtype() == at::kBFloat16;
 
@@ -1853,8 +1858,8 @@ void gated_delta_net_fused_op_3_gr
     if (total == 0) return;
     int blocks = CEIL_DIVIDE(total, FUSED_OP_3_THREADS);
 
-    #define ARGS(a_log_T)                       \
-        (const float*) qkv.data_ptr(),          \
+    #define ARGS(qkv_T, a_log_T)                \
+        (const qkv_T*) qkv.data_ptr(),          \
         (const float*) ba.data_ptr(),           \
         (const bfloat16*) dt_bias.data_ptr(),   \
         (const a_log_T*) a_log.data_ptr(),      \
@@ -1864,12 +1869,24 @@ void gated_delta_net_fused_op_3_gr
         BS, S, F, H,                            \
         beta_scale
 
-    if (a_log_fp32)
-        gated_delta_net_fused_op_3_kernel<<<blocks, FUSED_OP_3_THREADS, 0, stream>>>(ARGS(float));
-    else if (a_log_bf16)
-        gated_delta_net_fused_op_3_kernel<<<blocks, FUSED_OP_3_THREADS, 0, stream>>>(ARGS(bfloat16));
-    else TORCH_CHECK(false, "gated_delta_net_fused_op_3: unsupported a_log dtype");
+    #define LAUNCH(qkv_T, a_log_T)                                                     \
+        gated_delta_net_fused_op_3_kernel<qkv_T, a_log_T>                              \
+            <<<blocks, FUSED_OP_3_THREADS, 0, stream>>>(ARGS(qkv_T, a_log_T))
 
+    if (qkv_bf16)
+    {
+        if (a_log_fp32)      LAUNCH(bfloat16, float);
+        else if (a_log_bf16) LAUNCH(bfloat16, bfloat16);
+        else TORCH_CHECK(false, "gated_delta_net_fused_op_3: unsupported a_log dtype");
+    }
+    else
+    {
+        if (a_log_fp32)      LAUNCH(float, float);
+        else if (a_log_bf16) LAUNCH(float, bfloat16);
+        else TORCH_CHECK(false, "gated_delta_net_fused_op_3: unsupported a_log dtype");
+    }
+
+    #undef LAUNCH
     #undef ARGS
 
     cuda_check(cudaPeekAtLastError());

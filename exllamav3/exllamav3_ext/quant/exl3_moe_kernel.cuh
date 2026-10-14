@@ -50,20 +50,20 @@ void moe_gemm_tile
     // arrives in half-bit units (2 * bits + half, see bits_k.cuh): even = integer rates, odd = the
     // half-integer rates 1.5 / 2.5 / 3.5 (mul1 codebook only, the host checks)
     if constexpr (t_bits)
-        exl3_gemm_kernel_inner<t_bits, t_half, false, cb, SHAPE_ARGS, false>(ARGS);
+        exl3_gemm_kernel_inner<t_bits, t_half, false, cb, SHAPE_ARGS, false, false>(ARGS);
     else switch(K)
     {
-        case 2:  exl3_gemm_kernel_inner<1, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 4:  exl3_gemm_kernel_inner<2, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 6:  exl3_gemm_kernel_inner<3, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 8:  exl3_gemm_kernel_inner<4, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 10: exl3_gemm_kernel_inner<5, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 12: exl3_gemm_kernel_inner<6, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 14: exl3_gemm_kernel_inner<7, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 16: exl3_gemm_kernel_inner<8, false, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 3:  if constexpr (cb == 2) exl3_gemm_kernel_inner<1, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 5:  if constexpr (cb == 2) exl3_gemm_kernel_inner<2, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
-        case 7:  if constexpr (cb == 2) exl3_gemm_kernel_inner<3, true, false, cb, SHAPE_ARGS, false>(ARGS); break;
+        case 2:  exl3_gemm_kernel_inner<1, false, false, cb, SHAPE_ARGS, false, false>(ARGS); break;
+        case 4:  exl3_gemm_kernel_inner<2, false, false, cb, SHAPE_ARGS, false, false>(ARGS); break;
+        case 6:  exl3_gemm_kernel_inner<3, false, false, cb, SHAPE_ARGS, false, false>(ARGS); break;
+        case 8:  exl3_gemm_kernel_inner<4, false, false, cb, SHAPE_ARGS, false, false>(ARGS); break;
+        case 10: exl3_gemm_kernel_inner<5, false, false, cb, SHAPE_ARGS, false, false>(ARGS); break;
+        case 12: exl3_gemm_kernel_inner<6, false, false, cb, SHAPE_ARGS, false, false>(ARGS); break;
+        case 14: exl3_gemm_kernel_inner<7, false, false, cb, SHAPE_ARGS, false, false>(ARGS); break;
+        case 16: exl3_gemm_kernel_inner<8, false, false, cb, SHAPE_ARGS, false, false>(ARGS); break;
+        case 3:  if constexpr (cb == 2) exl3_gemm_kernel_inner<1, true, false, cb, SHAPE_ARGS, false, false>(ARGS); break;
+        case 5:  if constexpr (cb == 2) exl3_gemm_kernel_inner<2, true, false, cb, SHAPE_ARGS, false, false>(ARGS); break;
+        case 7:  if constexpr (cb == 2) exl3_gemm_kernel_inner<3, true, false, cb, SHAPE_ARGS, false, false>(ARGS); break;
     };
     #undef ARGS
     #undef SHAPE_ARGS

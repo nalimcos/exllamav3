@@ -46,6 +46,8 @@ HIP_EXCLUDED_SOURCES = {
     "hgemm_f16acc.cu",      # fp16-accumulator hgemm (hgemm_f16acc): GeForce tensor-core PTX; RDNA uses rocm/wmma_gemm.cu
     # Replaced on ROCm by an implementation of the same interface under rocm/
     "exl3_gemv.cu",         # -> rocm/quant/exl3_gemv_rdna.cu (exl3_gemv.cuh)
+    # sm_75-only split-k GEMV instances: bare inline PTX (no ROCm equivalent)
+    "quant/comp_units/exl3_gemv_sk_inst.cu",
     # The GEMM kernel map, MoE host, comp units and MoE instance units are shared: the kernel headers select
     # the backend's inner (quant/exl3_gemm_kernel.cuh, quant/comp_units/exl3_moe_inst_common.cuh) and the
     # shape table / dispatch carry USE_ROCM arms. The M-tiled MoE instances exist for the CUDA kernel only

@@ -381,6 +381,7 @@ bool exl3_gemv_try_launch
     bool half_k,
     int cb,
     bool c_fp32,
+    bool c_bf16,
     bool has_su_sv,
     int device,
     cudaStream_t stream,
@@ -399,6 +400,10 @@ bool exl3_gemv_try_launch
     // only, so decline: the caller falls through to the cooperative GEMM, which has half_k
     // instances (quant/comp_units/exl3_comp_unit_h*.cu). Correct, not the fast path.
     if (half_k) return false;
+
+    // bf16 C (the GDN bc-decode qkv GEMM): this kernel writes fp32 or fp16 only, so decline and let the
+    // caller run the cooperative GEMM
+    if (c_bf16) return false;
 
     int mode = exl3_gemv_env_mode();
     if (!force && mode == 0) return false;

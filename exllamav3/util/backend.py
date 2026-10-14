@@ -106,6 +106,11 @@ def compute_capability(device) -> tuple[int, int]:
     return cc
 
 
+def is_sm75(device = None) -> bool:
+    """True on a Turing device (compute capability 7.5)"""
+    return compute_capability(device) == (7, 5)
+
+
 def _env_flag(name: str) -> bool | None:
     """Bare switch `name` as set in EXL3_<name>, or None when the variable is unset"""
     env = os.environ.get("EXL3_" + name)
