@@ -1,21 +1,16 @@
-import os
-import sys
+"""
+gdno75 (exllamav3_ext/turing/gdno75.cu): the gated delta rule output stage (FLA's chunk_fwd_kernel_o) on sm_75
+HMMA (mma.sync.m16n8k8), against an fp32 reference, at Qwen3.8-27B GDN shapes (16 key heads, 48 value heads,
+K = V = 128). The kernel is plain PTX for sm_75 and later, so this runs on every CUDA device.
+"""
 
 import pytest
 import torch
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from exllamav3.vendor.fla.chunk_o import chunk_fwd_o
 
-# gdno75 (gated delta rule output stage on mma.m16n8k8) against an fp32 reference and the batched-cuBLAS path, at
-# Qwen3.8-27B GDN shapes (16 key heads, 48 value heads, K = V = 128)
+pytestmark = [pytest.mark.cuda_only, pytest.mark.cc(7, 5)]
 
-device = "cuda:0"
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability(0) < (7, 5),
-    reason = "needs an sm_75+ CUDA device",
-)
 BT = 64
 
 
@@ -23,7 +18,7 @@ def _reference(q, k, v, h, g, scale):
     B, T, H, _ = q.shape
     HV = v.shape[2]
     G = HV // H
-    o = torch.zeros(v.shape, device = device)
+    o = torch.zeros(v.shape, device = q.device)
     for b in range(B):
         for c in range((T + BT - 1) // BT):
             s, e = c * BT, min((c + 1) * BT, T)
@@ -36,8 +31,7 @@ def _reference(q, k, v, h, g, scale):
 
 
 @pytest.mark.parametrize("B, T", [(1, 1000), (1, 64), (1, 37), (2, 200)])
-def test_gdno75_matches_reference(monkeypatch, B, T):
-    torch.cuda.set_device(device)
+def test_gdno75_matches_reference(monkeypatch, device, B, T):
     gen = torch.Generator(device = device).manual_seed(T + B)
     H, HV = 16, 48
     NT = (T + BT - 1) // BT

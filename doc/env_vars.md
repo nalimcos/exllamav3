@@ -219,6 +219,33 @@ On the path above, head_dim 256 attention runs the `fa75` kernel (`exllamav3_ext
 `mma.sync.m16n8k8`) instead of SDPA, whose cutlass kernel handles 256-wide heads at a fraction of
 its 128-wide rate. Plain PTX for sm_75 and later; `1` forces it on any CUDA device.
 
+### `EXL3_GDN_FP16` (default: on for sm_75, off elsewhere)
+
+The chunked gated-delta-net prefill runs its q/k/v/beta operands as fp16 rather than bf16. Triton
+lowers `tl.dot` to scalar FMA on sm_75 and GeForce Turing parts have no bf16 tensor cores, so bf16
+operands get no HMMA there; the GDN switches below require fp16 and this one supplies it.
+Accumulation stays fp32 in the kernels, gates and states stay fp32, and the layer output returns
+in bf16. `0` runs the kernels on bf16 as before.
+
+### `EXL3_GDN_O_TORCH` (default: on for sm_75, off elsewhere)
+
+The gated-delta-net output stage (`chunk_fwd_o`) runs as batched cuBLAS GEMMs (`chunk_fwd_o_bmm`)
+instead of the autotuned Triton `chunk_fwd_kernel_o`, which spills on sm_75. Same math with fp16
+operands and fp32 accumulation.
+
+### `EXL3_GDN_WY_CUDA` (default: on for sm_75, off elsewhere)
+
+The WY representation (fused kkt + solve_tril + recompute_w_u) of the gated delta rule runs as one
+HMMA kernel (`gdnwy75`, `exllamav3_ext/turing/gdnwy75.cu`) where the shape allows it (K = V = 128,
+chunk 64, fp16 operands). The kernel does not materialise the solved `A` matrix, which its only
+caller discards. `0` runs FLA's Triton kernels.
+
+### `EXL3_GDN_O_CUDA` (default: on for sm_75, off elsewhere)
+
+The gated-delta-net output stage runs as one HMMA kernel (`gdno75`,
+`exllamav3_ext/turing/gdno75.cu`) where the shape allows it (K = V = 128, chunk 64, fp16 operands),
+tried before `EXL3_GDN_O_TORCH`. `0` skips it for the batched-GEMM / Triton paths.
+
 ### `EXL3_QC_PREFILL_NS` (default: `0` = measure)
 
 Pipeline stage count for the direct quantized-cache prefill kernel. Unset/`0`, the best of

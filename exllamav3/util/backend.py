@@ -81,16 +81,13 @@ def attn_decode_config(device, hd_pad: int) -> tuple[int, int, int]:
 # 256 where the cutlass kernel is slow. Decode and draft verification stay on the Triton kernels, which read
 # the packed cache directly. EXL3_SDPA_PREFILL / EXL3_FA75 force either path on or off on any CUDA device
 
-# Turing (sm_75) fast paths. GeForce Turing parts have no bf16 tensor cores, run fp32-accumulate HMMA at
-# half the fp16-accumulate rate, give a block 64 KB of shared memory, and Triton lowers tl.dot to scalar
-# FMA there, so several generic paths leave most of the chip idle. Each path below is switched by an
-# EXL3_<NAME> environment variable; when the variable is unset, it defaults to the value here on sm_75
-# devices and to 0 (upstream behaviour) on every other architecture.
+# Gated-delta-rule fast paths on Turing (sm_75), where Triton runs their tl.dot products as scalar FMA:
+# EXL3_<NAME> if set, else the value here on sm_75 devices and off on every other architecture
 SM75_DEFAULTS = {
-    "GDN_FP16": 1,        # gated delta rule prefill on fp16 operands instead of bf16
-    "GDN_O_TORCH": 1,     # gated delta rule output stage as batched cuBLAS GEMMs
-    "GDN_WY_CUDA": 1,     # gated delta rule WY representation (kkt + solve_tril + w/u) on the gdnwy75 kernel
-    "GDN_O_CUDA": 1,      # gated delta rule output stage on the gdno75 kernel (before GDN_O_TORCH)
+    "GDN_FP16": True,        # gated delta rule prefill on fp16 operands instead of bf16
+    "GDN_O_TORCH": True,     # gated delta rule output stage as batched cuBLAS GEMMs
+    "GDN_WY_CUDA": True,     # gated delta rule WY representation (kkt + solve_tril + w/u) on the gdnwy75 kernel
+    "GDN_O_CUDA": True,      # gated delta rule output stage on the gdno75 kernel (before GDN_O_TORCH)
 }
 
 _cc_cache = {}
@@ -109,37 +106,34 @@ def compute_capability(device) -> tuple[int, int]:
     return cc
 
 
-def _sm75_switch(name: str, device) -> bool:
-    env = os.environ.get(name)
-    if env is not None:
-        return env.strip().lower() not in ("0", "", "false", "off", "no")
-    return compute_capability(device) == (7, 5)
-
-
-def turing_flag(name: str, device = None) -> int:
-    """
-    Level of the sm_75 fast path `name` for `device`: EXL3_<name> if set (0 disables, any other integer
-    is taken as given), else SM75_DEFAULTS[name] on sm_75 and 0 elsewhere.
-    """
+def _env_flag(name: str) -> bool | None:
+    """Bare switch `name` as set in EXL3_<name>, or None when the variable is unset"""
     env = os.environ.get("EXL3_" + name)
-    if env is not None:
-        try:
-            return int(env)
-        except ValueError:
-            return 0 if env.strip().lower() in ("", "false", "off", "no") else 1
-    if not torch.cuda.is_available():
-        return 0
-    return SM75_DEFAULTS.get(name, 0) if compute_capability(device) == (7, 5) else 0
+    if env is None:
+        return None
+    return env.strip().lower() not in ("0", "", "false", "off", "no")
+
+
+def _sm75_switch(name: str, device) -> bool:
+    """Bare switch `name` (EXL3_<name>), on by default on sm_75"""
+    env = _env_flag(name)
+    return compute_capability(device) == (7, 5) if env is None else env
+
+
+def turing_flag(name: str, device = None) -> bool:
+    """Bare switch `name`: EXL3_<name> if set, else SM75_DEFAULTS[name] on sm_75 and False elsewhere"""
+    env = _env_flag(name)
+    return (SM75_DEFAULTS.get(name, False) and compute_capability(device) == (7, 5)) if env is None else env
 
 
 def sdpa_prefill(device) -> bool:
     """Prefill chunks attend over a dense fp16 window with SDPA / fa75 (sm_75 default; EXL3_SDPA_PREFILL)"""
-    return _sm75_switch("EXL3_SDPA_PREFILL", device)
+    return _sm75_switch("SDPA_PREFILL", device)
 
 
 def fa75_prefill(device) -> bool:
     """The fa75 kernel for head_dim 256 on that path (sm_75 default; EXL3_FA75)"""
-    return _sm75_switch("EXL3_FA75", device)
+    return _sm75_switch("FA75", device)
 
 
 def qc_prefill_two_pass_min_q(device) -> int:

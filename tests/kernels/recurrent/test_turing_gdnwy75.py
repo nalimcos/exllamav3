@@ -1,23 +1,19 @@
-import os
-import sys
+"""
+gdnwy75 (exllamav3_ext/turing/gdnwy75.cu): the gated delta rule WY representation (FLA's fused kkt + solve_tril
++ recompute_w_u) on sm_75 HMMA (mma.sync.m16n8k8), against FLA's Triton kernels, at Qwen3.8-27B GDN shapes
+(16 key heads, 48 value heads, K = V = 128). The kernel is plain PTX for sm_75 and later, so this runs on every
+CUDA device.
+"""
 
 import pytest
 import torch
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from exllamav3.vendor.fla.gdn_chunk_fwd import chunk_gated_delta_rule_fwd_intra
 from exllamav3.vendor.fla.cumsum import chunk_local_cumsum
 from exllamav3.vendor.fla.l2norm import l2norm_fwd
 
-# gdnwy75 (gated delta rule WY representation on mma.m16n8k8) against FLA's Triton kkt + solve_tril + recompute_w_u,
-# at Qwen3.8-27B GDN shapes (16 key heads, 48 value heads, K = V = 128)
+pytestmark = [pytest.mark.cuda_only, pytest.mark.cc(7, 5)]
 
-device = "cuda:0"
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability(0) < (7, 5),
-    reason = "needs an sm_75+ CUDA device",
-)
 BT = 64
 
 
@@ -27,8 +23,7 @@ def _rel(a, b):
 
 
 @pytest.mark.parametrize("B, T", [(1, 2048), (1, 1000), (1, 37), (2, 300), (1, 64)])
-def test_gdnwy75_matches_triton(monkeypatch, B, T):
-    torch.cuda.set_device(device)
+def test_gdnwy75_matches_triton(monkeypatch, device, B, T):
     gen = torch.Generator(device = device).manual_seed(T + B)
     H, HV = 16, 48
     k = l2norm_fwd(torch.randn(B, T, H, 128, device = device, dtype = torch.half, generator = gen))[0]

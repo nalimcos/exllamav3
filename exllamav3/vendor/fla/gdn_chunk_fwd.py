@@ -338,7 +338,7 @@ def chunk_gated_delta_rule_fwd_intra(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     r"""
     GDN intra-chunk forward: fused or unfused kkt + solve_tril + recompute_w_u.
 
@@ -365,7 +365,8 @@ def chunk_gated_delta_rule_fwd_intra(
     Returns:
         w (torch.Tensor): shape `[B, T, HV, K]`
         u (torch.Tensor): shape `[B, T, HV, V]`
-        A (torch.Tensor): shape `[B, T, HV, BT]`, the solved (I+A)^{-1} matrix
+        A (torch.Tensor | None): shape `[B, T, HV, BT]`, the solved (I+A)^{-1} matrix; None on the gdnwy75
+            path (sm_75), which does not materialise it and whose caller discards it
     """
     if chunk_size not in (16, 32, 64):
         raise ValueError(f"`chunk_size` must be 16, 32, or 64, got {chunk_size}.")

@@ -141,7 +141,7 @@ def chunk_fwd_kernel_o(
 def chunk_fwd_o_bmm(q, k, v, h, g, scale, chunk_size: int = 64):
     """
     chunk_fwd_kernel_o as batched cuBLAS GEMMs (fp16 operands, fp32 accumulation), for Turing: Triton lowers
-    tl.dot to scalar FMA on sm_75 and this kernel also spills there (~0.3 TFLOPS). Same math as the kernel with
+    tl.dot to scalar FMA on sm_75 and this kernel also spills there. Same math as the kernel with
     STATE_V_FIRST = False, USE_G, no g_gamma, no cu_seqlens:
         o_c = scale * [ (q_c @ h_c) * exp2(g_c) + (tril(q_c @ k_c^T) * exp2(g_i - g_j)) @ v_c ]
     """
@@ -187,6 +187,17 @@ def chunk_fwd_o(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
 ) -> torch.Tensor:
+    """
+    Output stage of the chunked GDN recurrence,
+        o_c = scale * [ (q_c @ h_c) * exp2(g_c) + (tril(q_c @ k_c^T) * exp2(g_i - g_j)) @ v_c ]
+    with three implementations of the same math, dispatched in this order:
+
+    - gdno75 (EXL3_GDN_O_CUDA): the whole stage as one sm_75 HMMA kernel, for fp16 q/k/v/h with fp32 g,
+      K = V = 128 and chunk_size 64
+    - chunk_fwd_o_bmm (EXL3_GDN_O_TORCH): the stage as batched cuBLAS GEMMs, for the same guarded window
+      (g given, no g_gamma / state_v_first / cu_seqlens / chunk_indices) at any shape and dtype
+    - chunk_fwd_kernel_o (Triton): the fallback for everything else
+    """
     B, T, H, K, V, HV = *q.shape, v.shape[-1], v.shape[2]
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
@@ -201,7 +212,7 @@ def chunk_fwd_o(
             v.dtype == torch.float16 and h.dtype == torch.float16 and g.dtype == torch.float32 and
             turing_flag("GDN_O_CUDA", q.device)
         ):
-            # Turing: the whole output stage on HMMA in one kernel (gdno75), ~9x the batched-GEMM form
+            # Turing: the whole output stage in one HMMA kernel (gdno75)
             from ...ext import exllamav3_ext as ext
             o = torch.empty_like(v)
             ext.gdno75_fwd(q.contiguous(), k.contiguous(), v.contiguous(), h.contiguous(), g.contiguous(), o, scale)
