@@ -744,7 +744,7 @@ _qc_staging_pages = int(os.environ.get("EXL3_QC_STAGING_PAGES", "256"))
 # Query-length threshold for the prefill staging pass at EXL3_QC_STAGING=1: below it the direct
 # path reads less gmem (short trailing chunks over long contexts, low bitrates). Per device:
 # where the staged window feeds SDPA (sm_75) every prefill chunk stages (util/backend.py)
-from ...util.backend import qc_prefill_two_pass_min_q, sdpa_prefill as _sdpa_prefill
+from ...util.backend import qc_prefill_two_pass_min_q, sdpa_prefill as _sdpa_prefill, fa75_prefill as _fa75_prefill
 
 def _get_h32(device):
     if device not in _h32_cache:
@@ -2115,6 +2115,48 @@ def paged_attn_triton_prefill(
             # buffer, then normalise once. num_splits is forced to 1: the merge is the
             # accumulator, not the combine's split reduction
             sk_cache, sk_scales, sv_cache, sv_scales, kd_, vd_, sbt, w, npps = staging_slices
+
+            # sm_75 fa75 sub-path: fa75 writes the unnormalized (o, m, l) of a slice, so the same
+            # combine merges the bounded window through it (SDPA exposes no lse and cannot). fa75
+            # has no batch axis: one call per slice and sequence, over that sequence's staged pages
+            if (
+                head_dim == 256 and q.dtype == torch.float16 and q_len > 8 and
+                window_left < 0 and window_right < 0 and not softcap and not has_sinks and
+                _sdpa_prefill(q.device) and _fa75_prefill(q.device)
+            ):
+                BM = 64
+                q_blocks = triton.cdiv(q_len, BM)
+                n_bh = bsz * n_q_heads
+                part_o = torch.empty(q_blocks * n_bh * BM * hd_pad, dtype = torch.float32, device = q.device)
+                part_ml = torch.empty(q_blocks * n_bh * BM * 2, dtype = torch.float32, device = q.device)
+                wide_index = max(bsz * q_len * n_q_heads * head_dim,
+                                 q_blocks * n_bh * BM * hd_pad) >= 1 << 31
+                seqlens = cache_seqlens.tolist()
+                kd_flat = kd_.view(bsz * w, page_size * n_kv_heads * head_dim)
+                vd_flat = vd_.view(bsz * w, page_size * n_kv_heads * head_dim)
+                for p0 in range(0, npps, w):
+                    pw = min(w, npps - p0)
+                    ext.dequant_cache_paged_window(
+                        sk_cache, sk_scales, kd_, sv_cache, sv_scales, vd_,
+                        cache_seqlens, sbt[:, p0:p0 + pw].contiguous(), page_size, kv_append_len, 0.0,
+                    )
+                    for b in range(bsz):
+                        # frame-local offset of this q chunk: key j of the slice is visible to row i
+                        # iff j <= i + offs; sequences entirely left of the slice have nothing to add
+                        offs = seqlens[b] + kv_append_len - p0 * page_size - q_len
+                        if offs + q_len <= 0:
+                            continue
+                        k_slice = kd_flat[b * pw:(b + 1) * pw].view(pw * page_size, n_kv_heads, head_dim)
+                        v_slice = vd_flat[b * pw:(b + 1) * pw].view(pw * page_size, n_kv_heads, head_dim)
+                        ext.fa75_fwd_slice(q[b], k_slice, v_slice, part_o, part_ml, n_bh, b * n_q_heads,
+                                           softmax_scale, offs, bool(p0 > 0))
+                _paged_attn_prefill_combine_kernel[(q_blocks, n_bh)](
+                    part_o, part_ml, out, h32, sinks,
+                    1, qcv, has_sinks, q_len, n_q_heads, head_dim, hd_pad, wide_index, BM,
+                    num_warps = 8, num_stages = 1,
+                )
+                return out
+
             block_m = cfg[0]
             q_blocks = triton.cdiv(q_len, block_m)
             programs = q_blocks * bsz * n_q_heads
