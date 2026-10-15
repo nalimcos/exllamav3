@@ -1809,6 +1809,16 @@ def _pick_qc_prefill_num_stages(key, launch):
     return best[1]
 
 
+def _window_prefill_ok(q, q_len, window_left, window_right, softcap, has_sinks):
+    """Conditions the whole-window SDPA shortcut and the fa75 staged sub-path share: a causal fp16 chunk
+    past the minimum q length, over a dense fp16 window, with no window / softcap / sinks (SDPA and fa75
+    mask only causally), and the sm_75 window path enabled"""
+    return (
+        q_len > 8 and window_left < 0 and window_right < 0 and not softcap and not has_sinks and
+        q.dtype == torch.float16 and _sdpa_prefill(q.device)
+    )
+
+
 def paged_attn_triton_prefill(
     q: torch.Tensor,
     k: torch.Tensor | None,
@@ -1965,12 +1975,12 @@ def paged_attn_triton_prefill(
     # sm_75: a prefill chunk over a dense fp16 cache (the staged window above, or the fp16 cache itself)
     # attends through SDPA / fa75 instead of the Triton kernel (util/backend.py). The direct quantized
     # kernel is kept for what the staging pass left out (short chunks below its threshold, non-causal).
-    # Sliced staging has no place here: SDPA / fa75 expose no lse, so there is no exact cross-slice merge
+    # Sliced staging only reaches SDPA through the fa75 sub-path below: SDPA exposes no lse, so a sliced
+    # window cannot merge through it, while fa75 writes the unnormalized (o, m, l) the combine needs
     if (
         staging_slices is None and
-        qc is None and k_cache is not None and new_kv_mode == 0 and causal and q_len > 8 and
-        window_left < 0 and window_right < 0 and not softcap and not has_sinks and
-        q.dtype == torch.float16 and _sdpa_prefill(q.device)
+        qc is None and k_cache is not None and new_kv_mode == 0 and causal and
+        _window_prefill_ok(q, q_len, window_left, window_right, softcap, has_sinks)
     ):
         from .torch import sdpa_prefill_paged
         if k is not None and kv_append_len:
@@ -2120,9 +2130,9 @@ def paged_attn_triton_prefill(
             # combine merges the bounded window through it (SDPA exposes no lse and cannot). fa75
             # has no batch axis: one call per slice and sequence, over that sequence's staged pages
             if (
-                head_dim == 256 and q.dtype == torch.float16 and q_len > 8 and
-                window_left < 0 and window_right < 0 and not softcap and not has_sinks and
-                _sdpa_prefill(q.device) and _fa75_prefill(q.device)
+                head_dim == 256 and
+                _window_prefill_ok(q, q_len, window_left, window_right, softcap, has_sinks) and
+                _fa75_prefill(q.device)
             ):
                 BM = 64
                 q_blocks = triton.cdiv(q_len, BM)

@@ -17,7 +17,7 @@ from exllamav3.modules.attention_fn import triton_paged
 from exllamav3.modules.attention_fn.triton_paged import (
     _paged_kv_update, paged_attn_triton_prefill,
 )
-from exllamav3.util.backend import fa75_prefill
+from exllamav3.util.backend import is_sm75
 from testlib.attention import gather_pages, quant_roundtrip, rand_paged_cache, ref_attn
 from testlib.compare import assert_rel_close
 
@@ -32,7 +32,7 @@ def build_case(bsz, past, q_len, hd, device):
     kvh, n_heads, bits = 2, 8, 4
     T = past + q_len
 
-    kc, vc, bt, sl = rand_paged_cache(bsz, T + 3, kvh, hd, device)
+    kc, vc, bt, sl = rand_paged_cache(bsz, T + 3, kvh, hd, past, device)
     k = torch.randn((bsz, q_len, kvh, hd), dtype = torch.half, device = device)
     v = torch.randn_like(k)
     q = torch.randn((bsz, q_len, n_heads, hd), dtype = torch.half, device = device)
@@ -97,6 +97,6 @@ def test_qc_staging_slices_fa75(device, monkeypatch, bsz, past, q_len, hd):
     monkeypatch.setattr(triton_paged, "_qc_staging", 1)
     if hd != 256:
         pytest.skip("the fa75 slice path only covers head_dim 256")
-    if not fa75_prefill(device):
-        pytest.skip("fa75 prefill not available for this device")
+    if not is_sm75(device):
+        pytest.skip("fa75 only runs on sm_75")
     check_case(build_case(bsz, past, q_len, hd, device), q_len)
