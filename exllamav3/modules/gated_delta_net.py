@@ -1167,13 +1167,16 @@ class GatedDeltaNet(Module):
         nv, hv = self.num_v_heads, self.v_head_dim
         # bf16 qkv GEMM output when the state is fp16 and the shape / weights match the bf16-identical path
         # (the SK GEMV's single-pass bf16 store). sm_75 only: elsewhere the GEMM's k-split partials would
-        # round through bf16, which changes the result against the fp32 output + trunc_bf16 the fused op reads
+        # round through bf16, which changes the result against the fp32 output + trunc_bf16 the fused op reads.
+        # Integer bitrates only: the SK GEMV declines half-integer (K + 0.5) rates and the GEMM has no
+        # bf16-output kernel for them, so those layers take the fp32 output
         qkv_dtype = torch.bfloat16 if (
             is_sm75(device)
             and state_half
             and self.k_head_dim == 128 and self.v_head_dim == 128
             and self.qkv_proj is not None
             and self.qkv_proj.inner.bias is None
+            and self.qkv_proj.inner.frac is None
             and self.fdim_qkv <= 12288
         ) else torch.float
         qkv             = g_tensor_cache.get(device, (bsz, seqlen, f), qkv_dtype, "s_qkv")
