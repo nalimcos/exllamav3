@@ -160,8 +160,9 @@ fa75_kernel
             oacc[dn][2] = pr[8 * dn + 8 * HD];
             oacc[dn][3] = pr[8 * dn + 8 * HD + 1];
         }
-        mrow[0] = pl[0]; lrow[0] = pl[1];
-        mrow[1] = pl[16]; lrow[1] = pl[17];
+        // The buffer holds the row total (summed over the 4 lanes sharing the row); lrow stays per-lane
+        mrow[0] = pl[0]; lrow[0] = pl[1] * 0.25f;
+        mrow[1] = pl[16]; lrow[1] = pl[17] * 0.25f;
     }
 
     const int row0 = m0 + 16 * warp + gq;                 // this thread's rows: row0, row0 + 8
@@ -349,7 +350,7 @@ fa75_kernel
                 }
                 float* pl_ = pml + (slot * BM + 16 * warp + gq + hh * 8) * 2;
                 pl_[0] = mrow[hh];
-                pl_[1] = lrow[hh];
+                pl_[1] = l;                    // row total: the combine reads one l per row
             }
         }
     }
@@ -396,10 +397,15 @@ void fa75_fwd_slice(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor partial
                 v.stride(0) % 8 == 0 && v.stride(1) % 8 == 0, "16-byte aligned strides");
     int Tq = q.size(0), Hq = q.size(1), Tkv = k.size(0), Hkv = k.size(1);
     TORCH_CHECK(Hq % Hkv == 0 && v.size(0) == Tkv && v.size(1) == Hkv, "shapes");
-    TORCH_CHECK(partial_o.is_contiguous() && partial_o.numel() == n_bh * BM * HD, "partial_o n_bh * BM * 256");
-    TORCH_CHECK(partial_ml.is_contiguous() && partial_ml.numel() == n_bh * BM * 2, "partial_ml n_bh * BM * 2");
     TORCH_CHECK(bh0 >= 0 && bh0 + Hq <= n_bh, "head/batch base within n_bh");
     dim3 grid((Tq + BM - 1) / BM, Hq);
+    // Slot (m_tile, bh0 + q head): n_bh slots per query block (m_tile), BM * HD floats per slot.
+    // The launched grid.x query blocks therefore need grid.x * n_bh slots, not n_bh alone
+    int64_t n_slots = (int64_t) grid.x * n_bh;
+    TORCH_CHECK(partial_o.is_contiguous() && partial_o.numel() >= n_slots * BM * HD,
+                "partial_o must hold grid.x * n_bh * BM * 256 floats");
+    TORCH_CHECK(partial_ml.is_contiguous() && partial_ml.numel() >= n_slots * BM * 2,
+                "partial_ml must hold grid.x * n_bh * BM * 2 floats");
     fa75_kernel<<<grid, NTHREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
         (const half*) q.data_ptr(), q.stride(0), q.stride(1),
         (const half*) k.data_ptr(), k.stride(0), k.stride(1),

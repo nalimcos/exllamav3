@@ -19,7 +19,8 @@ void fa75_fwd
 // scratch slice of one sequence; the first key is absolute (frame_len - offs) in a frame of frame_len keys
 // ending at this q chunk (causal: key j is visible to row i iff j <= i + offs, offs may be negative). Writes
 // the unnormalized (oacc, m, l) into the combine's slot (m_tile * n_bh + bh), resuming that slot when
-// resume != 0: partial_o is fp32 [n_bh, 64, 256], partial_ml fp32 [n_bh, 64, 2] (m at 2 * row, l at 2 * row + 1),
+// resume != 0: one 64 * 256-float slot of fp32 partial_o (64 * 2 of partial_ml, m at 2 * row, l at 2 * row + 1)
+// per (query block, bh), so the buffers hold q_blocks * n_bh slots with q_blocks = ceil(Tq / 64);
 // bh = bh0 + q head, bh0 = batch * Hq, HD = 256, BM = 64
 void fa75_fwd_slice
 (
