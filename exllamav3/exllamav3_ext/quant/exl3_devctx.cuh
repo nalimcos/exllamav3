@@ -21,6 +21,12 @@
 #define EXL3_GRID_BARRIER_OFFSET (MOE_SCHED_OFFSET + MOE_SCHED_INTS)
 #define EXL3_GRID_BARRIER_INTS 2
 
+// Split-k GEMV partials. On Maxwell they live in the lock buffer at EXL3_SK_WS_OFFSET (a single combined
+// buffer, so the kernel's arg 6 stays the lock buffer and the whole-grid barrier still reads
+// locks + EXL3_GRID_BARRIER_OFFSET); on sm_75 they are a standalone allocation.
+#define EXL3_SK_WS_OFFSET (EXL3_GRID_BARRIER_OFFSET + EXL3_GRID_BARRIER_INTS)
+#define EXL3_GEMV_SK_WS_FLOATS (5 * 512 * 1024)
+
 // Workspace size
 #define WORKSPACE_SIZE (16*1024*1024)
 

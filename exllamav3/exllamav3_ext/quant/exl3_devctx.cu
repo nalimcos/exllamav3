@@ -93,7 +93,11 @@ int* DevCtx::get_locks(int device)
     if (!locks[device])
     {
         c10::cuda::CUDAGuard guard(device);
-size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS + EXL3_GRID_BARRIER_INTS) * sizeof(int);
+        // Maxwell: the split-k GEMV partials ride in the lock buffer after the grid barrier (EXL3_SK_WS_OFFSET),
+        // so the whole-grid barrier and the workspace share one allocation; the other tiers keep the buffer small
+        cudaDeviceProp prop;
+        cuda_check(cudaGetDeviceProperties(&prop, device));
+        size_t size = (EXL3_SK_WS_OFFSET + (prop.major == 5 ? EXL3_GEMV_SK_WS_FLOATS : 0)) * sizeof(int);
         cudaError_t e = cudaMalloc(&locks[device], size);
         TORCH_CHECK(e == cudaSuccess, "exl3 lock buffer allocation failed on device ", device, ": ", cudaGetErrorString(e));
         e = cudaMemset(locks[device], 0, size);

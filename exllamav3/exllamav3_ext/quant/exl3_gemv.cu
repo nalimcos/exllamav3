@@ -8,6 +8,7 @@ namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
 #include "exl3_gemv_kernel.cuh"
+#include "exl3_gemv_sk_kernel.cuh"
 #include "exl3_devctx.cuh"
 #include "coop_autotune.cuh"
 #include <map>
@@ -30,6 +31,14 @@ kernel), bpw != 4, and m > 8.
 static int exl3_gemv_env_mode()
 {
     const char* env = std::getenv("EXL3_GEMV");
+    if (!env) return 1;
+    return atoi(env);
+}
+
+// Maxwell split-k GEMV (exl3_gemv_sk_kernel.cuh): EXL3_GEMV_SK = 0 disables it, unset/1 = on
+static int exl3_gemv_sk_env_mode()
+{
+    const char* env = std::getenv("EXL3_GEMV_SK");
     if (!env) return 1;
     return atoi(env);
 }
@@ -128,7 +137,7 @@ bool exl3_gemv_try_launch
     }
     else
     {
-        if (K < 2 || K > 4) return false;
+        if (K < 2 || K > 8) return false;      // 5-8 bpw (output heads) go to the split-k GEMV below
         if (K != 4 && cb == 0) return false;
     }
     if (size_m > EXL3_GEMV_MAX_M) return false;
@@ -154,6 +163,36 @@ bool exl3_gemv_try_launch
         cache[kernel] = blocks_per_sm;
         return blocks_per_sm;
     };
+
+    // Maxwell split-k GEMV (m = 1, MMODE 0): the decode-speed path for 2-8 bpw (output heads), balancing
+    // the work per SM for any shape. MMODE 1 (m = 2..8) and MMODE 2 (m = 9..16) are declined to the dense
+    // GEMM; the main GEMV below handles m = 2..8 at 2-4 bpw. arg 6 stays the lock buffer — the split-k
+    // partials live in it at EXL3_SK_WS_OFFSET, so no graph-parameter patching is needed.
+    if (cc == CC_MAXWELL && !half_k && !force && exl3_gemv_sk_env_mode() != 0 && size_m == 1 && K >= 2 && K <= 8)
+    {
+        void* sk_kernel = exl3_gemv_sk_select_kernel(K, cb, c_fp32, false, 0);
+        if (sk_kernel)
+        {
+            const int pf = EXL3_GEMV_SK_PF(0);
+            const int threads = EXL3_GEMV_SK_THREADS_M(0, EXL3_GEMV_SK_WNT_M(0));
+            const int grid = occupancy(sk_kernel, threads) * num_sms;
+            const int warps = grid * (threads / 32);
+            const int cols = EXL3_GEMV_SK_WNT_M(0) * 16;
+            const int kslices = size_k / 16;
+            const int total = size_n / cols * kslices;
+            // Same geometry as the kernel: the block partials (grid x groups per block range x rows x cols)
+            // must fit the workspace
+            const int span_w = CEIL_DIVIDE(CEIL_DIVIDE(total, MAX(warps, 1)), pf) * pf;
+            const int max_gpb = CEIL_DIVIDE(span_w * (threads / 32), kslices) + 1;
+            const size_t ws_floats = (size_t) grid * max_gpb * EXL3_GEMV_SK_ROWS(0) * cols;
+            if (grid > 0 && size_n % cols == 0 && ws_floats <= EXL3_GEMV_SK_WS_FLOATS)
+            {
+                cuda_check(EXL3_COOP_LAUNCH(sk_kernel, grid, threads, kernel_args, 0, stream));
+                if (launched_kernel) *launched_kernel = sk_kernel;
+                return true;
+            }
+        }
+    }
 
     // Extraction style: shuffle by default, smem staging selectable per call for evaluation
     bool smem = exl3_gemv_env_smem() == 1;
