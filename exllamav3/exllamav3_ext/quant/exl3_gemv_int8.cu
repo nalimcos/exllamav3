@@ -276,6 +276,12 @@ bool exl3_gemv_int8
     // and the following cuda_check would abort the process. This path is a decode-time
     // optimization over the regular fp16 tensor-core kernel, which handles the same work, so
     // declining is a performance loss and nothing more.
+    // Maxwell (sm_50/52): the int8 GEMV is dp4a-based and its value is the integer dp4a dot,
+    // which Maxwell does not have. Maxwell's 48 KB max smem/block is below the 80 KB checked
+    // here, so this check is the gate that keeps the int8 GEMV off Maxwell entirely.
+    // Coverage gap there: the fp32 GEMV covers K >= 2, while the int8 GEMV alone covered
+    // K == 1 and the residual / error-feedback quality mode (exl3_gemv_int8_mode() == 1);
+    // on Maxwell those cases are not covered and decode falls back to the fp32 dense GEMM.
     if (DevCtx::instance().get_smem_max(device) < 80 * 1024) return false;
 
     int num_sms = DevCtx::instance().get_num_sms(device);
