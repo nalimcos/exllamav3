@@ -1,9 +1,9 @@
 #pragma once
 
 // Split-k variant of the small-m EXL3 GEMV (exl3_gemv_kernel.cuh). sm_75 runs the tensor-core
-// fp16 MMAs; Maxwell (sm_50/52) runs the fp32 FMA form (MMODE 0, m = 1, activation-as-A, non-TRANS)
-// reusing the main GEMV's CORE FMA. MMODE 1 (m = 2..8, weights-as-A k8) and MMODE 2 (m = 9..16) are
-// declined on Maxwell (dispatch selects MMODE 0 only; MMODE 1/2 bodies are not instantiated there).
+// fp16 MMAs; Maxwell (sm_50/52) runs the fp32 FMA form: MMODE 0 (m = 1, activation-as-A, non-TRANS)
+// reuses the main GEMV's CORE FMA, and MMODE 1 (m = 2..8, weights-as-A k8, TRANS) is an fp32 FMA derived
+// from the k8 weights-as-A fragment layout. MMODE 2 (m = 9..16) is declined on Maxwell.
 //
 // The block-per-column-group GEMV leaves a partial last wave whenever the number of column groups is not a
 // multiple of the co-resident block count (n = 5120 at 32 columns per group: 160 groups on 136 slots, so 24
@@ -70,14 +70,14 @@ template <int bits, bool c_fp32, bool c_bf16, int cb, int MMODE, int WNT, int PF
 __global__ __launch_bounds__(EXL3_GEMV_SK_THREADS_M(MMODE, WNT))
 void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
 {
-    // Real code on sm_75 (tensor-core fp16 MMAs) and Maxwell (fp32 FMA, MMODE 0); every other tier traps
+    // Real code on sm_75 (tensor-core fp16 MMAs) and Maxwell (fp32 FMA, MMODE 0 + 1); every other tier traps
 #if defined(__CUDA_ARCH__) && (!EXL3_MAXWELL && __CUDA_ARCH__ != 750)
     __trap();
 #else
     static_assert(bits >= 2 && bits <= 8, "exl3_gemv_sk_kernel supports 2 to 8 bpw");
-    // Maxwell runs only the MMODE 0 (m = 1, activation-as-A, non-TRANS) fp32 FMA. MMODE 1 (weights-as-A k8)
-    // and MMODE 2 (m = 9..16) are declined to the dense GEMM (the dispatch selects MMODE 0 only) and compile
-    // as inert stubs here: the tensor-core mma_wa is a no-op on Maxwell and the FMA path is gated to MMODE 0.
+    // Maxwell runs the MMODE 0 (m = 1, activation-as-A, non-TRANS) and MMODE 1 (m = 2..8, weights-as-A k8,
+    // TRANS) fp32 FMA. MMODE 2 (m = 9..16) is declined to the dense GEMM (the dispatch selects MMODE 0/1);
+    // the tensor-core mma_wa is a no-op on Maxwell.
     constexpr int SK_THREADS = EXL3_GEMV_SK_THREADS_M(MMODE, WNT);
     constexpr int SK_WARPS = SK_THREADS / 32;
     static_assert(8 % PF == 0, "prefetch depth must divide 8");
@@ -315,10 +315,10 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
                 #pragma unroll
                 for (int t = 0; t < WNT; ++t)
                 {
-                    if constexpr (EXL3_MAXWELL && MMODE == 0)
+                    if constexpr (EXL3_MAXWELL)
                     {
-                        // fp32 dequant + the main GEMV's CORE per-lane FMA (8 FMA, no B-gather): each lane
-                        // multiplies its own row-0 A fragment by its own B fragment for its column g = lane>>2
+                        // fp32 dequant of the weights (the streamed tile): col g = lane>>2 (f0) and g+8 (f1),
+                        // k-pairs 2*(lane&3), +1 and +8, +9 — same windows the CORE form uses.
                         Vec<float,4> f0, f1;
                         if constexpr (BIG)
                             exl3_dq_dispatch_f32<bits, cb>(&sh_stage[warp][t * TWORDS], lane << 3, f0, f1);
@@ -341,14 +341,34 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
                             uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], x_src_b);
                             exl3_gemv_ns::dq8_regs_3bits_f32<cb>(awv, bwv, x_s2, f0, f1);
                         }
-                        accf[t][0].x += a01_x * f0[0];
-                        accf[t][0].y += a01_y * f0[1];
-                        accf[t][0].x += a23_x * f0[2];
-                        accf[t][0].y += a23_y * f0[3];
-                        accf[t][1].x += a01_x * f1[0];
-                        accf[t][1].y += a01_y * f1[1];
-                        accf[t][1].x += a23_x * f1[2];
-                        accf[t][1].y += a23_y * f1[3];
+                        if constexpr (MMODE == 0)
+                        {
+                            // activation-as-A (m = 1): batch 0 on every lane
+                            accf[t][0].x += a01_x * f0[0];
+                            accf[t][0].y += a01_y * f0[1];
+                            accf[t][0].x += a23_x * f0[2];
+                            accf[t][0].y += a23_y * f0[3];
+                            accf[t][1].x += a01_x * f1[0];
+                            accf[t][1].y += a01_y * f1[1];
+                            accf[t][1].x += a23_x * f1[2];
+                            accf[t][1].y += a23_y * f1[3];
+                        }
+                        else
+                        {
+                            // TRANS weights-as-A (m = 2..8): the activation (mma B) fragment is batch g = lane>>2,
+                            // in a_nx0 (k-pair 2t, +1) and a_nx1 (k-pair 2t+8, +9). Every product pairs a weight at
+                            // k with the activation at the same k; accf[..][0] accumulates C[g][g], [..][1] C[g+8][g].
+                            const float bx = __low2float(a_nx0), by = __high2float(a_nx0);
+                            const float cx = __low2float(a_nx1), cy = __high2float(a_nx1);
+                            accf[t][0].x += bx * f0[0];
+                            accf[t][0].y += by * f0[1];
+                            accf[t][0].x += cx * f0[2];
+                            accf[t][0].y += cy * f0[3];
+                            accf[t][1].x += bx * f1[0];
+                            accf[t][1].y += by * f1[1];
+                            accf[t][1].x += cx * f1[2];
+                            accf[t][1].y += cy * f1[3];
+                        }
                     }
                     else
                     {
@@ -433,16 +453,18 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
         }
 
         // Partial of this segment.
-        if constexpr (EXL3_MAXWELL && MMODE == 0)
+        if constexpr (EXL3_MAXWELL)
         {
-            // CORE (MMODE 0): lane l holds column g = l>>2 (frag 0) and g+8 (frag 1), split over the four
-            // k-pair lanes (l&3); reduce those lanes with shfl_xor and write the reduced row-0 partial
+            // CORE reduction, both forms: lane (g, t) holds output g (frag 0) and g+8 (frag 1) split over the
+            // four k-pair lanes (l&3); reduce those lanes with shfl_xor. The row is 0 for MMODE 0 and
+            // g = lane>>2 for TRANS (the batch the lane's activation fragment is).
             if ((lane & 3) == 0)
             {
                 const int g = lane >> 2;
                 float* sp = seg == 0 ? &sh_part[warp][0][0][0] :
                             s >= e   ? &sh_part[warp][1][0][0] :
                                        ws + ((size_t) blockIdx.x * max_gpb + group - g_lo_b) * ROWS * COLS;
+                const int row = MMODE == 0 ? 0 : g;
                 #pragma unroll
                 for (int t = 0; t < WNT; ++t)
                 {
@@ -452,8 +474,8 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
                     v0 += __shfl_xor_sync(0xffffffffu, v0, 2);
                     v1 += __shfl_xor_sync(0xffffffffu, v1, 1);
                     v1 += __shfl_xor_sync(0xffffffffu, v1, 2);
-                    sp[t * 16 + g] = v0;
-                    sp[t * 16 + g + 8] = v1;
+                    sp[row * COLS + t * 16 + g] = v0;
+                    sp[row * COLS + t * 16 + g + 8] = v1;
                 }
             }
         }

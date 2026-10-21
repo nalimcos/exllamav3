@@ -164,27 +164,29 @@ bool exl3_gemv_try_launch
         return blocks_per_sm;
     };
 
-    // Maxwell split-k GEMV (m = 1, MMODE 0): the decode-speed path for 2-8 bpw (output heads), balancing
-    // the work per SM for any shape. MMODE 1 (m = 2..8) and MMODE 2 (m = 9..16) are declined to the dense
-    // GEMM; the main GEMV below handles m = 2..8 at 2-4 bpw. arg 6 stays the lock buffer — the split-k
-    // partials live in it at EXL3_SK_WS_OFFSET, so no graph-parameter patching is needed.
-    if (cc == CC_MAXWELL && !half_k && !force && exl3_gemv_sk_env_mode() != 0 && size_m == 1 && K >= 2 && K <= 8)
+    // Maxwell split-k GEMV (MMODE 0, m = 1, activation-as-A; MMODE 1, m = 2..8, weights-as-A k8 TRANS): the
+// decode-speed path for 2-8 bpw (output heads), balancing the work per SM for any shape. MMODE 2 (m = 9..16)
+// is declined to the dense GEMM; the main GEMV below remains the fallback when the split-k workspace does
+// not fit. arg 6 stays the lock buffer — the split-k partials live in it at EXL3_SK_WS_OFFSET, so no
+// graph-parameter patching is needed.
+    if (cc == CC_MAXWELL && !half_k && !force && exl3_gemv_sk_env_mode() != 0 && size_m >= 1 && size_m <= 8 && K >= 2 && K <= 8)
     {
-        void* sk_kernel = exl3_gemv_sk_select_kernel(K, cb, c_fp32, false, 0);
+        const int mmode = size_m == 1 ? 0 : 1;
+        void* sk_kernel = exl3_gemv_sk_select_kernel(K, cb, c_fp32, false, mmode);
         if (sk_kernel)
         {
-            const int pf = EXL3_GEMV_SK_PF(0);
-            const int threads = EXL3_GEMV_SK_THREADS_M(0, EXL3_GEMV_SK_WNT_M(0));
+            const int pf = EXL3_GEMV_SK_PF(mmode);
+            const int threads = EXL3_GEMV_SK_THREADS_M(mmode, EXL3_GEMV_SK_WNT_M(mmode));
             const int grid = occupancy(sk_kernel, threads) * num_sms;
             const int warps = grid * (threads / 32);
-            const int cols = EXL3_GEMV_SK_WNT_M(0) * 16;
+            const int cols = EXL3_GEMV_SK_WNT_M(mmode) * 16;
             const int kslices = size_k / 16;
             const int total = size_n / cols * kslices;
             // Same geometry as the kernel: the block partials (grid x groups per block range x rows x cols)
             // must fit the workspace
             const int span_w = CEIL_DIVIDE(CEIL_DIVIDE(total, MAX(warps, 1)), pf) * pf;
             const int max_gpb = CEIL_DIVIDE(span_w * (threads / 32), kslices) + 1;
-            const size_t ws_floats = (size_t) grid * max_gpb * EXL3_GEMV_SK_ROWS(0) * cols;
+            const size_t ws_floats = (size_t) grid * max_gpb * EXL3_GEMV_SK_ROWS(mmode) * cols;
             if (grid > 0 && size_n % cols == 0 && ws_floats <= EXL3_GEMV_SK_WS_FLOATS)
             {
                 cuda_check(EXL3_COOP_LAUNCH(sk_kernel, grid, threads, kernel_args, 0, stream));
