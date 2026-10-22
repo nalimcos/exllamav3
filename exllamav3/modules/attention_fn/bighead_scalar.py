@@ -3,20 +3,25 @@ from ...ext import exllamav3_ext as ext
 from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
 
 KV_CHUNK_SIZE = 128
+# fp32 partial workspace cap, mirrors WORKSPACE_SIZE (16*1024*1024) in exl3_devctx.cuh
+BIGHEAD_WS_LIMIT = 16 * 1024 * 1024
 
 def fn_bighead_scalar_attn(args: AttnArgs) -> torch.Tensor | None:
     # Native-CUDA fp32 fallback for the dims the kernel instantiates
     # ({64,128,256} x G∈{1,2,4,8}, {512} x G∈{1,2,4,8,16}), used after Triton
     # for both decode and prefill. Declines non-instantiated dims / GQA ratios
-    # here so they never reach the CUDA TORCH_CHECK.
-    g = args.num_q_heads // args.num_kv_heads if args.num_kv_heads else None
+    # and shapes whose n_chunks==1 workspace footprint would not fit, so they
+    # never reach the CUDA TORCH_CHECK / hang the chunk-size loop.
     allowed_g = (1, 2, 4, 8, 16) if args.dim == 512 else (1, 2, 4, 8)
     if (
         args.is_varlen() or
         args.is_swa() or
         not args.has_kv_cache() or
         args.dim not in (64, 128, 256, 512) or
-        g not in allowed_g or
+        args.num_kv_heads == 0 or
+        args.num_q_heads % args.num_kv_heads != 0 or
+        (args.num_q_heads // args.num_kv_heads) not in allowed_g or
+        args.bsz * args.q_len * args.num_q_heads * (args.dim + 2) * 4 > BIGHEAD_WS_LIMIT or
         args.softcap != 0.0 or
         args.sinks is not None or
         args.non_causal_spans

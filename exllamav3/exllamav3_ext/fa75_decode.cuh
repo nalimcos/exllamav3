@@ -30,6 +30,5 @@ void fa75_decode_qc
     int64_t max_k_len,
     int64_t num_pages_per_seq,
     int64_t kv_append_len,
-    double scale,
-    bool causal
+    double scale
 );

@@ -64,8 +64,7 @@ fa75_decode_kernel
     int kv_append_len,
     int split_len,
     int num_splits,
-    float scale,
-    int causal
+    float scale
 )
 {
     constexpr int KP = BLOCK_N / 32;
@@ -82,7 +81,6 @@ fa75_decode_kernel
     const int n_q_heads = n_kv_heads * FAD_GQA;
 
     const int total_k_len = cache_seqlens[batch] + kv_append_len;
-    const int q_abs = total_k_len - 1;
     const int n_start = split * split_len;
     const int n_end = min(n_start + split_len, total_k_len);
 
@@ -203,7 +201,7 @@ fa75_decode_kernel
         for (int m = 0; m < KP; ++m)
         {
             const int logical = n0 + lane + 32 * m;
-            const bool valid = (logical < n_end) && (!causal || logical <= q_abs);
+            const bool valid = logical < n_end;
             if (!valid) s[m] = -CUDART_INF_F;
         }
         float smax = -CUDART_INF_F;
@@ -298,8 +296,7 @@ void fa75_decode_qc
     int64_t max_k_len,
     int64_t num_pages_per_seq,
     int64_t kv_append_len,
-    double scale,
-    bool causal
+    double scale
 )
 {
     const at::cuda::OptionalCUDAGuard guard(q.device());
@@ -332,7 +329,7 @@ void fa75_decode_qc
         (const int*) block_table.data_ptr(), (const int*) cache_seqlens.data_ptr(),
         (half*) out.data_ptr(), (float*) partial_o.data_ptr(), (float*) partial_ml.data_ptr(),
         n_kv_heads, (int) num_pages_per_seq, (int) kv_append_len, split_len, splits,
-        (float) scale, causal ? 1 : 0);
+        (float) scale);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -346,7 +343,7 @@ void fa75_decode_qc
     at::Tensor q, at::Tensor k_cache, at::Tensor k_scales, at::Tensor v_cache, at::Tensor v_scales,
     at::Tensor block_table, at::Tensor cache_seqlens, at::Tensor out, at::Tensor partial_o,
     at::Tensor partial_ml, int64_t num_splits, int64_t max_k_len, int64_t num_pages_per_seq,
-    int64_t kv_append_len, double scale, bool causal
+    int64_t kv_append_len, double scale
 )
 {
     TORCH_CHECK(false, "Turing (sm_75) kernel not available on ROCm");

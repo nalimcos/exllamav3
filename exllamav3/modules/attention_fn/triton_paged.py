@@ -2396,8 +2396,10 @@ def paged_attn_fa75_decode_qc(
         max_k_len = min(max_k_len, max_kv_len + kv_append_len)
 
     programs = bsz * n_kv_heads
-    sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
-    target = 2 * sm_count
+    dev = q.device.index
+    if dev not in _decode_sm_count:
+        _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
+    target = 2 * _decode_sm_count[dev]
     block_n = 32
     if num_splits is None:
         splits = max(1, min(target // programs, triton.cdiv(max_k_len, block_n), 128))
@@ -2415,7 +2417,7 @@ def paged_attn_fa75_decode_qc(
     ext.fa75_decode_qc(
         q, k_cache, k_scales, v_cache, v_scales, block_table, cache_seqlens,
         out, partial_o, partial_ml,
-        splits, max_k_len, num_pages_per_seq, kv_append_len, float(softmax_scale), True,
+        splits, max_k_len, num_pages_per_seq, kv_append_len, float(softmax_scale),
     )
 
     if splits > 1:
@@ -2425,7 +2427,8 @@ def paged_attn_fa75_decode_qc(
         rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
         _paged_attn_decode_combine_kernel[(programs, (block_rows // rows_sub) * (hd_pad // d_sub))](
             partial_o, partial_ml, out, h32,
-            splits, partial_ml, 1, False, 1, n_q_heads, n_kv_heads, head_dim, hd_pad, head_dim,
+            splits, partial_ml,   # sinks slot unused (HAS_SINKS=False); pass partial_ml as the stand-in *fp32 pointer
+            1, False, 1, n_q_heads, n_kv_heads, head_dim, hd_pad, head_dim,
             block_rows, rows_sub, d_sub,
             num_warps = 4, num_stages = 1,
         )
@@ -2448,8 +2451,7 @@ def fn_fa75_decode_qc(args: AttnArgs) -> torch.Tensor | None:
         args.softcap != 0.0 or
         args.sinks is not None or
         args.non_causal_spans is not None or
-        args.num_q_heads // args.num_kv_heads != 8 or
-        args.num_kv_heads == 0
+        args.num_q_heads // args.num_kv_heads != 8
     ):
         return None
     if torch.cuda.get_device_capability(args.q.device)[0] != 5:

@@ -72,8 +72,12 @@ def fn_torch_sdpa_fallback_cache(args: AttnArgs) -> torch.Tensor | None:
         _warn_sdpa_fallback()
 
     # Total KV length any query row attends to = cached past + new tokens; N^2 bounds the per-row
-    # score buffer on the worst-case (longest) sequence
-    total_len = args.cache_seqlens.max().item() + args.kv_len
+    # score buffer on the worst-case (longest) sequence. Prefer the host-known max_kv_len (past
+    # length, no GPU->CPU sync); fall back to the device max only when it is unset.
+    if args.max_kv_len is not None:
+        total_len = args.max_kv_len + args.kv_len
+    else:
+        total_len = args.cache_seqlens.max().item() + args.kv_len
     if args.num_q_heads * total_len * total_len * 4 > SDPA_MATH_MAX_SCORE_BYTES:
         return None
 
