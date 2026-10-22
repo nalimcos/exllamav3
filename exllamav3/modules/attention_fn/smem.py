@@ -48,6 +48,9 @@ def smem_limit(device) -> int:
             lim = props.shared_memory_per_block
         if not lim:
             lim = 64 * 1024 if props.major < 8 else 96 * 1024
+        if props.major == 5:
+            # Maxwell (CC 5.x): hard-cap at 48 KB so the ladder shrinks even if the driver reports 0 opt-in.
+            lim = min(lim, 48 * 1024)
         if _env_limit:
             lim = min(lim, _env_limit)
         _limit[idx] = lim

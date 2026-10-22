@@ -248,11 +248,12 @@ void rope_kernel
                 }
                 else
                 {
-                    half2 norm_constant_bias_h2 = __float2half2_rn(norm_constant_bias);
                     half2 *wptr = (half2*)(((half*)norm_weight) + t * 2);
-                    half2 w = __hadd2(*wptr, norm_constant_bias_h2);
+                    float wx = __low2float(*wptr) + norm_constant_bias;
+                    float wy = __high2float(*wptr) + norm_constant_bias;
+                    v1 *= wx;
+                    v2 *= wy;
                     v = __floats2half2_rn(v1, v2);
-                    v = __hmul2(w, v);
                 }
 
                 *tptr = v;
