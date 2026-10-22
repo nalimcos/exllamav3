@@ -11,6 +11,7 @@ from .triton_paged import (
     fn_triton_paged_attn_decode,
     fn_triton_paged_attn_prefill,
     fn_triton_varlen_attn,
+    fn_fa75_decode_qc,
     fn_triton_paged_attn_decode_qc,
     fn_triton_paged_attn_prefill_qc,
     fn_triton_attn_nocache,
@@ -30,6 +31,7 @@ _fns_triton_fast: list[AttnFn] = [
 # would silently attend over just the new K/V rows and ignore the cached context, so quant-direct calls only
 # ever dispatch over the qc-aware functions
 _fns_qc: list[AttnFn] = [
+    fn_fa75_decode_qc,          # opt-in (EXL3_ATTN_FA75) Maxwell CUDA-core decode; None otherwise
     fn_triton_paged_attn_decode_qc,
     fn_triton_paged_attn_prefill_qc,
 ]
@@ -39,13 +41,20 @@ _fns_qc: list[AttnFn] = [
 # with full-size fp16 temporaries for A/B testing
 _qc_attn = _qc_staging < 2
 
+# Built once at import from the current device; 0 when there is no CUDA device at import
+_cc_major = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+# The xformers cutlass fallback needs CC >= 7.0 and would crash on Maxwell (CC 5.x), reachable for
+# dim >= 512; drop the two fallbacks there, keeping the rest of the order
+_xformers = [] if _cc_major == 5 else [
+    fn_xformers_cutlass_fallback_cache,
+    fn_xformers_cutlass_fallback_nocache,
+]
 attn_fns: list[AttnFn] = _fns_triton_fast + [
     fn_triton_attn_nocache,
     fn_triton_paged_attn,
     fn_triton_paged_attn_longq,
     fn_bighead_scalar_attn,
-    fn_xformers_cutlass_fallback_cache,
-    fn_xformers_cutlass_fallback_nocache,
+    *_xformers,
     fn_torch_sdpa_fallback_cache,
     fn_torch_sdpa_fallback_nocache
 ]

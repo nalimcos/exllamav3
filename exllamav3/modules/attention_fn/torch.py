@@ -1,6 +1,12 @@
+import os
 import torch
 from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
 import torch.nn.functional as F
+
+# SDPA-math is acceptable only while the O(N^2) fp32 score buffer (n_q_heads*N^2*4 bytes) fits this budget.
+# On M40 this is VRAM-bounded (not FLOP-bounded): 256 MB → N≈2048 @ 32 heads, N≈1400 @ 64 heads.
+# Over → decline to the next dispatch candidate.
+SDPA_MATH_MAX_SCORE_BYTES = int(os.environ.get("EXL3_SDPA_MATH_MAX_SCORE_BYTES", str(1 << 28)))
 
 
 def _causal_lower_right(*args):
@@ -38,6 +44,9 @@ def fn_torch_sdpa_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
     if args.dim > 256:
         _warn_sdpa_fallback()
 
+    if args.num_q_heads * args.kv_len * args.kv_len * 4 > SDPA_MATH_MAX_SCORE_BYTES:
+        return None
+
     return F.scaled_dot_product_attention(
         args.q.transpose(1, 2),
         args.k.transpose(1, 2),
@@ -61,6 +70,12 @@ def fn_torch_sdpa_fallback_cache(args: AttnArgs) -> torch.Tensor | None:
 
     if args.dim > 256:
         _warn_sdpa_fallback()
+
+    # Total KV length any query row attends to = cached past + new tokens; N^2 bounds the per-row
+    # score buffer on the worst-case (longest) sequence
+    total_len = args.cache_seqlens.max().item() + args.kv_len
+    if args.num_q_heads * total_len * total_len * 4 > SDPA_MATH_MAX_SCORE_BYTES:
+        return None
 
     if not args.non_causal_spans:
         return _torch_bighead_fallback(

@@ -17,6 +17,7 @@
 #include "gdn.cuh"
 #include "add.cuh"
 #include "dflash2.cuh"
+#include "fa75_decode.cuh"
 
 #include "quant/quantize.cuh"
 #include "quant/pack.cuh"
@@ -214,6 +215,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
 #endif
     m.def("rope", &rope, "rope");
+    m.def("fa75_decode_qc", &fa75_decode_qc, "fa75_decode_qc");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");
     m.def("silu_oai_mul", &silu_oai_mul, "silu_oai_mul");
