@@ -211,6 +211,8 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
         // A fragment per segment. Maxwell FMA (MMODE 0): fp32 scalars, every lane reads row 0. sm_75 mma:
         // half2 FragB, lane l covers row l/4 (rows beyond size_m zeroed).
         [[maybe_unused]] float a01_x = 0, a01_y = 0, a23_x = 0, a23_y = 0;
+        // FMA (MMODE 0) reads the current-slice snapshot below; a01_x... is only the next-slice advance target
+        [[maybe_unused]] float a01x_c = 0, a01y_c = 0, a23x_c = 0, a23y_c = 0;
         half2 a_nx0 = hzero, a_nx1 = hzero;
         [[maybe_unused]] half2 a_nx2 = hzero, a_nx3 = hzero;
         if constexpr (EXL3_MAXWELL && MMODE == 0)
@@ -238,7 +240,7 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
         }
 
         // Accumulators. Maxwell FMA: direct fp32 (no fp16 fold). sm_75 mma: fp16 ch / cw folded to fp32 acc0.
-        [[maybe_unused]] float2 accf[WNT][2] = {};   // FMA (Maxwell)
+        [[maybe_unused]] float2 accf[WNT][4] = {};   // FMA (Maxwell): per tile, (batch, col) output
         [[maybe_unused]] FragC_h ch[WNT][2] = {};   // mma (sm_75)
         [[maybe_unused]] float2 acc0[WNT][2][NB] = {};
         [[maybe_unused]] uint32_t cw[WNT][2][NB] = {};
@@ -263,9 +265,11 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
                 }
 
                 // A fragment for this slice + look-ahead. sm_75 mma: half2 FragB (a01/a23, a45/a67 for the NB = 2
-                // batch half). Maxwell FMA: the fp32 scalars a01_x... advanced one slice ahead.
+                // batch half). Maxwell FMA: the FMA reads the current-slice snapshot below; the persistent
+                // a01_x / a_nx registers are only the next-slice (i + 1) advance target.
                 [[maybe_unused]] FragB a01, a23;
                 [[maybe_unused]] half2 a45 = hzero, a67 = hzero;
+                [[maybe_unused]] half2 a01c = hzero, a23c = hzero;   // FMA (MMODE 1): current-slice activation
                 if constexpr (!EXL3_MAXWELL)
                 {
                     a01[0] = a_nx0;
@@ -277,6 +281,8 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
                 }
                 if constexpr (EXL3_MAXWELL && MMODE == 0)
                 {
+                    // current slice (i) into the FMA read; a01_x then takes the next slice
+                    a01x_c = a01_x; a01y_c = a01_y; a23x_c = a23_x; a23y_c = a23_y;
                     if (i + 1 < myn)
                     {
                         const size_t a_col = (size_t) (ks0 + i + 1) * 8 + (lane & 3);
@@ -288,6 +294,11 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
                 }
                 else
                 {
+                    if constexpr (EXL3_MAXWELL)
+                    {
+                        // current slice (i) into the FMA gather; a_nx then takes the next slice
+                        a01c = a_nx0; a23c = a_nx1;
+                    }
                     if (i + 1 < myn && r0_ok)
                     {
                         const size_t a_col = (size_t) (ks0 + i + 1) * 8 + (lane & 3);
@@ -343,21 +354,60 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
                         }
                         if constexpr (MMODE == 0)
                         {
-                            // activation-as-A (m = 1): batch 0 on every lane
-                            accf[t][0].x += a01_x * f0[0];
-                            accf[t][0].y += a01_y * f0[1];
-                            accf[t][0].x += a23_x * f0[2];
-                            accf[t][0].y += a23_y * f0[3];
-                            accf[t][1].x += a01_x * f1[0];
-                            accf[t][1].y += a01_y * f1[1];
-                            accf[t][1].x += a23_x * f1[2];
-                            accf[t][1].y += a23_y * f1[3];
+                            // activation-as-A (m = 1): batch 0 on every lane; W[slice i] x Act[slice i]
+                            accf[t][0].x += a01x_c * f0[0];
+                            accf[t][0].y += a01y_c * f0[1];
+                            accf[t][0].x += a23x_c * f0[2];
+                            accf[t][0].y += a23y_c * f0[3];
+                            accf[t][1].x += a01x_c * f1[0];
+                            accf[t][1].y += a01y_c * f1[1];
+                            accf[t][1].x += a23x_c * f1[2];
+                            accf[t][1].y += a23y_c * f1[3];
+                        }
+                        else if constexpr (MMODE == 1)
+                        {
+                            // TRANS weights-as-A (m = 2..8). f0 = W[g][slabs(u)], f1 = W[g+8][slabs(u)] (the lane's
+                            // own k-slabs {2u, 2u+1, 2u+8, 2u+9}). The four outputs the lane owns are the full 16-k
+                            // dots {batch 2u, 2u+1} x {col g, g+8}: C[b][c] = sum_k W[c][k] * Act[b][k]. Because the
+                            // k-slab index and the batch index are both encoded in the lane sub-index u, no single
+                            // lane can be reduced across the warp into these dots; instead the lane gathers the full
+                            // rows (weights from the g / g+8 groups, activations from the 2u / 2u+1 groups) with
+                            // per-lane masks and dot-products them locally.
+                            const int g = lane >> 2;
+                            const int u = lane & 3;
+                            #pragma unroll
+                            for (int u2 = 0; u2 < 4; ++u2)
+                            {
+                                // weights for col g / g+8 at k-slab slabs(u2), from lane (g, u2)
+                                const int lw = (g << 2) | u2;
+                                const float w00 = __shfl_sync(0xffffffffu, f0[0], lw);
+                                const float w01 = __shfl_sync(0xffffffffu, f0[1], lw);
+                                const float w02 = __shfl_sync(0xffffffffu, f0[2], lw);
+                                const float w03 = __shfl_sync(0xffffffffu, f0[3], lw);
+                                const float w10 = __shfl_sync(0xffffffffu, f1[0], lw);
+                                const float w11 = __shfl_sync(0xffffffffu, f1[1], lw);
+                                const float w12 = __shfl_sync(0xffffffffu, f1[2], lw);
+                                const float w13 = __shfl_sync(0xffffffffu, f1[3], lw);
+                                // activations for batch 2u / 2u+1 at k-slab slabs(u2), from lane (2u, u2) / (2u+1, u2)
+                                const int lb0 = (2 * u) << 2 | u2;
+                                const half2 a0v = __shfl_sync(0xffffffffu, a01c, lb0);
+                                const half2 a1v = __shfl_sync(0xffffffffu, a23c, lb0);
+                                const float e0 = __low2float(a0v), e1 = __high2float(a0v);
+                                const float e2 = __low2float(a1v), e3 = __high2float(a1v);
+                                const int lb1 = (2 * u + 1) << 2 | u2;
+                                const half2 b0v = __shfl_sync(0xffffffffu, a01c, lb1);
+                                const half2 b1v = __shfl_sync(0xffffffffu, a23c, lb1);
+                                const float o0 = __low2float(b0v), o1 = __high2float(b0v);
+                                const float o2 = __low2float(b1v), o3 = __high2float(b1v);
+                                accf[t][0].x += w00 * e0 + w01 * e1 + w02 * e2 + w03 * e3;   // C[2u][g]
+                                accf[t][1].x += w00 * o0 + w01 * o1 + w02 * o2 + w03 * o3;   // C[2u+1][g]
+                                accf[t][2].x += w10 * e0 + w11 * e1 + w12 * e2 + w13 * e3;   // C[2u][g+8]
+                                accf[t][3].x += w10 * o0 + w11 * o1 + w12 * o2 + w13 * o3;   // C[2u+1][g+8]
+                            }
                         }
                         else
                         {
-                            // TRANS weights-as-A (m = 2..8): the activation (mma B) fragment is batch g = lane>>2,
-                            // in a_nx0 (k-pair 2t, +1) and a_nx1 (k-pair 2t+8, +9). Every product pairs a weight at
-                            // k with the activation at the same k; accf[..][0] accumulates C[g][g], [..][1] C[g+8][g].
+                            // MMODE 2 (m = 9..16) is declined on Maxwell (never dispatched); the original TRANS stub.
                             const float bx = __low2float(a_nx0), by = __high2float(a_nx0);
                             const float cx = __low2float(a_nx1), cy = __high2float(a_nx1);
                             accf[t][0].x += bx * f0[0];
@@ -455,27 +505,61 @@ void exl3_gemv_sk_kernel(EXL3_GEMM_ARGS)
         // Partial of this segment.
         if constexpr (EXL3_MAXWELL)
         {
-            // CORE reduction, both forms: lane (g, t) holds output g (frag 0) and g+8 (frag 1) split over the
-            // four k-pair lanes (l&3); reduce those lanes with shfl_xor. The row is 0 for MMODE 0 and
-            // g = lane>>2 for TRANS (the batch the lane's activation fragment is).
-            if ((lane & 3) == 0)
+            // CORE reduction. MMODE 0: a col output is split over the four k-pair lanes (u = lane&3); reduce
+            // those lanes with shfl_xor and write from u == 0. MMODE 1: each lane already holds the full dot
+            // for its four (batch, col) outputs (full rows gathered above), so it writes them directly.
+            const int g = lane >> 2;
+            const int u = lane & 3;
+            float* sp = seg == 0 ? &sh_part[warp][0][0][0] :
+                        s >= e   ? &sh_part[warp][1][0][0] :
+                                   ws + ((size_t) blockIdx.x * max_gpb + group - g_lo_b) * ROWS * COLS;
+            if constexpr (MMODE == 0)
             {
-                const int g = lane >> 2;
-                float* sp = seg == 0 ? &sh_part[warp][0][0][0] :
-                            s >= e   ? &sh_part[warp][1][0][0] :
-                                       ws + ((size_t) blockIdx.x * max_gpb + group - g_lo_b) * ROWS * COLS;
-                const int row = MMODE == 0 ? 0 : g;
+                if (u == 0)
+                {
+                    #pragma unroll
+                    for (int t = 0; t < WNT; ++t)
+                    {
+                        float v0 = accf[t][0].x + accf[t][0].y;
+                        float v1 = accf[t][1].x + accf[t][1].y;
+                        v0 += __shfl_xor_sync(0xffffffffu, v0, 1);
+                        v0 += __shfl_xor_sync(0xffffffffu, v0, 2);
+                        v1 += __shfl_xor_sync(0xffffffffu, v1, 1);
+                        v1 += __shfl_xor_sync(0xffffffffu, v1, 2);
+                        sp[t * 16 + g] = v0;
+                        sp[t * 16 + g + 8] = v1;
+                    }
+                }
+            }
+            else if constexpr (MMODE == 1)
+            {
                 #pragma unroll
                 for (int t = 0; t < WNT; ++t)
                 {
-                    float v0 = accf[t][0].x + accf[t][0].y;
-                    float v1 = accf[t][1].x + accf[t][1].y;
-                    v0 += __shfl_xor_sync(0xffffffffu, v0, 1);
-                    v0 += __shfl_xor_sync(0xffffffffu, v0, 2);
-                    v1 += __shfl_xor_sync(0xffffffffu, v1, 1);
-                    v1 += __shfl_xor_sync(0xffffffffu, v1, 2);
-                    sp[row * COLS + t * 16 + g] = v0;
-                    sp[row * COLS + t * 16 + g + 8] = v1;
+                    const int b0 = 2 * u;
+                    sp[b0 * COLS + t * 16 + g]       = accf[t][0].x;   // C[2u][g]
+                    sp[(b0 + 1) * COLS + t * 16 + g] = accf[t][1].x;   // C[2u+1][g]
+                    sp[b0 * COLS + t * 16 + g + 8]   = accf[t][2].x;   // C[2u][g+8]
+                    sp[(b0 + 1) * COLS + t * 16 + g + 8] = accf[t][3].x;   // C[2u+1][g+8]
+                }
+            }
+            else
+            {
+                // MMODE 2 (m = 9..16), declined on Maxwell: the original TRANS diagonal, unchanged.
+                if (u == 0)
+                {
+                    #pragma unroll
+                    for (int t = 0; t < WNT; ++t)
+                    {
+                        float v0 = accf[t][0].x + accf[t][0].y;
+                        float v1 = accf[t][1].x + accf[t][1].y;
+                        v0 += __shfl_xor_sync(0xffffffffu, v0, 1);
+                        v0 += __shfl_xor_sync(0xffffffffu, v0, 2);
+                        v1 += __shfl_xor_sync(0xffffffffu, v1, 1);
+                        v1 += __shfl_xor_sync(0xffffffffu, v1, 2);
+                        sp[g * COLS + t * 16 + g] = v0;
+                        sp[g * COLS + t * 16 + g + 8] = v1;
+                    }
                 }
             }
         }
