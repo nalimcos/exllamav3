@@ -36,7 +36,16 @@ Confirm the router GEMM runs on Maxwell: bsz 1 through the fp32 FMA GEMV path, b
 
 ## E5 — reconstruct → cuBLAS SGEMM (guaranteed-correct Maxwell path)
 
-Add an explicit `cublasSgemm` path to `exllamav3_ext/hgemm.cu`, gated on `CC_MAXWELL`, so the reconstruct GEMM on Maxwell is guaranteed-correct and matches the GTX 16xx reference, rather than relying on the mixed-precision path.
+Two explicit FP32 GEMM helpers in `exllamav3_ext/hgemm.cu`, gated on `DevCtx::instance().get_cc(device) == CC_MAXWELL` and wrapped in `#if !defined(USE_ROCM)`, so the reconstruct GEMM on Maxwell does not depend on the mixed-precision 16F-in / C32-accumulate cuBLAS behavior (matches the GTX 16xx `hgemm_recon_fp32` reference).
+
+- **`hgemm_sgemm_impl(a, b, c, stream)`** — dense. Casts `a`, `b` to FP32 (`to(at::kFloat)`), allocates an FP32 output laid out to match `c`'s row stride (`at::empty({size_m, c_stride_m}, fp32).narrow(1, 0, size_n)`), calls `cublasSgemm` with the SAME operand roles / dims / leading dims / transpose as the `cublasGemmEx` it mirrors (`CUBLAS_OP_N` both; m/n/k = `size_n, size_m, size_k`; b ld `size_n`, a ld `size_k`, c ld `c_stride_m`), then `c.copy_(cf)` (downcast for an FP16 `c`, strided for a non-contiguous `c`).
+- **`hgemm_batched_sgemm_impl(a, w, c, stream)`** — batched. Same idea; `cublasGemmStridedBatchedEx` with `CUDA_R_32F` + `CUBLAS_COMPUTE_32F`, FP32-cast inputs, identical dims / leading dims / batch strides to the `cublasGemmStridedBatchedEx` it mirrors, then `c.copy_(cf)`.
+
+**Dispatch (hot path confirmed for both cases on Maxwell):**
+- Dense prefill: `exl3.py:reconstruct_hgemm` → `ext.hgemm_recon` → C++ `hgemm_recon` (`hgemm_f16acc.cu`) → `hgemm_f16acc_try` (false on Maxwell: `f16acc::covered` requires `major >= 8`) → `hgemm` → `hgemm_gr` → **`hgemm_gemmex_impl`**, which now calls `hgemm_sgemm_impl` and returns under the Maxwell gate.
+- Batched-expert MoE: `moe_batch_recon.py` → `ext.hgemm_batched` → **`hgemm_batched`**, which now calls `hgemm_batched_sgemm_impl` and returns under the Maxwell gate (after the f16acc try, false on Maxwell).
+
+Both gates sit after the existing shape/contiguity checks; the existing `cublasGemmEx` path is untouched on non-Maxwell devices. `reconstruct.cu` is unchanged (still emits FP16 weights); the FP16→FP32 cast lives in the GEMM layer.
 
 **Nuance (kept deliberately):** the existing `hgemm`/`hgemm_batched` use `cublasGemmEx(CUDA_R_16F, CUBLAS_COMPUTE_32F)`, which **is** supported on Maxwell CC 5.0/5.2 (CUDA 9.0 release notes: "Maxwell or later"). What is unsupported on Maxwell is FP16 *compute* (`COMPUTE_16F` / `cublasHgemm`, needs CC 5.3+). We do not switch the general `hgemm` to it; we add the explicit `cublasSgemm` reconstruct path per the workstream requirement so this path is guaranteed-correct by construction on Maxwell.
 

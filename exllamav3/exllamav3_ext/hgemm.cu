@@ -1,5 +1,6 @@
 #include <cuda_fp16.h>
 #include "hgemm.cuh"
+#include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
@@ -19,6 +20,102 @@ Row-major matmul using cuBLAS, a @ b -> c
 */
 
 using bfloat16 = __nv_bfloat16;
+
+#if !defined(USE_ROCM)
+// Maxwell (CC 5) reconstruct GEMM: an explicit FP32 SGEMM path so the result does not depend on the
+// mixed-precision 16F-in / C32-accumulate cuBLAS behavior. FP16 inputs are cast to FP32 and the FP32
+// result is written back into c (downcast for an FP16 c, strided for a non-contiguous c). The layout
+// (operand roles, dims, leading dims, transpose) mirrors the GemmEx each path already uses, so the
+// numbers match that path. CUDA-only: the ROCm build always uses hipBLAS here.
+
+// Dense: mirrors the cublasGemmEx call in hgemm_gemmex_impl, using cublasSgemm.
+static void hgemm_sgemm_impl
+(
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor c,
+    cudaStream_t stream
+)
+{
+    auto af = a.to(at::kFloat);
+    auto bf = b.to(at::kFloat);
+
+    int size_k = a.size(-1);
+    int size_m = a.numel() / size_k;
+    int size_n = b.size(-1);
+    int64_t c_stride_m = c.stride(-2);
+    // FP32 output laid out to match c's row stride, so the GEMM writes exactly where GemmEx would
+    auto cf = at::empty({size_m, c_stride_m}, c.options().dtype(at::kFloat)).narrow(1, 0, size_n);
+
+    cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetStream(cublas_handle, stream);
+    cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
+    int device;
+    cudaGetDevice(&device);
+    void* ws = DevCtx::instance().get_ws(device);
+    cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
+
+    float alpha_ = 1.0f;
+    float beta_ = 0.0f;
+    auto r = cublasSgemm
+    (
+        cublas_handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        size_n, size_m, size_k,
+        &alpha_, (const float*) bf.data_ptr(), size_n,
+                 (const float*) af.data_ptr(), size_k,
+        &beta_,  (float*) cf.data_ptr(), (int) c_stride_m
+    );
+    cublas_check(r);
+    cuda_check(cudaPeekAtLastError());
+    c.copy_(cf);
+}
+
+// Batched: mirrors the cublasGemmStridedBatchedEx call in hgemm_batched, using CUDA_R_32F.
+static void hgemm_batched_sgemm_impl
+(
+    at::Tensor a,
+    at::Tensor w,
+    at::Tensor c,
+    cudaStream_t stream
+)
+{
+    auto af = a.to(at::kFloat);
+    auto wf = w.to(at::kFloat);
+
+    int batch = a.size(0);
+    int size_m = a.size(1);
+    int size_k = a.size(2);
+    int size_n = w.size(2);
+
+    cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetStream(cublas_handle, stream);
+    cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
+    int device;
+    cudaGetDevice(&device);
+    void* ws = DevCtx::instance().get_ws(device);
+    cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
+
+    float alpha_ = 1.0f;
+    float beta_ = 0.0f;
+    auto cf = at::empty({batch, size_m, size_n}, c.options().dtype(at::kFloat));
+    auto r = cublasGemmStridedBatchedEx
+    (
+        cublas_handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        size_n, size_m, size_k,
+        &alpha_, wf.data_ptr(), CUDA_R_32F, size_n, (long long) size_k * size_n,
+                 af.data_ptr(), CUDA_R_32F, size_k, (long long) size_m * size_k,
+        &beta_,  cf.data_ptr(), CUDA_R_32F, size_n, (long long) size_m * size_n,
+        batch,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    );
+    cublas_check(r);
+    cuda_check(cudaPeekAtLastError());
+    c.copy_(cf);
+}
+#endif
 
 static void hgemm_gemmex_impl
 (
@@ -54,6 +151,16 @@ static void hgemm_gemmex_impl
     TORCH_CHECK(c_stride_m >= size_n, "c row stride is too small");
     TORCH_CHECK(c_stride_m <= std::numeric_limits<int>::max(), "c row stride is too large");
 
+    int device;
+    cudaGetDevice(&device);
+#if !defined(USE_ROCM)
+    if (DevCtx::instance().get_cc(device) == CC_MAXWELL)
+    {
+        hgemm_sgemm_impl(a, b, c, stream);
+        return;
+    }
+#endif
+
 #if defined(USE_ROCM)
     // RDNA: narrow outputs at decode-class row counts on a split-K GEMV (rocm/hgemm_narrow_rdna.cuh)
     if (hgemm_narrow_try(a_ptr, b_ptr, c.data_ptr(), output_fp32, size_m, size_k, size_n, c_stride_m, a.get_device(), stream))
@@ -72,8 +179,6 @@ static void hgemm_gemmex_impl
     cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
     cublasSetStream(cublas_handle, stream);
     cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
-    int device;
-    cudaGetDevice(&device);
     void* ws = DevCtx::instance().get_ws(device);
     cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
 
@@ -168,11 +273,19 @@ void hgemm_batched
     int size_n = w.size(2);
     if (!batch || !size_m || !size_n || !size_k) return;
 
+    int device;
+    cudaGetDevice(&device);
+#if !defined(USE_ROCM)
+    if (DevCtx::instance().get_cc(device) == CC_MAXWELL)
+    {
+        hgemm_batched_sgemm_impl(a, w, c, stream);
+        return;
+    }
+#endif
+
     cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
     cublasSetStream(cublas_handle, stream);
     cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
-    int device;
-    cudaGetDevice(&device);
     void* ws = DevCtx::instance().get_ws(device);
     cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
 
