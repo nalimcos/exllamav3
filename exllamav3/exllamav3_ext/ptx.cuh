@@ -480,9 +480,9 @@ __device__ __forceinline__ uint64_t globaltimer_ns()
 __device__ __forceinline__ void stg_wt_u32(uint32_t* p, uint32_t v)
 {
 #if EXL3_MAXWELL
-    // plain store + fence on Maxwell
+    // sys-fence: system-scope release matching st.global.wt (cross-GPU pinned-host flag)
     *p = v;
-    __threadfence();
+    __threadfence_system();
 #else
     asm volatile("st.global.wt.u32 [%0], %1;" :: "l"(p), "r"(v));
 #endif
@@ -491,9 +491,9 @@ __device__ __forceinline__ void stg_wt_u32(uint32_t* p, uint32_t v)
 __device__ __forceinline__ void stg_wt_u128(uint4* p, const uint4 v)
 {
 #if EXL3_MAXWELL
-    // plain store + fence on Maxwell
+    // sys-fence: system-scope release matching st.global.wt (cross-GPU pinned-host flag)
     *p = v;
-    __threadfence();
+    __threadfence_system();
 #else
     asm volatile ("st.global.wt.v4.u32 [%0], {%1,%2,%3,%4};"
                   :: "l"(p),
@@ -504,9 +504,9 @@ __device__ __forceinline__ void stg_wt_u128(uint4* p, const uint4 v)
 __device__ __forceinline__ uint32_t ldg_cv_u32(const uint32_t* p)
 {
 #if EXL3_MAXWELL
-    // plain load + fence on Maxwell
-    uint32_t v = *p;
-    __threadfence();
+    // volatile load + sys-fence: real acquire at system scope, no stale L1 (cross-GPU pinned-host flag)
+    uint32_t v = *(volatile uint32_t*) p;
+    __threadfence_system();
     return v;
 #else
     uint32_t v;
@@ -518,9 +518,15 @@ __device__ __forceinline__ uint32_t ldg_cv_u32(const uint32_t* p)
 __device__ __forceinline__ uint4 ldg_cv_u128(const uint4* p)
 {
 #if EXL3_MAXWELL
-    // plain load + fence on Maxwell
-    uint4 v = *p;
-    __threadfence();
+    // volatile per-lane load + sys-fence: real acquire at system scope, no stale L1 (cross-GPU
+    // pinned-host flag). Lane-wise: a volatile uint4 lvalue can't bind to the const uint4& copy ctor.
+    const volatile uint4* pv = reinterpret_cast<const volatile uint4*>(p);
+    uint4 v;
+    v.x = pv->x;
+    v.y = pv->y;
+    v.z = pv->z;
+    v.w = pv->w;
+    __threadfence_system();
     return v;
 #else
     uint4 v;
