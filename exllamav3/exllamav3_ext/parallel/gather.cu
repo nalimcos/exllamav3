@@ -2,8 +2,6 @@
 #include "gather.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <cooperative_groups.h>
-namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
 #include "../ptx.cuh"
@@ -11,6 +9,7 @@ namespace cg = cooperative_groups;
 #include "timeout.cuh"
 #include "ll.cuh"
 #include "barrier_inner.cuh"
+#include "../quant/coop_autotune.cuh"
 
 #define NUM_THREADS 1024
 #define NUM_THREADS_SMALL 256
@@ -32,7 +31,7 @@ void pg_gather_kernel
     const int out_device,
     uint8_t* __restrict__ data_ptr,
     uint8_t* __restrict__ out_data_ptr,
-    const Offsets __grid_constant__ all_offsets,
+    const Offsets all_offsets,
     const int batch,
     uint8_t* __restrict__ shbuf_ptr,
     const size_t data_size,
@@ -41,7 +40,6 @@ void pg_gather_kernel
 )
 {
     int t = threadIdx.x;
-    auto grid = cg::this_grid();
 
     __shared__ uint32_t r;
     uint8_t* data_end = data_ptr + data_size;
@@ -239,7 +237,7 @@ void pg_gather_kernel
         }
     }
 
-    grid.sync();
+    group_barrier(0, gridDim.x, (int*)&ctx->grid_barrier[this_device].counter);
     pg_barrier_inner(ctx, device_mask, this_device, out_device, abort_flag);
 }
 
@@ -253,7 +251,7 @@ void pg_gather_small_kernel
     const int out_device,
     uint8_t* __restrict__ data_ptr,
     uint8_t* __restrict__ out_data_ptr,
-    const Offsets __grid_constant__ all_offsets,
+    const Offsets all_offsets,
     const int batch,
     uint8_t* __restrict__ shbuf_ptr,
     const size_t data_size,
@@ -367,32 +365,20 @@ void pg_gather_small
     for (int i : devices) device_mask |= (1 << i);
 
     uint32_t* abort_flag_ptr = (uint32_t*) abort_flag.data_ptr();
-    void* kernelArgs[] =
-    {
-        (void*)& ctx_dev,  // Shared, pinned (device alias)
-        (void*)& device_mask,
-        (void*)& this_device,
-        (void*)& out_device,
-        (void*)& data_ptr,
-        (void*)& out_data_ptr,
-        (void*)& all_offsets,
-        (void*)& batch,
-        (void*)& shbuf_ptr,
-        (void*)& send_size,
-        (void*)& abort_flag_ptr
-    };
 
-    dim3 block_grid(1);
-    dim3 block_dim(NUM_THREADS_SMALL);
-
-    cudaLaunchCooperativeKernel
+    pg_gather_small_kernel<<<1, NUM_THREADS_SMALL, 0, stream>>>
     (
-        (void*)pg_gather_small_kernel,
-        block_grid,
-        block_dim,
-        kernelArgs,
-        0,
-        stream
+        (PGContext*) ctx_dev,  // Shared, pinned (device alias)
+        device_mask,
+        this_device,
+        out_device,
+        data_ptr,
+        out_data_ptr,
+        all_offsets,
+        batch,
+        shbuf_ptr,
+        send_size,
+        abort_flag_ptr
     );
     cuda_check(cudaPeekAtLastError());
 }
@@ -462,16 +448,21 @@ void pg_gather
     };
 
     dim3 block_grid(num_blocks);
-    dim3 block_dim(NUM_THREADS);
 
-    cudaLaunchCooperativeKernel
-    (
-        (void*)pg_gather_kernel,
-        block_grid,
-        block_dim,
-        kernelArgs,
-        0,
-        stream
-    );
+    // On CC_MAXWELL the launch is plain and grid-bounded, so a non-hostable grid would be
+    // clamped silently and the group_barrier would hang -- verify co-residency up front instead
+    int device;
+    cudaGetDevice(&device);
+    if (DevCtx::instance().get_cc(device) == CC_MAXWELL)
+    {
+        int maxb = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb, (void*)pg_gather_kernel, NUM_THREADS, 0);
+        int num_sms = 0;
+        cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
+        TORCH_CHECK(num_blocks <= maxb * num_sms,
+            "pg_gather: grid of ", num_blocks, " blocks does not fit co-resident on a CC_MAXWELL device (maxb*num_sms = ", maxb*num_sms, "); required for group_barrier");
+    }
+
+    exl3_launch_bounded_or_coop((void*)pg_gather_kernel, block_grid, (int)NUM_THREADS, kernelArgs, 0, stream);
     cuda_check(cudaPeekAtLastError());
 }
