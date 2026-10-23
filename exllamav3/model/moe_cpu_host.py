@@ -7,6 +7,7 @@ import torch
 
 from ..ext import exllamav3_ext as ext
 from ..util.device_copy import host_to_device
+from ..util.backend import is_maxwell
 from ..util.misc import Cleanupper, install_parent_death_signal
 from ..util.shm import check_shm_capacity
 from ..util.memory import check_host_memory, windows_memory_status
@@ -1804,7 +1805,7 @@ class MoeCpuHost:
                 t1 = sum(1 for c in fc if 16 < c <= 32)
                 t2 = sum(1 for c in fc if c > 32)
                 tiers = [(t2, 33, fused_t, 64), (t1, 17, 32, 32), (len(fc) - t1 - t2, 1, 16, 16)] \
-                    if TUNING.mtile and (t1 or t2) else [(n_fused, 1, fused_t, 16)]
+                    if TUNING.mtile and not is_maxwell(y.device) and (t1 or t2) else [(n_fused, 1, fused_t, 16)]
                 for n_act, lo, hi, mt in tiers:
                     if not n_act:
                         continue

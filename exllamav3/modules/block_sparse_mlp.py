@@ -9,7 +9,7 @@ from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
-from ..util.backend import MOE_FUSED_ROWS, MOE_BATCH_RECON, MOE_MTILE
+from ..util.backend import MOE_FUSED_ROWS, MOE_BATCH_RECON, MOE_MTILE, is_maxwell
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP, capture_out_sensitivity
 from .rmsnorm import RMSNorm
@@ -740,7 +740,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             # row capacity rises to FUSED_ROWS_WIDE. Dims that are multiples of 256 keep the
             # N = 256 instance for the <= 16-row launch only (it is the faster 16-row tiling)
             if self.support_fused:
-                self.mtile_ok = MTILE and bool(self.multi_up.mul1)
+                self.mtile_ok = MTILE and bool(self.multi_up.mul1) and not is_maxwell(device)
                 self.fused_rows = FUSED_ROWS_WIDE if self.mtile_ok else TEMP_ROWS_FUSED
                 R = self.fused_rows
                 C = ext.exl3_moe_max_concurrency(torch.device(device).index)

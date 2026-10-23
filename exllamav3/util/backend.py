@@ -29,6 +29,15 @@ def gfx_arch(device) -> str:
     return arch
 
 
+def is_maxwell(device) -> bool:
+    """True on a CUDA device with compute-capability major 5 (Maxwell, sm_50/sm_52); False for
+    non-CUDA devices"""
+    if device.type != "cuda":
+        return False
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    return torch.cuda.get_device_capability(idx)[0] == 5
+
+
 def _env(name: str, cuda, rocm):
     """Environment override, else the backend's default (returned as a string, like the override)"""
     return os.environ.get(name, str(rocm if ROCM else cuda))
