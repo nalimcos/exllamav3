@@ -22,17 +22,30 @@ The fused-MoE FMA matmul is **16-row-only**: `exl3_gemm_inner.cuh` has `static_a
 
 **Net effect on Maxwell:** `exl3_moe` is never called with `m_tile > 16`. Experts with ≤128 rows (the fused tier's row capacity, `MOE_FUSED_ROWS`) run a single 16-row FMA launch; experts with >128 rows route to the batched-reconstruct / per-expert reconstruct path. The GEMM side of reconstruct is a separate workstream item (E5); this task does not touch `hgemm.cu`.
 
-## E2 — MoE-coop decode confirm
+## E2 — MoE-coop decode confirm + backstop
 
-Confirm the cooperative MoE decode kernel (`exl3_moe_coop`) uses the fp32 FMA `gemv_tile` (single-row path) with real weight pointers on Maxwell, and add a decode test. The decode (bsz 1) path is a plain fp32 FMA gemv launch, co-residency-bounded — confirm no wide-row / TC dependency is exercised.
+**Confirmed** (`exl3_moe_coop.cu` + `comp_units/exl3_moe_coop_instances.cuh` + `exl3_moe_coop_kernel.cuh`):
+- The selectors `moe_coop_kernel_a`/`_b` (wrappers at `exl3_moe_coop.cu:20/47`) always return a real `MoeCoopKernel`: every `exl3_moe_coop_kernel_a_*`/`_b_*` in `exl3_moe_coop_instances.cuh` returns `{ (void*) exl3_moe_coop_a_kernel<K, cb, wide>, smem }` (or the `_b_kernel` form) — there is no nullptr branch, on any CC. (The multi-row `exl3_moe_inst_*` decline is a different kernel family; the coop `gemv_tile` is instantiated unconditionally.)
+- `gemv_tile` (`exl3_moe_coop_kernel.cuh:341`) carries an `if constexpr (EXL3_MAXWELL)` fp32-FMA path (fragment gather at :466/:490, cross-warp reduction at :583): on Maxwell it is a plain fp32 per-row FMA with no `cp.async`/`mma` dependency. The launch (`cudaLaunchKernel(ka.kernel, …)` at :159) receives these real pointers.
 
-## E3 — routing (router) confirm
+**Change:** symmetric defense-in-depth backstop immediately after the two kernel-selection lines (`exl3_moe_coop.cu:141-142`): `TORCH_CHECK(ka.kernel != nullptr, "exl3_moe_coop: no kernel selected (a)")` and the `(b)` counterpart, so a future selector that does decline fails cleanly instead of launching a null kernel.
 
-Confirm the router GEMM runs on Maxwell: bsz 1 through the fp32 FMA GEMV path, bsz > 1 through `hgemm` (cublas, E5 path), and the `det_gemm` (deterministic) branch gated on `cc < 8` so it is not taken on the non-relevant arches. No kernel change expected — confirm the dispatch picks a working path.
+**Test:** `tests/test_moe_coop.py` is the natural decode-MoE / `exl3_moe_coop` coverage — end-to-end parity of every K 1..8 × codebook, mixed K, all activations, biases, padded dims, expert-range masking, shared-expert merge and fp32 gate/up scratch against a torch reference built from reconstructed weights. It is GPU-bound (exercises `ext.reconstruct`/`ext.hgemm`, the E5 FP32-SGEMM path, and the coop fp32-FMA kernel) and is **STAGED for the Maxwell target box**; it runs the new backstop as a pass-through. No new test added (it would be redundant and GPU-only, and would not run in this no-GPU worktree).
+
+## E3 — routing (router) confirm + comment
+
+**Confirmed** (`routing.cu` + `routing_gemm.cu`):
+- bsz 1 → `routing_gemv_kernel` (CUDA-core fp32 FMA GEMV, safe on every arch) at `routing.cu:282`.
+- bsz > 1 → `hgemm(hidden, gate, scores)` fallback at `routing.cu:294`, which on Maxwell runs the E5 FP32-SGEMM path (`hgemm.cu`).
+- The int8 TC `routing_gemm_det` is cleanly skipped: `routing_gemm_det_fits` (`routing_gemm.cu:285`) returns `false` for `cc_major < 8`, so the `routing_gemm_det_` branch is never taken on Maxwell.
+
+**Change:** a two-line comment at the `hgemm` fallback noting that pre-CC7 (Maxwell) devices reach this cuBLAS path (now FP32-SGEMM via `hgemm.cu`) and that the TC det_gemm path is gated off in `routing_gemm.cu`. Comment only — no kernel change.
 
 ## E4 — HC mix: clean-decline CC gate
 
-`hc_mix_tiled` (HC mix tiling) is declined on Maxwell: the tiling gate uses `>= 8` (CC major 8+), so Maxwell (CC 5) takes the non-tiled path. The prefill non-tiled `else` branch already uses `torch.matmul`, which is correct on Maxwell via `CUBLAS_COMPUTE_32F` — **no change** needed there. Add the clean-decline gate so the tiling path is never entered on CC 5.
+`hc_mix_tiled` (HC mix tiling) is declined on Maxwell: the Python gate `hyperconnections.py` sets `self.tiled` only for CC major `>= 8`, so Maxwell (CC 5) is never routed to `gr_mix_tiled`. The TC primitives in the tiling kernels (`det_mma3`, `cp.async`, `ldmatrix` in `det_gemm.cuh`) are `#if __CUDA_ARCH__ >= 800` and silently no-op below 800 → silent garbage if launched on Maxwell.
+
+**Change:** a single minimal CUDA-side defense-in-depth guard in the host entry `gr_mix_tiled` (`hc_mix_tiled.cu`), after the stream is in scope and before the large dynamic-smem attribute / TC-kernel launches: read the compute-capability major and `TORCH_CHECK(cc_major >= 8, "gr_mix_tiled: needs sm_80+ (cp.async + mma.m16n8k32 s8); pre-Ampere (e.g. Maxwell) devices take the CUDA-core gr_mix / cuBLAS path")`. The prefill non-tiled `else` branch in `hyperconnections.py` is untouched — its FP16 `torch.matmul` dispatches to `cublasGemmEx(CUDA_R_16F, CUBLAS_COMPUTE_32F)`, supported on Maxwell.
 
 ## E5 — reconstruct → cuBLAS SGEMM (guaranteed-correct Maxwell path)
 
@@ -52,9 +65,9 @@ Both gates sit after the existing shape/contiguity checks; the existing `cublasG
 ## Files touched per sub-task
 
 - **E1:** `exllamav3/util/backend.py` (new `is_maxwell`), `exllamav3/modules/block_sparse_mlp.py` (import + `mtile_ok` gate), `exllamav3/model/moe_cpu_host.py` (import + tier gate), `exllamav3/exllamav3_ext/quant/exl3_moe.cu` (never-nullptr `TORCH_CHECK`).
-- **E2:** `exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu` (confirm only) + a decode test.
-- **E3:** router dispatch (confirm only) — `exllamav3/modules/block_sparse_mlp_routing.py` / the `det_gemm` branch.
-- **E4:** `exllamav3/exllamav3_ext/hc_mix_tiled.cu` (+ `hc_fuse.cuh`) — clean-decline `>= 8` gate.
+- **E2:** `exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu` (confirm + `TORCH_CHECK` backstop after the selectors). Test: `tests/test_moe_coop.py` (existing, GPU, STAGED for the target box).
+- **E3:** `exllamav3/exllamav3_ext/routing.cu` (confirm + a two-line comment at the `hgemm` fallback).
+- **E4:** `exllamav3/exllamav3_ext/hc_mix_tiled.cu` — clean-decline `cc_major >= 8` guard in `gr_mix_tiled`.
 - **E5:** `exllamav3/exllamav3_ext/hgemm.cu` — explicit `cublasSgemm` reconstruct path gated on `CC_MAXWELL`.
 
 ## Compile plan
