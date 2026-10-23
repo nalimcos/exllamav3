@@ -38,9 +38,10 @@ inline cudaError_t exl3_launch_grid_bounded(void* kernel, dim3 grid, int block, 
     return cudaLaunchKernel(kernel, grid, block, args, smem, stream);
 }
 
-// Arch-aware launch. Decided at runtime by the device tier (host code has no __CUDA_ARCH__): Maxwell (CC_MAXWELL)
-// launches plain with the grid bounded to the co-resident count; the other CUDA tiers use the cooperative launch.
-inline cudaError_t exl3_gemm_launch(void* kernel, int grid, int block, void** args, size_t smem, cudaStream_t stream)
+// Arch-aware launch, used by the GEMM/GEMV kernels and the TP collectives. Decided at runtime by the device tier
+// (host code has no __CUDA_ARCH__): CC_MAXWELL -> exl3_launch_grid_bounded (bounded plain), else
+// cudaLaunchCooperativeKernel.
+inline cudaError_t exl3_launch_bounded_or_coop(void* kernel, int grid, int block, void** args, size_t smem, cudaStream_t stream)
 {
     int device;
     cudaGetDevice(&device);
@@ -48,7 +49,7 @@ inline cudaError_t exl3_gemm_launch(void* kernel, int grid, int block, void** ar
         return exl3_launch_grid_bounded(kernel, grid, block, args, smem, stream, device);
     return cudaLaunchCooperativeKernel(kernel, grid, block, args, smem, stream);
 }
-inline cudaError_t exl3_gemm_launch(void* kernel, dim3 grid, int block, void** args, size_t smem, cudaStream_t stream)
+inline cudaError_t exl3_launch_bounded_or_coop(void* kernel, dim3 grid, int block, void** args, size_t smem, cudaStream_t stream)
 {
     int device;
     cudaGetDevice(&device);
@@ -57,7 +58,7 @@ inline cudaError_t exl3_gemm_launch(void* kernel, dim3 grid, int block, void** a
     return cudaLaunchCooperativeKernel(kernel, grid, block, args, smem, stream);
 }
 
-#define EXL3_COOP_LAUNCH(kernel, grid, block, args, smem, stream) exl3_gemm_launch(kernel, grid, block, args, smem, stream)
+#define EXL3_COOP_LAUNCH(kernel, grid, block, args, smem, stream) exl3_launch_bounded_or_coop(kernel, grid, block, args, smem, stream)
 
 struct CoopAutotuneCandidate
 {

@@ -2,8 +2,6 @@
 #include "all_reduce.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <cooperative_groups.h>
-namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
 #include "../ptx.cuh"
@@ -11,6 +9,7 @@ namespace cg = cooperative_groups;
 #include "timeout.cuh"
 #include "ll.cuh"
 #include "barrier_inner.cuh"
+#include "../quant/coop_autotune.cuh"
 #include <thread>
 #include <cstring>
 #include <chrono>
@@ -265,8 +264,8 @@ __device__ __forceinline__ void arc_wire_recv(const uint8_t* src8, uint8_t* dst8
 }
 
 // Multi-chunk (bandwidth) reduce: CPUREDUCE_MB_BLOCKS blocks per direction, each owning a
-// stripe of every chunk and its own stage flags. The cooperative launch is used ONLY for its
-// co-residency guarantee -- there is no grid.sync: send and recv blocks free-run, elastically
+// stripe of every chunk and its own stage flags. Only the co-residency guarantee matters --
+// there is no grid.sync: send and recv blocks free-run, elastically
 // decoupled through value gates. Send blocks throttle on the CPU's release counter so they never
 // overwrite a staging slot the CPU has not consumed; recv blocks gate each chunk on the CPU
 // release; the CPU throttles on the recv-progress flags before reusing accumulator slots. One
@@ -626,43 +625,33 @@ void pg_all_reduce_cpu
                 "R buffer too small for the multi-chunk reduce pipeline (need >= 4 stages per slot)");
         }
         dim3 block_grid(2 * CPUREDUCE_MB_BLOCKS);
-        dim3 block_dim(NUM_THREADS);
+        int block_dim = NUM_THREADS;
+
+        // On CC_MAXWELL the launch is plain and grid-bounded, so a non-hostable striped grid would be
+        // clamped silently and hang the elastic CPU ring -- verify co-residency up front instead
+        int device;
+        cudaGetDevice(&device);
+        if (DevCtx::instance().get_cc(device) == CC_MAXWELL)
+        {
+            int maxb = 0;
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb, (void*)pg_all_reduce_cpu_kernel<PARCK_MODE_FLOAT>, NUM_THREADS, 0);
+            int num_sms = 0;
+            cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
+            TORCH_CHECK(2 * CPUREDUCE_MB_BLOCKS <= maxb * num_sms,
+                "pg_all_reduce_cpu: the striped grid (", 2*CPUREDUCE_MB_BLOCKS, " blocks) does not fit co-resident on a CC_MAXWELL device (maxb*num_sms = ", maxb*num_sms, "); required for the elastic CPU ring");
+        }
 
         if (tensor.dtype() == at::kFloat)
         {
-            cudaLaunchCooperativeKernel
-            (
-                (void*)pg_all_reduce_cpu_kernel<PARCK_MODE_FLOAT>,
-                block_grid,
-                block_dim,
-                kernelArgs,
-                0,
-                stream
-            );
+            exl3_launch_bounded_or_coop((void*)pg_all_reduce_cpu_kernel<PARCK_MODE_FLOAT>, block_grid, block_dim, kernelArgs, 0, stream);
         }
         else if (tensor.dtype() == at::kHalf && !fp16_wire)
         {
-            cudaLaunchCooperativeKernel
-            (
-                (void*)pg_all_reduce_cpu_kernel<PARCK_MODE_HALF>,
-                block_grid,
-                block_dim,
-                kernelArgs,
-                0,
-                stream
-            );
+            exl3_launch_bounded_or_coop((void*)pg_all_reduce_cpu_kernel<PARCK_MODE_HALF>, block_grid, block_dim, kernelArgs, 0, stream);
         }
         else if (tensor.dtype() == at::kBFloat16 || fp16_wire)
         {
-            cudaLaunchCooperativeKernel
-            (
-                (void*)pg_all_reduce_cpu_kernel<PARCK_MODE_BF16>,
-                block_grid,
-                block_dim,
-                kernelArgs,
-                0,
-                stream
-            );
+            exl3_launch_bounded_or_coop((void*)pg_all_reduce_cpu_kernel<PARCK_MODE_BF16>, block_grid, block_dim, kernelArgs, 0, stream);
         }
         else TORCH_CHECK(false, "pg_all_reduce_cpu: Unknown dtype");
     }
