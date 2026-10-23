@@ -22,6 +22,8 @@ void pg_init_context(uintptr_t ctx)
         ctx_ptr->reduce_stage_consumed[i] = 0;
         ctx_ptr->gather_stage_produced[i] = 0;
         ctx_ptr->gather_stage_consumed[i] = 0;
+        ctx_ptr->grid_barrier[i].counter = 0;
+        ctx_ptr->grid_barrier[i].sense = 0;
         ctx_ptr->cpusum_stage_device[i * REDUCE_STAGE_STRIDE] = 0;
         ctx_ptr->cpusum_stage_recv[i * REDUCE_STAGE_STRIDE] = 0;
         for (int j = 0; j < CPUREDUCE_MB_BLOCKS; ++j)
