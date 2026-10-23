@@ -451,18 +451,13 @@ void pg_gather
 
     // On CC_MAXWELL the launch is plain and grid-bounded, so a non-hostable grid would be
     // clamped silently and the group_barrier would hang -- verify co-residency up front instead
-    int device;
-    cudaGetDevice(&device);
-    if (DevCtx::instance().get_cc(device) == CC_MAXWELL)
+    if (DevCtx::instance().get_cc(this_device) == CC_MAXWELL)
     {
-        int maxb = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb, (void*)pg_gather_kernel, NUM_THREADS, 0);
-        int num_sms = 0;
-        cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
-        TORCH_CHECK(num_blocks <= maxb * num_sms,
-            "pg_gather: grid of ", num_blocks, " blocks does not fit co-resident on a CC_MAXWELL device (maxb*num_sms = ", maxb*num_sms, "); required for group_barrier");
+        int capacity = exl3_max_coresident((void*)pg_gather_kernel, NUM_THREADS, 0, this_device);
+        TORCH_CHECK(num_blocks <= capacity,
+            "pg_gather: grid of ", num_blocks, " blocks does not fit co-resident on a CC_MAXWELL device (maxb*num_sms = ", capacity, "); required for group_barrier");
     }
 
-    exl3_launch_bounded_or_coop((void*)pg_gather_kernel, block_grid, (int)NUM_THREADS, kernelArgs, 0, stream);
+    exl3_launch_bounded_or_coop((void*)pg_gather_kernel, block_grid, NUM_THREADS, kernelArgs, 0, stream);
     cuda_check(cudaPeekAtLastError());
 }

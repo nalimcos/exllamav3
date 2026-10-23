@@ -61,8 +61,7 @@ struct alignas(64) PGContext
     alignas(64) uint32_t cpusum_stage_recv[MAX_DEVICES * REDUCE_STAGE_STRIDE];
     alignas(64) uint32_t cpusum_stage_recv_mb[MAX_DEVICES * CPUREDUCE_MB_BLOCKS * REDUCE_STAGE_STRIDE];
     alignas(64) uint32_t cpusum_stage_cpu; char _pad4[64 - sizeof(uint32_t)];
-    // Per-GPU group_barrier state: grid_barrier[dev].counter / .sense (group_id=0 -> [0]=counter,
-    // [1]=sense). One cache line per device (avoid cross-GPU false sharing). Init 0.
+    // Per-GPU group_barrier state {counter, sense}; 64B stride keeps each device's flags on its own cache line.
     alignas(64) struct { uint32_t counter; uint32_t sense; } grid_barrier[MAX_DEVICES];
     ReduceJob reduce_jobs[MAX_REDUCE_JOBS];
 };

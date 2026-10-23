@@ -480,9 +480,10 @@ __device__ __forceinline__ uint64_t globaltimer_ns()
 __device__ __forceinline__ void stg_wt_u32(uint32_t* p, uint32_t v)
 {
 #if EXL3_MAXWELL
-    // sys-fence: system-scope release matching st.global.wt (cross-GPU pinned-host flag)
-    *p = v;
+    // Maxwell emulation of the system-scope write-through: a system-scope release (fence before the
+    // store), consistent with stg_release_sys
     __threadfence_system();
+    *(volatile uint32_t*) p = v;
 #else
     asm volatile("st.global.wt.u32 [%0], %1;" :: "l"(p), "r"(v));
 #endif
@@ -491,9 +492,15 @@ __device__ __forceinline__ void stg_wt_u32(uint32_t* p, uint32_t v)
 __device__ __forceinline__ void stg_wt_u128(uint4* p, const uint4 v)
 {
 #if EXL3_MAXWELL
-    // sys-fence: system-scope release matching st.global.wt (cross-GPU pinned-host flag)
-    *p = v;
+    // Maxwell emulation of the system-scope write-through: a system-scope release (fence before the
+    // store), consistent with stg_release_sys. Lane-wise: a volatile uint4 lvalue can't bind to the
+    // copy-assignment (nvcc: no operator = matches these operands)
     __threadfence_system();
+    volatile uint4* pv = reinterpret_cast<volatile uint4*>(p);
+    pv->x = v.x;
+    pv->y = v.y;
+    pv->z = v.z;
+    pv->w = v.w;
 #else
     asm volatile ("st.global.wt.v4.u32 [%0], {%1,%2,%3,%4};"
                   :: "l"(p),

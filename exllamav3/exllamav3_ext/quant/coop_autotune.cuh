@@ -1,10 +1,10 @@
 #pragma once
 
-// Launch of the grid-synchronizing EXL3 GEMM kernels. ROCm's cooperative launch faults in the runtime when these
-// are submitted back to back, so ROCm launches them as plain kernels and the kernels synchronize through a device
-// barrier instead (EXL3_GRID_SYNC, exl3_gemm_kernel.cuh). Maxwell (CC 5.x) has no cooperative launch either, so it
-// takes the same plain-launch path, bounding the grid to the co-resident count so every block is resident. The
-// other CUDA tiers use the cooperative launch and grid.sync().
+// Launch of the grid-synchronizing EXL3 GEMM kernels and the TP collectives (some use no grid sync). ROCm's
+// cooperative launch faults in the runtime when these are submitted back to back, so ROCm launches them as plain
+// kernels and the kernels synchronize through a device barrier instead (EXL3_GRID_SYNC, exl3_gemm_kernel.cuh).
+// Maxwell (CC 5.x) has no cooperative launch either, so it takes the same plain-launch path, bounding the grid to
+// the co-resident count so every block is resident. The other CUDA tiers use the cooperative launch and grid.sync().
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <vector>
@@ -36,6 +36,16 @@ inline cudaError_t exl3_launch_grid_bounded(void* kernel, dim3 grid, int block, 
         grid.x = (maxb * num_sms) / yz;
     }
     return cudaLaunchKernel(kernel, grid, block, args, smem, stream);
+}
+
+// Co-resident block capacity of a kernel on a device: maxb * num_sms.
+inline int exl3_max_coresident(void* kernel, int block, size_t smem, int device)
+{
+    int maxb = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb, kernel, block, smem);
+    int num_sms = 0;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
+    return maxb * num_sms;
 }
 
 // Arch-aware launch, used by the GEMM/GEMV kernels and the TP collectives. Decided at runtime by the device tier

@@ -629,16 +629,12 @@ void pg_all_reduce_cpu
 
         // On CC_MAXWELL the launch is plain and grid-bounded, so a non-hostable striped grid would be
         // clamped silently and hang the elastic CPU ring -- verify co-residency up front instead
-        int device;
-        cudaGetDevice(&device);
-        if (DevCtx::instance().get_cc(device) == CC_MAXWELL)
+        if (DevCtx::instance().get_cc(this_device) == CC_MAXWELL)
         {
-            int maxb = 0;
-            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb, (void*)pg_all_reduce_cpu_kernel<PARCK_MODE_FLOAT>, NUM_THREADS, 0);
-            int num_sms = 0;
-            cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device);
-            TORCH_CHECK(2 * CPUREDUCE_MB_BLOCKS <= maxb * num_sms,
-                "pg_all_reduce_cpu: the striped grid (", 2*CPUREDUCE_MB_BLOCKS, " blocks) does not fit co-resident on a CC_MAXWELL device (maxb*num_sms = ", maxb*num_sms, "); required for the elastic CPU ring");
+            // identical occupancy across instantiations (same launch bounds + shared memory)
+            int capacity = exl3_max_coresident((void*)pg_all_reduce_cpu_kernel<PARCK_MODE_FLOAT>, NUM_THREADS, 0, this_device);
+            TORCH_CHECK(2 * CPUREDUCE_MB_BLOCKS <= capacity,
+                "pg_all_reduce_cpu: the striped grid (", 2*CPUREDUCE_MB_BLOCKS, " blocks) does not fit co-resident on a CC_MAXWELL device (maxb*num_sms = ", capacity, "); required for the elastic CPU ring");
         }
 
         if (tensor.dtype() == at::kFloat)

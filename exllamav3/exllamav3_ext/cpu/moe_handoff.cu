@@ -28,13 +28,13 @@
 //   GPU flag kernels
 // -------------------------------------------------------------------------------------------
 
-// No longer used
+// Kernel path: fallback for other arches; the only path on CC_MAXWELL (no stream memops).
 __global__ void moe_flag_write_kernel(uint32_t* flag, uint32_t value)
 {
     stg_release_sys_u32(flag, value);
 }
 
-// No longer used
+// Kernel path: fallback for other arches; the only path on CC_MAXWELL (no stream memops).
 __global__ void moe_flag_wait_kernel(uint32_t* flag, uint32_t value, uint32_t* abort_flag)
 {
     uint64_t sleep = MOE_SLEEP_MIN;
@@ -113,6 +113,15 @@ MemOps& memops() { static MemOps m; return m; }
 std::atomic<bool> g_memops_ok { true };
 std::atomic<bool> g_memops_enabled { true };
 
+// Stream memops are unsupported on CC_MAXWELL; the kernel path (which times out) is used there.
+inline bool stream_memops_usable(int device)
+{
+    return DevCtx::instance().get_cc(device) != CC_MAXWELL
+        && memops().resolved
+        && g_memops_enabled.load(std::memory_order_relaxed)
+        && g_memops_ok.load(std::memory_order_relaxed);
+}
+
 } // namespace
 
 void exl3_moe_cpu_set_memops(bool enabled)
@@ -124,14 +133,10 @@ void exl3_moe_flag_write(uintptr_t flag, int64_t value)
 {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     MemOps& m = memops();
-    // CC_MAXWELL has no stream memops (cuStreamWriteValue32 returns NOT_SUPPORTED unless a driver
-    // knob is set): skip the memop path and use the kernel fallback, which is deterministic and has
-    // a real timeout.
+    // No driver support for stream memops on CC_MAXWELL; the kernel fallback has a 30 s timeout.
     int device;
     cudaGetDevice(&device);
-    const bool is_maxwell = DevCtx::instance().get_cc(device) == CC_MAXWELL;
-    if (!is_maxwell && m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
-        && g_memops_ok.load(std::memory_order_relaxed))
+    if (stream_memops_usable(device))
     {
 #if defined(USE_ROCM)
         hipError_t r = m.write(stream, (void*) flag, (uint32_t) value, 0);
@@ -149,14 +154,10 @@ void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag)
 {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     MemOps& m = memops();
-    // CC_MAXWELL has no stream memops (cuStreamWaitValue32 returns NOT_SUPPORTED unless a driver
-    // knob is set): skip the memop path and use the kernel fallback, which is deterministic and has
-    // a real timeout.
+    // No driver support for stream memops on CC_MAXWELL; the kernel fallback has a 30 s timeout.
     int device;
     cudaGetDevice(&device);
-    const bool is_maxwell = DevCtx::instance().get_cc(device) == CC_MAXWELL;
-    if (!is_maxwell && m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
-        && g_memops_ok.load(std::memory_order_relaxed))
+    if (stream_memops_usable(device))
     {
 #if defined(USE_ROCM)
         hipError_t r = m.wait(stream, (void*) flag, (uint32_t) value, hipStreamWaitValueGte, 0xffffffffu);
