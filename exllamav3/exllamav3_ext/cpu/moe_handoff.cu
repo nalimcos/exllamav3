@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "../ptx.cuh"
+#include "../quant/exl3_devctx.cuh"
 
 #ifdef __linux__
 #include <dlfcn.h>
@@ -123,7 +124,13 @@ void exl3_moe_flag_write(uintptr_t flag, int64_t value)
 {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     MemOps& m = memops();
-    if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
+    // CC_MAXWELL has no stream memops (cuStreamWriteValue32 returns NOT_SUPPORTED unless a driver
+    // knob is set): skip the memop path and use the kernel fallback, which is deterministic and has
+    // a real timeout.
+    int device;
+    cudaGetDevice(&device);
+    const bool is_maxwell = DevCtx::instance().get_cc(device) == CC_MAXWELL;
+    if (!is_maxwell && m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
         && g_memops_ok.load(std::memory_order_relaxed))
     {
 #if defined(USE_ROCM)
@@ -142,7 +149,13 @@ void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag)
 {
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     MemOps& m = memops();
-    if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
+    // CC_MAXWELL has no stream memops (cuStreamWaitValue32 returns NOT_SUPPORTED unless a driver
+    // knob is set): skip the memop path and use the kernel fallback, which is deterministic and has
+    // a real timeout.
+    int device;
+    cudaGetDevice(&device);
+    const bool is_maxwell = DevCtx::instance().get_cc(device) == CC_MAXWELL;
+    if (!is_maxwell && m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
         && g_memops_ok.load(std::memory_order_relaxed))
     {
 #if defined(USE_ROCM)
