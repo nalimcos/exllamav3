@@ -138,6 +138,8 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int 
     const bool wide_b = moe_coop_pick_wide(p.I / 16, slots, device);
     MoeCoopKernel ka = moe_coop_kernel_a(K_gu, cb, p.Hi, wide_a);
     MoeCoopKernel kb = moe_coop_kernel_b(K_d, cb, wide_b);
+    TORCH_CHECK(ka.kernel != nullptr, "exl3_moe_coop: no kernel selected (a)");
+    TORCH_CHECK(kb.kernel != nullptr, "exl3_moe_coop: no kernel selected (b)");
     moe_coop_smem_optin(ka.kernel, ka.smem);
     moe_coop_smem_optin(kb.kernel, kb.smem);
 

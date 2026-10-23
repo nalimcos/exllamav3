@@ -289,6 +289,8 @@ void routing_gemv
     }
     else
     {
+        // Pre-CC7 (Maxwell) devices reach this cuBLAS fallback: the int8 TC det_gemm is gated off
+        // for cc_major < 8 (routing_gemm.cu), and hgemm now runs FP32-SGEMM on Maxwell (hgemm.cu).
         hgemm(hidden, gate, scores);
     }
 }

@@ -608,6 +608,9 @@ void gr_mix_tiled
 
     int dev = 0;
     cudaGetDevice(&dev);
+    int cc_major = 0;
+    cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+    TORCH_CHECK(cc_major >= 8, "gr_mix_tiled: needs sm_80+ (cp.async + mma.m16n8k32 s8); pre-Ampere (e.g. Maxwell) devices take the CUDA-core gr_mix / cuBLAS path");
     static bool attr[32] = {};
     if (!attr[dev])
     {
