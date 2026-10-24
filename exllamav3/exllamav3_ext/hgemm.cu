@@ -21,6 +21,22 @@ Row-major matmul using cuBLAS, a @ b -> c
 
 using bfloat16 = __nv_bfloat16;
 
+// Shared cuBLAS setup: the current handle bound to the stream with host pointer mode, the per-device
+// cuBLAS workspace, and the GEMM alpha/beta scalars (1.0 / 0.0). Returns the handle.
+static cublasHandle_t cublas_setup(cudaStream_t stream, float* alpha, float* beta)
+{
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetStream(handle, stream);
+    cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST);
+    int device;
+    cudaGetDevice(&device);
+    void* ws = DevCtx::instance().get_ws(device);
+    cublasSetWorkspace(handle, ws, WORKSPACE_SIZE);
+    *alpha = 1.0f;
+    *beta = 0.0f;
+    return handle;
+}
+
 #if !defined(USE_ROCM)
 // Maxwell (CC 5) reconstruct GEMM: an explicit FP32 SGEMM path so the result does not depend on the
 // mixed-precision 16F-in / C32-accumulate cuBLAS behavior. FP16 inputs are cast to FP32 and the FP32
@@ -37,6 +53,7 @@ static void hgemm_sgemm_impl
     cudaStream_t stream
 )
 {
+    TORCH_CHECK(c.dim() == 2, "hgemm_sgemm: dense path expects a 2D output (use hgemm_batched for batched/3D c)");
     auto af = a.to(at::kFloat);
     auto bf = b.to(at::kFloat);
 
@@ -47,16 +64,8 @@ static void hgemm_sgemm_impl
     // FP32 output laid out to match c's row stride, so the GEMM writes exactly where GemmEx would
     auto cf = at::empty({size_m, c_stride_m}, c.options().dtype(at::kFloat)).narrow(1, 0, size_n);
 
-    cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
-    cublasSetStream(cublas_handle, stream);
-    cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
-    int device;
-    cudaGetDevice(&device);
-    void* ws = DevCtx::instance().get_ws(device);
-    cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
-
-    float alpha_ = 1.0f;
-    float beta_ = 0.0f;
+    float alpha_, beta_;
+    cublasHandle_t cublas_handle = cublas_setup(stream, &alpha_, &beta_);
     auto r = cublasSgemm
     (
         cublas_handle,
@@ -88,16 +97,8 @@ static void hgemm_batched_sgemm_impl
     int size_k = a.size(2);
     int size_n = w.size(2);
 
-    cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
-    cublasSetStream(cublas_handle, stream);
-    cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
-    int device;
-    cudaGetDevice(&device);
-    void* ws = DevCtx::instance().get_ws(device);
-    cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
-
-    float alpha_ = 1.0f;
-    float beta_ = 0.0f;
+    float alpha_, beta_;
+    cublasHandle_t cublas_handle = cublas_setup(stream, &alpha_, &beta_);
     auto cf = at::empty({batch, size_m, size_n}, c.options().dtype(at::kFloat));
     auto r = cublasGemmStridedBatchedEx
     (
@@ -175,15 +176,8 @@ static void hgemm_gemmex_impl
     }
 #endif
 
-    // Set cuBLAS modes and workspace
-    cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
-    cublasSetStream(cublas_handle, stream);
-    cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
-    void* ws = DevCtx::instance().get_ws(device);
-    cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
-
-    float alpha_ = 1.0f;
-    float beta_ = 0.0f;
+    float alpha_, beta_;
+    cublasHandle_t cublas_handle = cublas_setup(stream, &alpha_, &beta_);
     cudaDataType_t c_type = output_fp32 ? CUDA_R_32F : CUDA_R_16F;
     auto r = cublasGemmEx
     (
@@ -283,14 +277,8 @@ void hgemm_batched
     }
 #endif
 
-    cublasHandle_t cublas_handle = at::cuda::getCurrentCUDABlasHandle();
-    cublasSetStream(cublas_handle, stream);
-    cublasSetPointerMode(cublas_handle, CUBLAS_POINTER_MODE_HOST);
-    void* ws = DevCtx::instance().get_ws(device);
-    cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
-
-    float alpha_ = 1.0f;
-    float beta_ = 0.0f;
+    float alpha_, beta_;
+    cublasHandle_t cublas_handle = cublas_setup(stream, &alpha_, &beta_);
     auto r = cublasGemmStridedBatchedEx
     (
         cublas_handle,

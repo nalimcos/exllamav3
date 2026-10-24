@@ -492,9 +492,7 @@ void exl3_moe
 #endif
     dim3 grid_dim(group_size, 1, num_groups);
 
-    // Never-nullptr backstop: the 32/64-row tile getters return nullptr on Maxwell (no multi-row
-    // instances are built), so a caller that bypasses the Python m_tile gate must fail here instead
-    // of launching a null kernel
+    // Defense-in-depth backstop: a caller that bypasses the Python m_tile gate must fail here, not launch a null kernel
     TORCH_CHECK(kernel != nullptr,
                 "exl3_moe: no kernel for this tile on this architecture (multi-row MoE tiles >16 are not built on Maxwell; keep m_tile <= 16 or route large experts to reconstruct)");
 

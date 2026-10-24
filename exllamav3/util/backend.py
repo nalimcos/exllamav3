@@ -29,13 +29,21 @@ def gfx_arch(device) -> str:
     return arch
 
 
+_maxwell_cache = {}
+
+
 def is_maxwell(device) -> bool:
     """True on a CUDA device with compute-capability major 5 (Maxwell, sm_50/sm_52); False for
     non-CUDA devices"""
-    if device.type != "cuda":
+    if not isinstance(device, torch.device) or device.type != "cuda":
         return False
-    idx = device.index if device.index is not None else torch.cuda.current_device()
-    return torch.cuda.get_device_capability(idx)[0] == 5
+    idx = device.index
+    if idx is None:
+        idx = torch.cuda.current_device()
+    cached = _maxwell_cache.get(idx)
+    if cached is None:
+        cached = _maxwell_cache[idx] = torch.cuda.get_device_capability(idx)[0] == 5
+    return cached
 
 
 def _env(name: str, cuda, rocm):
