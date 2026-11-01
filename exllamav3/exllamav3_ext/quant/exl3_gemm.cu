@@ -664,18 +664,20 @@ int exl3_mgemm_gr
 #if !defined(USE_ROCM)
     // Maxwell small-m decode path: the cooperative MGEMM kernel is a tile-pipelined GEMM whose
     // weight traversal reaches only ~24-35 GB/s at m = 1..8, while the GEMV sustains ~142 GB/s
-    // (M40, 3 bpw, measured). Uniform, unfiltered, single-token batches instead take ONE launch
-    // of the table-indirect multi-matrix GEMV (matrix j = blockIdx.y resolves the device
-    // pointer tables on chip). Sliced (size_n_list / had_src_list), MoE (indices / weights)
-    // and half-integer-rate batches keep the MGEMM kernel. Kill switch: EXL3_GEMV=0 declines
-    // the shape gate inside exl3_gemv_batch_launch, restoring MGEMM everywhere.
+    // (M40, 3 bpw, measured). Uniform AND equal-width sliced batches (SlicedMultiLinear's q/k/v
+    // and GDN qkv/z bundles), unfiltered and single-token, instead take ONE launch of the
+    // table-indirect multi-matrix GEMV, resolving the device pointer tables / slice metadata on
+    // chip. Per-matrix-width batches (size_n_list without had_src_list, e.g. dsv4), MoE
+    // (indices / weights) and half-integer-rate batches keep the MGEMM kernel. Kill switch:
+    // EXL3_GEMV=0 declines the shape gate inside exl3_gemv_batch_launch, restoring MGEMM.
     if (cc == CC_MAXWELL &&
         size_m >= 1 && size_m <= EXL3_GEMV_MAX_M &&
         !half_k &&
-        !size_n_list && !had_src_list &&
         !indices && !weights && min_index < 0 &&
         num_tokens == 1 &&
-        force_shape_idx <= 0 && force_num_sms <= 0)
+        force_shape_idx <= 0 && force_num_sms <= 0 &&
+        (!size_n_list || had_src_list) &&
+        (!had_src_list || (bszm_in == 1 && n_stride_list && c_ptrs)))
     {
         int gemv_gx = 0;
         void* gemv_args[] =
@@ -691,12 +693,16 @@ int exl3_mgemm_gr
             (void*)& A_had_ptr,
             (void*)& svh_ptr_ptr,
             (void*)& bszm_in,
-            (void*)& gemv_gx
+            (void*)& gemv_gx,
+            (void*)& n_stride_list_ptr,
+            (void*)& had_src_list_ptr,
+            (void*)& c_list_ptr
         };
         void* gemv_kernel = nullptr;
         if (exl3_gemv_batch_launch
         (
-            gemv_args, &gemv_gx, size_m, size_k, size_n, bszm, K, cb, c_fp32,
+            gemv_args, &gemv_gx, size_m, size_k, size_n,
+            had_src_list ? bszm_out : bszm, K, cb, c_fp32,
             device, stream, &gemv_kernel
         ))
         {

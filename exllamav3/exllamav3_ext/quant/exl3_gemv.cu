@@ -246,10 +246,11 @@ bool exl3_gemv_probe
 // Batched (multi-matrix) launch for exl3_mgemm's small-m path: ONE launch over a ONE-dimensional
 // grid of gx * bszm blocks of the table-indirect multi-matrix GEMV (slice j = blockIdx.x / gx),
 // bounded to full co-residency so the whole-grid barrier inside the kernel is safe. kernel_args
-// must be the 12-slot mkernel argument block (A, B_table, C, size_m, size_k, size_n, locks,
-// suh_table, A_had, svh_table, bszm_in, gx) — the first three slots match the plain GEMV/GEMM
-// kernel layout, so graph sites and caller patching are identical. *gx_out receives the chosen
-// per-slice grid width (it is an unfixed kernel argument, so the caller supplies storage).
+// must be the 15-slot mkernel argument block (A, B_table, C, size_m, size_k, size_n, locks,
+// suh_table, A_had, svh_table, bszm_in, gx, n_stride_list, had_src_list, c_list) — the first
+// three slots match the plain GEMV/GEMM kernel layout, so graph sites and caller patching are
+// identical; the trailing metadata pointers are null for uniform batches. *gx_out receives the
+// chosen per-slice grid width (it is an unfixed kernel argument, so the caller supplies storage).
 // Returns false (launching nothing) when the shape gate or the co-residency bound declines.
 bool exl3_gemv_batch_launch
 (
@@ -275,6 +276,11 @@ bool exl3_gemv_batch_launch
                         exl3_gemv_env_mode(), &kernel, &mkernel, &block_dim, &cols, &max_blocks))
         return false;
     if (!mkernel) return false;
+
+    // The grid barrier inside the mkernel requires every block of the launch co-resident; its
+    // register count can differ from the plain kernel's, so re-query occupancy on it directly
+    int num_sms = DevCtx::instance().get_num_sms(device);
+    max_blocks = exl3_gemv_occupancy(device, mkernel, block_dim) * num_sms;
     if (max_blocks < bszm) return false;
 
     int groups = size_n / cols;
@@ -287,6 +293,8 @@ bool exl3_gemv_batch_launch
     if (launched_kernel) *launched_kernel = mkernel;
     return true;
 }
+
+
 
 bool exl3_gemv_try_launch
 (

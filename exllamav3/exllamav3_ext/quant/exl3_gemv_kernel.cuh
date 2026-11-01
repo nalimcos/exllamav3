@@ -309,7 +309,8 @@ __device__ __forceinline__ void exl3_gemv_body
     const half* __restrict__ svh,
     const int block_idx,
     const int grid_x,
-    const int barrier_blocks
+    const int barrier_blocks,
+    const int b_row_tiles
 )
 {
     static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
@@ -350,7 +351,6 @@ __device__ __forceinline__ void exl3_gemv_body
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
 
-    const int ntiles = size_n / 16;
     const int kslices = size_k / 16;
     const int num_groups = size_n / COLS;
 
@@ -359,7 +359,7 @@ __device__ __forceinline__ void exl3_gemv_body
     const int myn = max(0, min(chunk, kslices - ks0));
 
     const uint32_t* B32 = (const uint32_t*) B;
-    const size_t slice_stride = (size_t) ntiles * TWORDS;   // uint32 per k-slice row
+    const size_t slice_stride = (size_t) b_row_tiles * TWORDS;   // uint32 per k-slice row (source-matrix row stride for slices)
     const half2* A2 = (const half2*) A;
     const half2 hzero = __half2half2(__ushort_as_half(0));
 
@@ -756,17 +756,24 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     exl3_gemv_body<bits, c_fp32, cb, MMODE, CFG, SMEM_STAGE, HALF>
     (
         A, B, C, size_m, size_k, size_n, locks, suh, A_had, svh,
-        blockIdx.x, gridDim.x, gridDim.x
+        blockIdx.x, gridDim.x, gridDim.x, size_n / 16
     );
 }
 
-// Multi-matrix variant of the small-m GEMV for exl3_mgemm batches (fused gate/up, K/V pairs):
-// ONE launch covers the whole batch as slice j = blockIdx.x / gx of a ONE-dimensional grid
-// (blockIdx.y must stay 0: the embedded hadamard helpers index their scale vectors by it),
-// resolving the weight/scale tables on device (the host cannot dereference device pointer
-// tables). Every slice writes and reads only its own A_had and C slabs, so the phases stay
-// separated by the one whole-grid barrier; the launch is bounded to full co-residency.
+// Multi-matrix variant of the small-m GEMV for exl3_mgemm batches (fused gate/up, K/V pairs,
+// sliced attention/GDN bundles): ONE launch covers the whole batch as slice j = blockIdx.x / gx
+// of a ONE-dimensional grid (blockIdx.y must stay 0: the embedded hadamard helpers index their
+// scale vectors by it), resolving the weight/scale tables on device (the host cannot dereference
+// device pointer tables). Every slice writes and reads only its own A_had and C slabs, so the
+// phases stay separated by the one whole-grid barrier; the launch is bounded to full co-residency.
 // Half-integer bitrates are not instantiated: the batched path declines them to the MGEMM.
+//
+// Uniform batches: B/suh/svh tables hold one entry per matrix; C slots are raw j * m * n.
+// Sliced batches (n_stride_list / had_src_list / c_list non-null): entry j is column slice j of
+// its source — B/svh/c_list pre-offset to the slice, n_stride_list gives the SOURCE row width
+// (the B row stride), had_src_list the A_had slab / suh source. Equal slice widths throughout
+// (what SlicedMultiLinear builds; size_n is the slice width) — the mgemm kernel's general
+// per-slice widths are not handled here.
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE>
 __global__ __launch_bounds__(CFG == 0 ? 512 : 256, 1)
 void exl3_gemv_mkernel
@@ -782,23 +789,29 @@ void exl3_gemv_mkernel
     half* __restrict__ A_had,
     const uintptr_t* __restrict__ svh_table,
     const int bszm_in,
-    const int gx
+    const int gx,
+    const int* __restrict__ n_stride_list,
+    const int* __restrict__ had_src_list,
+    void* const* __restrict__ c_list
 )
 {
     static_assert(bits == 2 || bits == 3 || bits == 4, "exl3_gemv_mkernel supports 2, 3 and 4 bpw");
     const int j = blockIdx.x / gx;
     const int bx = blockIdx.x - j * gx;
     const uint16_t* B_j = (const uint16_t*) B_table[j];
-    const half* suh_j = (const half*) suh_table[j];
     const half* svh_j = (const half*) svh_table[j];
     const size_t mk = (size_t) size_m * size_k;
     const size_t mn = (size_t) size_m * size_n;
+    const int src = had_src_list ? had_src_list[j] : j;
+    const half* suh_j = (const half*) suh_table[src];
     const half* A_j = A + (bszm_in > 1 ? (size_t) (j % bszm_in) * mk : 0);
-    half* A_had_j = A_had + (size_t) j * mk;
-    void* C_j = (void*) ((char*) C + (size_t) j * mn * (c_fp32 ? 4 : 2));
+    half* A_had_j = A_had + (size_t) src * mk;
+    const int b_row_tiles = n_stride_list ? n_stride_list[j] / 16 : size_n / 16;
+    void* C_j = c_list ? (void*) c_list[j]
+                       : (void*) ((char*) C + (size_t) j * mn * (c_fp32 ? 4 : 2));
     exl3_gemv_body<bits, c_fp32, cb, MMODE, CFG, SMEM_STAGE, false>
     (
         A_j, B_j, C_j, size_m, size_k, size_n, locks, suh_j, A_had_j, svh_j,
-        bx, gx, gridDim.x
+        bx, gx, gridDim.x, b_row_tiles
     );
 }
