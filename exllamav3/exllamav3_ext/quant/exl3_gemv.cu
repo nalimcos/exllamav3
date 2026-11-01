@@ -115,6 +115,179 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
     return nullptr;
 }
 
+static void* exl3_gemv_select_mkernel(int bits, int cb, bool c_fp32, int mmode, int cfg, bool smem)
+{
+    #define SEL(bits_, cb_, fp32_, mm_, cfg_, sm_) \
+        if (bits == bits_ && cb == cb_ && c_fp32 == fp32_ && mmode == mm_ && cfg == cfg_ && smem == sm_) \
+            return (void*) exl3_gemv_mkernel<bits_, fp32_, cb_, mm_, cfg_, sm_>;
+    #define SEL_GRID(bits_, cb_, sm_) \
+        SEL(bits_, cb_, false, 0, 0, sm_) SEL(bits_, cb_, false, 0, 1, sm_) \
+        SEL(bits_, cb_, false, 1, 0, sm_) SEL(bits_, cb_, false, 1, 1, sm_) \
+        SEL(bits_, cb_, true,  0, 0, sm_) SEL(bits_, cb_, true,  0, 1, sm_) \
+        SEL(bits_, cb_, true,  1, 0, sm_) SEL(bits_, cb_, true,  1, 1, sm_)
+    SEL_GRID(4, 0, false) SEL_GRID(4, 1, false) SEL_GRID(4, 2, false)
+    SEL_GRID(2, 1, false) SEL_GRID(2, 2, false) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
+    SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
+    #undef SEL_GRID
+    #undef SEL
+    return nullptr;
+}
+
+// Cooperative launch: grids are capped at full co-residency (cached per kernel), and the
+// narrow config's co-residency also feeds the shape heuristic
+static std::map<void*, int> exl3_gemv_occ_cache[MAX_DEVICES];
+static int exl3_gemv_occupancy(int device, void* kernel, int block_dim)
+{
+    auto& cache = exl3_gemv_occ_cache[device];
+    auto it = cache.find(kernel);
+    if (it != cache.end()) return it->second;
+    int blocks_per_sm;
+    cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0));
+    cache[kernel] = blocks_per_sm;
+    return blocks_per_sm;
+}
+
+// Shared selection logic for exl3_gemv_try_launch / exl3_gemv_probe / exl3_gemv_batch_launch:
+// applies the hard constraints and the shape heuristic, selects the kernel(s) and computes the
+// launch geometry. Returns false when the GEMV path does not take this call. Never launches.
+// *mkernel_out receives the table-indirect multi-matrix variant when one is instantiated for
+// the rate (integer bitrates only; the batched path declines half-integer rates to the MGEMM).
+static bool exl3_gemv_pick
+(
+    int cc,
+    int device,
+    int size_m,
+    int size_k,
+    int size_n,
+    int K,
+    bool half_k,
+    int cb,
+    bool c_fp32,
+    int mode,
+    void** kernel_out,
+    void** mkernel_out,
+    int* block_dim_out,
+    int* cols_out,
+    int* max_blocks_out
+)
+{
+    if (half_k)
+    {
+        if (K < 1 || K > 3 || cb != 2) return false;
+    }
+    else
+    {
+        if (K < 2 || K > 8) return false;      // 5-8 bpw (output heads) go to the split-k GEMV
+        if (K != 4 && cb == 0) return false;
+    }
+    if (size_m < 1 || size_m > EXL3_GEMV_MAX_M) return false;
+    if (size_k % 128 || size_n % 128) return false;
+
+    int mmode = size_m == 1 ? 0 : 1;
+    int num_sms = DevCtx::instance().get_num_sms(device);
+
+    // Extraction style: shuffle by default, smem staging selectable per call for evaluation
+    bool smem = exl3_gemv_env_smem() == 1;
+
+    auto select = [&] (int cfg_) -> void*
+    {
+        return half_k ? exl3_gemv_select_kernel_half(K, c_fp32, mmode, cfg_, smem)
+                      : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg_, smem);
+    };
+    void* narrow_kernel = select(0);
+    if (!narrow_kernel) return false;
+    int narrow_coresident = exl3_gemv_occupancy(device, narrow_kernel, 512) * num_sms;
+
+    // Shape heuristic: a half-integer rate K + 0.5 is handled like the integer rate above it (its tile is
+    // between the two in bytes; unmeasured, so it inherits the K + 1 envelope)
+    int cfg = exl3_gemv_cfg(cc, size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident);
+    if (cfg < 0) return false;
+
+    void* kernel = cfg == 0 ? narrow_kernel : select(cfg);
+    if (!kernel) return false;
+
+    int block_dim = cfg == 0 ? 512 : 256;
+    int cols = cfg == 0 ? 32 : 64;
+
+    int max_blocks = exl3_gemv_occupancy(device, kernel, block_dim) * num_sms;
+    if (max_blocks < 1) return false;
+
+    *kernel_out = kernel;
+    *mkernel_out = half_k ? nullptr : exl3_gemv_select_mkernel(K, cb, c_fp32, mmode, cfg, smem);
+    *block_dim_out = block_dim;
+    *cols_out = cols;
+    *max_blocks_out = max_blocks;
+    return true;
+}
+
+bool exl3_gemv_probe
+(
+    int cc,
+    int device,
+    int size_m,
+    int size_k,
+    int size_n,
+    int K,
+    bool half_k,
+    int cb,
+    bool c_fp32
+)
+{
+    void* kernel;
+    void* mkernel;
+    int block_dim, cols, max_blocks;
+    if (!exl3_gemv_pick(cc, device, size_m, size_k, size_n, K, half_k, cb, c_fp32,
+                        exl3_gemv_env_mode(), &kernel, &mkernel, &block_dim, &cols, &max_blocks))
+        return false;
+    // The probe's only consumer is the batched (multi-matrix) path, which needs the mkernel
+    return mkernel != nullptr;
+}
+
+// Batched (multi-matrix) launch for exl3_mgemm's small-m path: ONE launch over a ONE-dimensional
+// grid of gx * bszm blocks of the table-indirect multi-matrix GEMV (slice j = blockIdx.x / gx),
+// bounded to full co-residency so the whole-grid barrier inside the kernel is safe. kernel_args
+// must be the 12-slot mkernel argument block (A, B_table, C, size_m, size_k, size_n, locks,
+// suh_table, A_had, svh_table, bszm_in, gx) — the first three slots match the plain GEMV/GEMM
+// kernel layout, so graph sites and caller patching are identical. *gx_out receives the chosen
+// per-slice grid width (it is an unfixed kernel argument, so the caller supplies storage).
+// Returns false (launching nothing) when the shape gate or the co-residency bound declines.
+bool exl3_gemv_batch_launch
+(
+    void** kernel_args,
+    int* gx_out,
+    int size_m,
+    int size_k,
+    int size_n,
+    int bszm,
+    int K,
+    int cb,
+    bool c_fp32,
+    int device,
+    cudaStream_t stream,
+    void** launched_kernel
+)
+{
+    int cc = DevCtx::instance().get_cc(device);
+    void* kernel;
+    void* mkernel;
+    int block_dim, cols, max_blocks;
+    if (!exl3_gemv_pick(cc, device, size_m, size_k, size_n, K, false, cb, c_fp32,
+                        exl3_gemv_env_mode(), &kernel, &mkernel, &block_dim, &cols, &max_blocks))
+        return false;
+    if (!mkernel) return false;
+    if (max_blocks < bszm) return false;
+
+    int groups = size_n / cols;
+    int gx = MIN(groups, max_blocks / bszm);
+    if (gx < 1) return false;
+
+    *gx_out = gx;
+    dim3 grid(gx * bszm);
+    cuda_check(EXL3_COOP_LAUNCH(mkernel, grid, block_dim, kernel_args, 0, stream));
+    if (launched_kernel) *launched_kernel = mkernel;
+    return true;
+}
+
 bool exl3_gemv_try_launch
 (
     void** kernel_args,
@@ -135,38 +308,10 @@ bool exl3_gemv_try_launch
     // Free integer checks first; the env read (~64 ns) and device queries only run for calls
     // that could actually take this path
     if (!has_su_sv) return false;
-    if (half_k)
-    {
-        if (K < 1 || K > 3 || cb != 2) return false;
-    }
-    else
-    {
-        if (K < 2 || K > 8) return false;      // 5-8 bpw (output heads) go to the split-k GEMV below
-        if (K != 4 && cb == 0) return false;
-    }
-    if (size_m > EXL3_GEMV_MAX_M) return false;
-    if (size_k % 128 || size_n % 128) return false;
 
     int mode = force ? 2 : exl3_gemv_env_mode();
     if (mode == 0) return false;
     int cc = DevCtx::instance().get_cc(device);
-    // if (cc != CC_AMPERE) return false;
-    int mmode = size_m == 1 ? 0 : 1;
-    int num_sms = DevCtx::instance().get_num_sms(device);
-
-    // Cooperative launch: grids are capped at full co-residency (cached per kernel), and the
-    // narrow config's co-residency also feeds the shape heuristic
-    static std::map<void*, int> occ_cache[MAX_DEVICES];
-    auto& cache = occ_cache[device];
-    auto occupancy = [&] (void* kernel, int block_dim) -> int
-    {
-        auto it = cache.find(kernel);
-        if (it != cache.end()) return it->second;
-        int blocks_per_sm;
-        cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0));
-        cache[kernel] = blocks_per_sm;
-        return blocks_per_sm;
-    };
 
     // Maxwell split-k GEMV (MMODE 0, m = 1, activation-as-A; MMODE 1, m = 2..8, weights-as-A k8 TRANS): the
 // decode-speed path for 2-8 bpw (output heads), balancing the work per SM for any shape. MMODE 2 (m = 9..16)
@@ -179,9 +324,10 @@ bool exl3_gemv_try_launch
         void* sk_kernel = exl3_gemv_sk_select_kernel(K, cb, c_fp32, false, mmode);
         if (sk_kernel)
         {
+            const int num_sms = DevCtx::instance().get_num_sms(device);
             const int pf = EXL3_GEMV_SK_PF(mmode);
             const int threads = EXL3_GEMV_SK_THREADS_M(mmode, EXL3_GEMV_SK_WNT_M(mmode));
-            const int grid = occupancy(sk_kernel, threads) * num_sms;
+            const int grid = exl3_gemv_occupancy(device, sk_kernel, threads) * num_sms;
             const int warps = grid * (threads / 32);
             const int cols = EXL3_GEMV_SK_WNT_M(mmode) * 16;
             const int kslices = size_k / 16;
@@ -200,30 +346,13 @@ bool exl3_gemv_try_launch
         }
     }
 
-    // Extraction style: shuffle by default, smem staging selectable per call for evaluation
-    bool smem = exl3_gemv_env_smem() == 1;
+    void* kernel;
+    void* mkernel;
+    int block_dim, cols, max_blocks;
+    if (!exl3_gemv_pick(cc, device, size_m, size_k, size_n, K, half_k, cb, c_fp32, mode,
+                        &kernel, &mkernel, &block_dim, &cols, &max_blocks))
+        return false;
 
-    auto select = [&] (int cfg_) -> void*
-    {
-        return half_k ? exl3_gemv_select_kernel_half(K, c_fp32, mmode, cfg_, smem)
-                      : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg_, smem);
-    };
-    void* narrow_kernel = select(0);
-    if (!narrow_kernel) return false;
-    int narrow_coresident = occupancy(narrow_kernel, 512) * num_sms;
-
-    // Shape heuristic: a half-integer rate K + 0.5 is handled like the integer rate above it (its tile is
-    // between the two in bytes; unmeasured, so it inherits the K + 1 envelope)
-    int cfg = exl3_gemv_cfg(cc, size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident);
-    if (cfg < 0) return false;
-
-    void* kernel = cfg == 0 ? narrow_kernel : select(cfg);
-    if (!kernel) return false;
-
-    int block_dim = cfg == 0 ? 512 : 256;
-    int cols = cfg == 0 ? 32 : 64;
-
-    int max_blocks = occupancy(kernel, block_dim) * num_sms;
     int grid = MIN(size_n / cols, max_blocks);
     if (grid < 1) return false;
 

@@ -28,7 +28,7 @@
 #include "hadamard_inner.cuh"
 #include "exl3_devctx.cuh"
 
-#define EXL3_GEMV_MAX_M 8
+#include "exl3_gemv.cuh"   // EXL3_GEMV_MAX_M
 
 // Whole-grid barrier: grid.sync() on the cooperative tiers, device barrier on Maxwell (the GEMV is a
 // plain launch there, grid bounded to co-residency — see exl3_launch_grid_bounded).
@@ -274,9 +274,43 @@ __device__ __forceinline__ void dq8_regs_half(uint32_t a7, uint32_t b7, int s7, 
 // ptxas spends 81-85 registers on them on sm_86/sm_89 (one 512-thread block per SM instead of two, measured
 // 18-28% slower at attention-projection shapes on the 3090). They are packed into one register (see x_pack) and
 // the bound keeps the compiler at the integer instances' 64
+// Grid-wide barrier between the input-transform and main/output phases. On Maxwell (plain
+// bounded launch) it is the device sense-reversing barrier over `barrier_blocks` blocks — for
+// the multi-matrix kernel that is gridDim.x * gridDim.y so one shared counter covers every
+// slice; cooperative-launch tiers use grid.sync(), which spans the whole grid regardless.
+__device__ __forceinline__ void exl3_gemv_sync(int* locks, int barrier_blocks)
+{
+#if EXL3_MAXWELL
+    group_barrier(0, barrier_blocks, locks + EXL3_GRID_BARRIER_OFFSET);
+#else
+    (void) locks; (void) barrier_blocks;
+    cooperative_groups::this_grid().sync();
+#endif
+}
+
+// block_idx / grid_x: this block's x-slot within its matrix slice and the slice's x-extent; the
+// plain kernel passes (blockIdx.x, gridDim.x), the multi-matrix kernel launches ONE-dimensional
+// and passes (blockIdx.x % gx, gx) — blockIdx.y must stay 0 everywhere, the embedded hadamard
+// helpers index their scale vectors by it. barrier_blocks is the whole launch's block count:
+// all slices share the one barrier counter, and correctness needs every block co-resident (the
+// launch is bounded accordingly).
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
-void exl3_gemv_kernel(EXL3_GEMM_ARGS)
+__device__ __forceinline__ void exl3_gemv_body
+(
+    const half* __restrict__ A,
+    const uint16_t* __restrict__ B,
+    void* __restrict__ C,
+    const int size_m,
+    const int size_k,
+    const int size_n,
+    int* __restrict__ locks,
+    const half* __restrict__ suh,
+    half* __restrict__ A_had,
+    const half* __restrict__ svh,
+    const int block_idx,
+    const int grid_x,
+    const int barrier_blocks
+)
 {
     static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
                   "exl3_gemv_kernel supports 2, 3 and 4 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
@@ -294,15 +328,11 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     constexpr int LSTRIDE = TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 ? TWORDS : 32);   // uint32 per load (lanes < LSTRIDE load)
     static_assert(!TWO_PER_LOAD || WNT % 2 == 0, "two tiles per warp load needs an even tile count per warp");
 
-#if !EXL3_MAXWELL
-    auto grid = cooperative_groups::this_grid();
-#endif
-
     // Input scales and Hadamard transform, same as exl3_gemm_kernel
     {
         int total_warps = size_m * size_k / 128;
-        int warps_grid = gridDim.x * blockDim.x / 32;
-        int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
+        int warps_grid = grid_x * blockDim.x / 32;
+        int this_warp = threadIdx.x / 32 + blockDim.x / 32 * block_idx;
 
         for(; this_warp < total_warps; this_warp += warps_grid)
             had_hf_r_128_inner<true, false>
@@ -313,7 +343,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 0.088388347648f  // 1/sqrt(128)
             );
 
-        EXL3_GRID_SYNC();
+        exl3_gemv_sync(locks, barrier_blocks);
         A = A_had;
     }
 
@@ -377,7 +407,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     __shared__ float sh_red[WK][ROWS][COLS];
     [[maybe_unused]] __shared__ uint32_t sh_stage[SMEM_STAGE ? WK : 1][SMEM_STAGE ? LOADS * LSTRIDE : 1];
 
-    for (int group = blockIdx.x; group < num_groups; group += gridDim.x)
+    for (int group = block_idx; group < num_groups; group += grid_x)
     {
         const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + group * WNT * TWORDS + lane;
 
@@ -691,11 +721,11 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
     // Output scales and Hadamard transform, same semantics as the inner GEMM epilogue
     {
-        EXL3_GRID_SYNC();
+        exl3_gemv_sync(locks, barrier_blocks);
 
         int total_warps = size_m * size_n / 128;
-        int warps_grid = gridDim.x * blockDim.x / 32;
-        int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
+        int warps_grid = grid_x * blockDim.x / 32;
+        int this_warp = threadIdx.x / 32 + blockDim.x / 32 * block_idx;
 
         for(; this_warp < total_warps; this_warp += warps_grid)
         {
@@ -717,4 +747,58 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 );
         }
     }
+}
+
+template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
+void exl3_gemv_kernel(EXL3_GEMM_ARGS)
+{
+    exl3_gemv_body<bits, c_fp32, cb, MMODE, CFG, SMEM_STAGE, HALF>
+    (
+        A, B, C, size_m, size_k, size_n, locks, suh, A_had, svh,
+        blockIdx.x, gridDim.x, gridDim.x
+    );
+}
+
+// Multi-matrix variant of the small-m GEMV for exl3_mgemm batches (fused gate/up, K/V pairs):
+// ONE launch covers the whole batch as slice j = blockIdx.x / gx of a ONE-dimensional grid
+// (blockIdx.y must stay 0: the embedded hadamard helpers index their scale vectors by it),
+// resolving the weight/scale tables on device (the host cannot dereference device pointer
+// tables). Every slice writes and reads only its own A_had and C slabs, so the phases stay
+// separated by the one whole-grid barrier; the launch is bounded to full co-residency.
+// Half-integer bitrates are not instantiated: the batched path declines them to the MGEMM.
+template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE>
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, 1)
+void exl3_gemv_mkernel
+(
+    const half* __restrict__ A,
+    const uintptr_t* __restrict__ B_table,
+    void* __restrict__ C,
+    const int size_m,
+    const int size_k,
+    const int size_n,
+    int* __restrict__ locks,
+    const uintptr_t* __restrict__ suh_table,
+    half* __restrict__ A_had,
+    const uintptr_t* __restrict__ svh_table,
+    const int bszm_in,
+    const int gx
+)
+{
+    static_assert(bits == 2 || bits == 3 || bits == 4, "exl3_gemv_mkernel supports 2, 3 and 4 bpw");
+    const int j = blockIdx.x / gx;
+    const int bx = blockIdx.x - j * gx;
+    const uint16_t* B_j = (const uint16_t*) B_table[j];
+    const half* suh_j = (const half*) suh_table[j];
+    const half* svh_j = (const half*) svh_table[j];
+    const size_t mk = (size_t) size_m * size_k;
+    const size_t mn = (size_t) size_m * size_n;
+    const half* A_j = A + (bszm_in > 1 ? (size_t) (j % bszm_in) * mk : 0);
+    half* A_had_j = A_had + (size_t) j * mk;
+    void* C_j = (void*) ((char*) C + (size_t) j * mn * (c_fp32 ? 4 : 2));
+    exl3_gemv_body<bits, c_fp32, cb, MMODE, CFG, SMEM_STAGE, false>
+    (
+        A_j, B_j, C_j, size_m, size_k, size_n, locks, suh_j, A_had_j, svh_j,
+        bx, gx, gridDim.x
+    );
 }

@@ -661,6 +661,61 @@ int exl3_mgemm_gr
     }
 #endif
 
+#if !defined(USE_ROCM)
+    // Maxwell small-m decode path: the cooperative MGEMM kernel is a tile-pipelined GEMM whose
+    // weight traversal reaches only ~24-35 GB/s at m = 1..8, while the GEMV sustains ~142 GB/s
+    // (M40, 3 bpw, measured). Uniform, unfiltered, single-token batches instead take ONE launch
+    // of the table-indirect multi-matrix GEMV (matrix j = blockIdx.y resolves the device
+    // pointer tables on chip). Sliced (size_n_list / had_src_list), MoE (indices / weights)
+    // and half-integer-rate batches keep the MGEMM kernel. Kill switch: EXL3_GEMV=0 declines
+    // the shape gate inside exl3_gemv_batch_launch, restoring MGEMM everywhere.
+    if (cc == CC_MAXWELL &&
+        size_m >= 1 && size_m <= EXL3_GEMV_MAX_M &&
+        !half_k &&
+        !size_n_list && !had_src_list &&
+        !indices && !weights && min_index < 0 &&
+        num_tokens == 1 &&
+        force_shape_idx <= 0 && force_num_sms <= 0)
+    {
+        int gemv_gx = 0;
+        void* gemv_args[] =
+        {
+            (void*)& A_ptr,
+            (void*)& B_ptr_ptr,
+            (void*)& C_ptr,
+            (void*)& size_m,
+            (void*)& size_k,
+            (void*)& size_n,
+            (void*)& locks,
+            (void*)& suh_ptr_ptr,
+            (void*)& A_had_ptr,
+            (void*)& svh_ptr_ptr,
+            (void*)& bszm_in,
+            (void*)& gemv_gx
+        };
+        void* gemv_kernel = nullptr;
+        if (exl3_gemv_batch_launch
+        (
+            gemv_args, &gemv_gx, size_m, size_k, size_n, bszm, K, cb, c_fp32,
+            device, stream, &gemv_kernel
+        ))
+        {
+            if (graph)
+            {
+                // Same patch ids as the MGEMM kernel so existing callers keep passing
+                // GP_mgemm_A: every graphed caller of this path holds the B/suh/svh tables
+                // and the A_had/C slabs in static storage, so their capture-time values
+                // stay valid and the unpatched sites are simply skipped by the site walk
+                graph->record_param(gemv_kernel, GP_mgemm_A, 0);
+                graph->record_param(gemv_kernel, GP_mgemm_C, 2);
+                graph->record_param(gemv_kernel, GP_end, 0);
+            }
+            cuda_check(cudaPeekAtLastError());
+            return 94;
+        }
+    }
+#endif
+
     int shape_idx;
     int block_dim;
     fp_exl3_mgemm_kernel kernel;
