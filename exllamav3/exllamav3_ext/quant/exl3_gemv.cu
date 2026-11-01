@@ -35,11 +35,15 @@ static int exl3_gemv_env_mode()
     return atoi(env);
 }
 
-// Maxwell split-k GEMV (exl3_gemv_sk_kernel.cuh): EXL3_GEMV_SK = 0 disables it, unset/1 = on
+// Maxwell split-k GEMV (exl3_gemv_sk_kernel.cuh). Measured on Tesla M40 (Qwen3.8-27B 3bpw,
+// decode bsz 1): the plain GEMV path matches or beats the split-k kernel on every bitrate
+// (e.g. 3 bpw 5120x12288: 48.6 vs 40.7 GB/s) once the split-k grid-sync + reduction overhead
+// is counted, so the split-k path is opt-in here: EXL3_GEMV_SK = 1 enables it, unset/0 = plain
+// GEMV. It remains the only small-m path for 5-8 bpw when enabled.
 static int exl3_gemv_sk_env_mode()
 {
     const char* env = std::getenv("EXL3_GEMV_SK");
-    if (!env) return 1;
+    if (!env) return 0;
     return atoi(env);
 }
 
