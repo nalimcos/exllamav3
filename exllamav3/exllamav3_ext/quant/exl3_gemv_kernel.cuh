@@ -433,6 +433,146 @@ __device__ __forceinline__ void exl3_gemv_body
         [[maybe_unused]] FragC_h ch[WNT][2] = {};
         [[maybe_unused]] float accm[WNT][2][ROWS] = {};
 
+        // Per-slice consume for the Maxwell FMA path, factored out of the mma ring so the
+        // double-buffered pair pipeline below can call it per slice: A fragment (fp32 scalars,
+        // row 0 on every lane for MMODE 0, per-row for MMODE 1) + WNT dequant/FMA tiles.
+        [[maybe_unused]] auto maxwell_consume = [&] (int i, const uint32_t (&cbw)[LOADS])
+        {
+            const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
+            float a01_x, a01_y, a23_x, a23_y;   // MMODE 0
+            float ar01_x[ROWS], ar01_y[ROWS], ar23_x[ROWS], ar23_y[ROWS];   // MMODE 1
+            if constexpr (MMODE == 0)
+            {
+                a01_x = __low2float(A2[a_col]);
+                a01_y = __high2float(A2[a_col]);
+                a23_x = __low2float(A2[a_col + 4]);
+                a23_y = __high2float(A2[a_col + 4]);
+            }
+            else
+            {
+                #pragma unroll
+                for (int r = 0; r < ROWS; ++r)
+                {
+                    const bool ok = r < size_m;
+                    ar01_x[r] = ok ? __low2float(A2[(size_t) r * (size_k / 2) + a_col]) : 0.0f;
+                    ar01_y[r] = ok ? __high2float(A2[(size_t) r * (size_k / 2) + a_col]) : 0.0f;
+                    ar23_x[r] = ok ? __low2float(A2[(size_t) r * (size_k / 2) + a_col + 4]) : 0.0f;
+                    ar23_y[r] = ok ? __high2float(A2[(size_t) r * (size_k / 2) + a_col + 4]) : 0.0f;
+                }
+            }
+
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t)
+            {
+                Vec<float,4> f0, f1;
+                if constexpr (SMEM_STAGE)
+                {
+                    const uint32_t* tp = &sh_stage[warp][t * TWORDS];
+                    if constexpr (bits == 4)
+                        exl3_gemv_ns::dq8_regs_4bits_f32<cb>(tp[(lane + 31) & 31], tp[lane], f0, f1);
+                    else if constexpr (bits == 2)
+                        exl3_gemv_ns::dq8_regs_2bits_f32<cb>(tp[x_src_a], tp[x_src_b], lane << 3, f0, f1);
+                    else
+                        exl3_gemv_ns::dq8_regs_3bits_f32<cb>(tp[x_src_a], tp[x_src_b], x_s2, f0, f1);
+                }
+                else if constexpr (bits == 4)
+                {
+                    uint32_t aw = __shfl_sync(0xffffffffu, cbw[t], (lane + 31) & 31);
+                    exl3_gemv_ns::dq8_regs_4bits_f32<cb>(aw, cbw[t], f0, f1);
+                }
+                else if constexpr (bits == 2)
+                {
+                    // Two tiles per loaded word group: tile t lives in lanes (t&1)*16 .. +15
+                    const uint32_t w = cbw[t >> 1];
+                    const int base = (t & 1) << 4;
+                    uint32_t bwv = __shfl_sync(0xffffffffu, w, base + x_src_b);
+                    uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
+                    exl3_gemv_ns::dq8_regs_2bits_f32<cb>(awv, bwv, lane << 3, f0, f1);
+                }
+                else  // bits == 3
+                {
+                    uint32_t awv = __shfl_sync(0xffffffffu, cbw[t], x_src_a);
+                    uint32_t bwv = __shfl_sync(0xffffffffu, cbw[t], x_src_b);
+                    exl3_gemv_ns::dq8_regs_3bits_f32<cb>(awv, bwv, x_s2, f0, f1);
+                }
+
+                // Direct per-lane fp32 FMA, no B-gather: each lane multiplies its own A fragment by
+                // its own B fragment for its column g = lane>>2 (f0) / g+8 (f1), k-pair lane&3.
+                if constexpr (MMODE == 0)
+                {
+                    acc0[t][0].x += a01_x * f0[0];
+                    acc0[t][0].y += a01_y * f0[1];
+                    acc0[t][0].x += a23_x * f0[2];
+                    acc0[t][0].y += a23_y * f0[3];
+                    acc0[t][1].x += a01_x * f1[0];
+                    acc0[t][1].y += a01_y * f1[1];
+                    acc0[t][1].x += a23_x * f1[2];
+                    acc0[t][1].y += a23_y * f1[3];
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int r = 0; r < ROWS; ++r)
+                    {
+                        accm[t][0][r] += ar01_x[r] * f0[0];
+                        accm[t][0][r] += ar01_y[r] * f0[1];
+                        accm[t][0][r] += ar23_x[r] * f0[2];
+                        accm[t][0][r] += ar23_y[r] * f0[3];
+                        accm[t][1][r] += ar01_x[r] * f1[0];
+                        accm[t][1][r] += ar01_y[r] * f1[1];
+                        accm[t][1][r] += ar23_x[r] * f1[2];
+                        accm[t][1][r] += ar23_y[r] * f1[3];
+                    }
+                }
+            }
+        };
+
+        if constexpr (EXL3_MAXWELL)
+        {
+            // Double-buffered pair pipeline (measured best structure on M40, tmp/pattern_bench4
+            // V6: sustains ~75 GB/s under a heavy consume chain vs 40-68 GB/s for the shallow PF
+            // ring): the next pair's B loads issue BEFORE the current pair's dequant/FMA consume,
+            // so pair i+1's memory latency hides behind pair i's consume chain. Slices are still
+            // consumed strictly in ascending i — accumulation order and numerics are identical
+            // to the ring. No __syncthreads inside the loop (the phase barriers are outside).
+            uint32_t pb[2][LOADS];
+            #pragma unroll
+            for (int d = 0; d < 2; ++d)
+                #pragma unroll
+                for (int l = 0; l < LOADS; ++l)
+                    pb[d][l] = d < myn ? ld_b(d, l) : 0;
+
+            for (int i = 0; i < myn; i += 2)
+            {
+                uint32_t nb[2][LOADS];
+                #pragma unroll
+                for (int d = 0; d < 2; ++d)
+                    #pragma unroll
+                    for (int l = 0; l < LOADS; ++l)
+                        nb[d][l] = (i + 2 + d < myn) ? ld_b(i + 2 + d, l) : 0;
+
+                #pragma unroll
+                for (int d = 0; d < 2; ++d)
+                {
+                    if (i + d < myn)
+                    {
+                        uint32_t cbw[LOADS];
+                        #pragma unroll
+                        for (int l = 0; l < LOADS; ++l)
+                            cbw[l] = pb[d][l];
+                        maxwell_consume(i + d, cbw);
+                    }
+                }
+
+                #pragma unroll
+                for (int d = 0; d < 2; ++d)
+                    #pragma unroll
+                    for (int l = 0; l < LOADS; ++l)
+                        pb[d][l] = nb[d][l];
+            }
+        }
+        else
+        {
         for (int ib = 0; ib < myn; ib += PF)
         {
         #pragma unroll
@@ -632,6 +772,7 @@ __device__ __forceinline__ void exl3_gemv_body
                             ch[t][f][0] = hzero;
                         }
                 }
+        }
         }
         }
 
