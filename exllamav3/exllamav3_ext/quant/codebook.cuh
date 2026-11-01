@@ -136,12 +136,33 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
 }
 
 // Procedural fp32 dequant: the decode_3inst<cb> codebook math (IMUL + portable byte-sum + scale)
-// run in fp16 and upcast to float, so it is bit-identical to the half path. The Maxwell FMA GEMM
+// run in fp16 and upcast to float, so it is bit-identical to the half path — except cb=2 on
+// Maxwell, which collapses the half pipeline to exact fp32 (see below). The Maxwell FMA GEMM
 // dequantizes each weight with this (no LUT): the 16-bit sliding-window input spans up to 2^16
 // values, so a LUT is infeasible and the per-weight ALU decode is the only option.
 template <int cb>
 __device__ inline float decode_3inst_f(uint64_t x)
 {
+#if EXL3_MAXWELL
+    if constexpr (cb == 2)
+    {
+        // Maxwell has neither dp4a (sm_61+) nor fp16 FMA, so the canonical cb=2 decode emulates
+        // both: a 4x shift/and/mad byte-sum, then a half mul/add via float with conversions —
+        // ~18 instructions per 16-bit window. The half pipeline is exact in fp32: the dp4a
+        // accumulator 0x6400 is the half bit pattern of 1024.0 and the byte sum (<= 1020) fits
+        // the 10-bit mantissa, so half2float(0x6400 + s) == 1024.0f + s exactly, and
+        // (1024+s)*k_inv + k_bias == fmaf(s, k_inv, 1024*k_inv + k_bias). One IMAD, one 8-instr
+        // byte sum and one FMA replace the whole emulated chain — and drop its two half
+        // roundings, so this is closer to the true fp32 value than the half path it replaces.
+        x *= 0x83DCD12Du;
+        uint32_t s = (uint32_t(x) & 0x00ff00ffu) + ((uint32_t(x) >> 8) & 0x00ff00ffu);
+        s = (s & 0xffffu) + (s >> 16);
+        constexpr float k_inv = 0.00676727294921875f;   // half bits 0x1eee
+        constexpr float c_fold = -3.453125f;            // 1024*k_inv + half bits 0xc931
+        return fmaf((float) s, k_inv, c_fold);
+    }
+    else
+#endif
     return __half2float(decode_3inst<cb>(x));
 }
 
