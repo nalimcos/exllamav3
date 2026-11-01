@@ -20,6 +20,7 @@ namespace cg = cooperative_groups;
 #include <set>
 #include <vector>
 
+int exl3_gemm_tilesize_m_g[] = {EXL3_GEMM_TILESIZE_M};
 int exl3_gemm_tilesize_k_g[] = {EXL3_GEMM_TILESIZE_K};
 int exl3_gemm_tilesize_n_g[] = {EXL3_GEMM_TILESIZE_N};
 int exl3_gemm_blockdim_g[] = {EXL3_GEMM_BLOCKDIM};
@@ -318,6 +319,10 @@ int exl3_gemm_gr
 
             fp_exl3_gemm_kernel candidate_kernel = get_gemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb, half_k);
             if (!candidate_kernel) continue;
+            // Multi-row tiles (TILESIZE_M > 16) have no sm_50/52 device image: the Maxwell FMA
+            // inner requires TILESIZE_M == 16 (static_assert in exl3_gemm_inner.cuh), so nvcc
+            // emits no cubin for them. Offer only 16-row tiles to the autotuner on Maxwell.
+            if (exl3_no_tc(cc) && exl3_gemm_tilesize_m_g[candidate_shape_idx] > 16) continue;
 
             int tilesize_k = exl3_gemm_tilesize_k_g[candidate_shape_idx];
             int tilesize_n = exl3_gemm_tilesize_n_g[candidate_shape_idx];
@@ -724,6 +729,8 @@ int exl3_mgemm_gr
 
                 fp_exl3_mgemm_kernel candidate_kernel = get_mgemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb, half_k);
                 if (!candidate_kernel) continue;
+                // See the gemm candidate loop: multi-row tiles have no Maxwell device image
+                if (exl3_no_tc(cc) && exl3_gemm_tilesize_m_g[candidate_shape_idx] > 16) continue;
 
                 int tilesize_k = exl3_gemm_tilesize_k_g[candidate_shape_idx];
                 int tilesize_n = exl3_gemm_tilesize_n_g[candidate_shape_idx];

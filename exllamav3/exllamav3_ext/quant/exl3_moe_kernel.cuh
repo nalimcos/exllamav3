@@ -1,6 +1,10 @@
 #pragma once
 
+// libcudacxx atomics are sm_60+ only on *nix; the sm_52 (EXL3_MAXWELL) path below uses plain
+// atomicAdd + __threadfence instead, so skip the header when compiling device code for < sm_60
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
 #include <cuda/atomic>
+#endif
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
 #include <stdio.h>
