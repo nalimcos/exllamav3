@@ -18,6 +18,14 @@ from exllamav3.util.rope import RopeSettings, RopeStyle
 
 device = "cuda:0"
 
+# The MLA triton kernels autotune to configs needing 64 KB of dynamic shared memory, over the
+# 48 KB ceiling of pre-Ampere parts (sm_52 included): every kernel-touching test fails with
+# triton OutOfResources there. MLA is not among the architectures the Maxwell fork serves.
+pytestmark = pytest.mark.skipif(
+    torch.cuda.get_device_capability(device)[0] < 8,
+    reason="MLA triton kernels require >48KB dynamic smem (sm_80+)",
+)
+
 
 class FakeSTC:
     """Minimal stand-in for the safetensors collection, serving tensors from a dict."""

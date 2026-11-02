@@ -23,7 +23,12 @@ def quant_gate(gate):
     return gate_t, g8, sb
 
 
-@unittest.skipUnless(torch.cuda.is_available() and ext.HAS_DET_GEMM, "CUDA build with the deterministic GEMM required")
+# The deterministic int8 kernels need cp.async and mma.m16n8k32 s8 (both sm_80+) plus 97 KB of
+# dynamic smem; routing_gemm.cu routes pre-Ampere devices to cuBLAS instead, and the bindings
+# reject the launch there — so the whole class is sm_80+ only
+@unittest.skipUnless(torch.cuda.is_available() and ext.HAS_DET_GEMM
+                     and torch.cuda.get_device_capability(DEVICE)[0] >= 8,
+                     "CUDA build with the deterministic GEMM required, on sm_80+")
 class TestRoutingGemmDet(unittest.TestCase):
 
     def test_matches_reference(self):

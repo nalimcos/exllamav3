@@ -13,6 +13,13 @@ from exllamav3.util.rope import RopeSettings, RopeStyle
 
 from test_mla import FakeConfig, rms_norm
 
+# Inherits test_mla's skip: the DSA kernels share its smem-hungry triton configs, so they are
+# equally pre-Ampere-bound
+pytestmark = pytest.mark.skipif(
+    torch.cuda.get_device_capability("cuda:0")[0] < 8,
+    reason="MLA/DSA triton kernels require >48KB dynamic smem (sm_80+)",
+)
+
 # DSA-on-MLA (GLM-5.2): the lightning indexer selects index_topk tokens per query and the
 # attention core gathers only those latent rows. These tests transcribe the reference indexer
 # (transformers glm_moe_dsa) in plain torch and check, on random weights:

@@ -31,6 +31,11 @@ def rel(a, b):
     return ((a.float() - b.float()).abs().max() / b.float().abs().max()).item()
 
 
+# The tiled int8 path is sm_80+ (cp.async, mma.m16n8k32 s8; see hyperconnections.py); tests that
+# assert m.tiled are skipped below that capability
+tiled_kernel_supported = torch.cuda.is_available() and \
+    torch.cuda.get_device_capability(DEVICE)[0] >= 8
+
 @unittest.skipUnless(torch.cuda.is_available() and ext.HAS_GR_MIX_TILED, "CUDA build with the tiled mix kernels required")
 class TestGrMixTiled(unittest.TestCase):
 
@@ -44,6 +49,7 @@ class TestGrMixTiled(unittest.TestCase):
     ]
     ROWS = [33, 64, 100, 257, 1000, 2048]
 
+    @unittest.skipUnless(tiled_kernel_supported, "tiled int8 mix kernel is sm_80+")
     def test_tiled_matches_reference_and_gemm(self):
         for D, rank, use_combine in self.CASES:
             m = make_site(D, rank, use_combine)
@@ -106,8 +112,14 @@ class TestGrMixTiled(unittest.TestCase):
     def test_cross_device_identity(self):
         # The int8 tensor-core path must agree bit for bit across GPU architectures
         n = torch.cuda.device_count()
-        if n < 2:
-            self.skipTest("needs two or more GPUs")
+        devices = list(range(n))
+        if (sms := getattr(ext, "BUILD_SMS", None)) is not None:
+            # The kernel images only cover these SMs; launching on any other GPU hard-exits the
+            # process in the CUDA_CHECK macro, so restrict the comparison to covered devices
+            covered = {tuple(int(p) for p in sm.split(".")) for sm in sms.split(",")}
+            devices = [d for d in devices if torch.cuda.get_device_capability(d) in covered]
+        if len(devices) < 2:
+            self.skipTest("needs two or more GPUs the extension's kernel images cover")
         torch.manual_seed(5)
         D, rank = 1024, 320
         H = 4
@@ -118,7 +130,7 @@ class TestGrMixTiled(unittest.TestCase):
         for R in (100, 1000):
             x = torch.randn(1, R, H, D) * 3.0
             outs = []
-            for d in range(n):
+            for d in devices:
                 dev = torch.device(f"cuda:{d}")
                 m = GatedResidual(config = None, key = "site", hc_mult = H, hidden_size = D,
                                   rms_norm_eps = 1e-6, use_combine = True)
@@ -127,11 +139,13 @@ class TestGrMixTiled(unittest.TestCase):
                 m._prepare(down.to(dev), up.to(dev), inject.to(dev), keep_source_weights = True)
                 post, mixed = m._mix(x.to(dev))
                 outs.append((post.cpu(), mixed.cpu()))
-            for d in range(1, n):
-                self.assertTrue(torch.equal(outs[0][0], outs[d][0]), (R, torch.cuda.get_device_name(d)))
-                self.assertTrue(torch.equal(outs[0][1], outs[d][1]), (R, torch.cuda.get_device_name(d)))
+            for i in range(1, len(outs)):
+                name = torch.cuda.get_device_name(devices[i])
+                self.assertTrue(torch.equal(outs[0][0], outs[i][0]), (R, name))
+                self.assertTrue(torch.equal(outs[0][1], outs[i][1]), (R, name))
 
 
+    @unittest.skipUnless(tiled_kernel_supported, "tiled int8 mix kernel is sm_80+")
     def test_source_weights_released(self):
         # Inference loads drop the fp16 sources once the kernel tables exist; conversion keeps them
         m = make_site(256, 64, True)

@@ -93,6 +93,48 @@ def extension_sources(sources_dir: str, hip: bool = False) -> list[str]:
     return sorted(sources)
 
 
+def build_sms() -> list[tuple[int, int]]:
+    """SM targets this build compiles kernel images for, as (major, minor) tuples, parsed from
+    TORCH_CUDA_ARCH_LIST. Callers run util.arch_list.maybe_set_arch_list_env() first so the env
+    var reflects the visible devices when it wasn't set explicitly. Empty when the list is
+    absent or names no CUDA architectures (e.g. a ROCm build)."""
+    raw = os.environ.get("TORCH_CUDA_ARCH_LIST", "")
+    sms = []
+    for entry in raw.replace(";", ",").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if entry.endswith("+PTX"):
+            entry = entry[:-4]
+        # Family suffixes: 'a' (accelerated, Hopper/Blackwell), 'f' (family, Blackwell)
+        if entry[-1:] in ("a", "f") and entry[:-1].replace(".", "").isdigit():
+            entry = entry[:-1]
+        if "." in entry:
+            major, _, minor = entry.partition(".")
+        else:
+            # Plain-int form as torch accepts it: "52" -> 5.2, "80" -> 8.0
+            major, minor = entry[:-1], entry[-1:]
+        if not (major.isdigit() and minor.isdigit()):
+            continue
+        sms.append((int(major), int(minor)))
+    return sms
+
+
+def build_sms_define() -> str | None:
+    """-D flag recording the SM targets of this build in the extension's C++ sources, which expose
+    it as the BUILD_SMS module attribute ("5.2,6.1"). Tests use it to skip GPUs the kernel images
+    do not cover, since an unsupported launch hits a hard process exit in the CUDA_CHECK macro.
+    None when the build is ROCm or the arch list is unknown."""
+    if os.environ.get("PYTORCH_ROCM_ARCH"):
+        return None
+    sms = build_sms()
+    if not sms:
+        return None
+    # Plain quotes: setuptools passes the flag as a single argv element and the JIT build shlex-quotes
+    # it into build.ninja, so both paths leave the quotes in the macro value
+    return '-DEXL3_BUILD_SMS="' + ",".join(f"{major}.{minor}" for major, minor in sms) + '"'
+
+
 def hip_cflags(debug: bool = False) -> list[str]:
     """
     Flags for the extension's HIP translation units (compiled by hipcc, which is clang-based and takes

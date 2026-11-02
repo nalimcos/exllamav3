@@ -120,6 +120,9 @@ def test_close_releases_arena():
     assert cache.arena is None and not cache.slot_views and not cache.segments and not cache.entries
 
 
+# torch.cuda.host_memory_stats only exists from torch 2.7 on; the pinned-allocator check has no
+# equivalent API before that
+@pytest.mark.skipif(not hasattr(torch.cuda, "host_memory_stats"), reason="torch < 2.7: no host memory stats API")
 def test_tier_occupies_exactly_its_budget():
     # The slabs are slices of one registered arena. Pinned tensors from torch's allocator would each be
     # rounded up to a power of two (and kept by it after the tier is gone), so none may come from there

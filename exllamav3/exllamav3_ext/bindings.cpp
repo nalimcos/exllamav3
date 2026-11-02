@@ -85,6 +85,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 #else
     const bool cuda_only = true;
 #endif
+    // SM targets the kernel images cover, "5.2,6.1" (util/cuda_flags.py build_sms_define). None when the
+    // build is ROCm or the arch list is unknown, in which case every visible CUDA device is assumed covered
+#ifdef EXL3_BUILD_SMS
+    m.attr("BUILD_SMS") = std::string(EXL3_BUILD_SMS);
+#else
+    m.attr("BUILD_SMS") = py::none();
+#endif
     m.attr("HAS_GR_MIX_TILED") = true;          // gr_mix_tiled, gr_mix_tiled_slices
     m.attr("HAS_DET_GEMM") = true;              // routing_gemm_det, det_quant_weight, det_math_test
     m.attr("HAS_HGEMM_F16ACC") = cuda_only;     // hgemm_f16acc, hgemm_f16acc_status
