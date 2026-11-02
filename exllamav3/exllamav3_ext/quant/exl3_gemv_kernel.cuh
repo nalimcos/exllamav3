@@ -310,7 +310,8 @@ __device__ __forceinline__ void exl3_gemv_body
     const int block_idx,
     const int grid_x,
     const int barrier_blocks,
-    const int b_row_tiles
+    const int b_row_tiles,
+    const int c_row_stride
 )
 {
     static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
@@ -852,8 +853,10 @@ __device__ __forceinline__ void exl3_gemv_body
             for (int j = 0; j < WK; ++j)
                 sum += sh_red[j][r][c];
             const int col = group * COLS + c;
-            if constexpr (c_fp32) ((float*) C)[(size_t) r * size_n + col] = sum;
-            else                  ((half*)  C)[(size_t) r * size_n + col] = __float2half_rn(sum);
+            // Row stride is the SOURCE width: sliced batches (c_list) pass column-slice bases of a
+            // wider matrix, where rows are n_stride apart; only the slice's own columns are written
+            if constexpr (c_fp32) ((float*) C)[(size_t) r * c_row_stride + col] = sum;
+            else                  ((half*)  C)[(size_t) r * c_row_stride + col] = __float2half_rn(sum);
         }
         __syncthreads();
     }
@@ -864,26 +867,31 @@ __device__ __forceinline__ void exl3_gemv_body
     {
         exl3_gemv_sync(locks, barrier_blocks);
 
-        int total_warps = size_m * size_n / 128;
+        // One 128-wide task per (row, column-chunk) pair; rows live c_row_stride apart in the
+        // (possibly sliced) output, so a flat this_warp * 128 walk would cross row boundaries
+        int cols_128 = size_n / 128;
+        int total_warps = size_m * cols_128;
         int warps_grid = grid_x * blockDim.x / 32;
         int this_warp = threadIdx.x / 32 + blockDim.x / 32 * block_idx;
 
         for(; this_warp < total_warps; this_warp += warps_grid)
         {
+            const int r = this_warp / cols_128;
+            const int c0 = (this_warp % cols_128) * 128;
             if constexpr (c_fp32)
                 had_ff_r_128_inner<false, true>
                 (
-                    ((const float*) C) + this_warp * 128,
-                    ((float*) C) + this_warp * 128,
-                    svh + (this_warp * 128) % size_n,
+                    ((const float*) C) + (size_t) r * c_row_stride + c0,
+                    ((float*) C) + (size_t) r * c_row_stride + c0,
+                    svh + c0 % size_n,
                     0.088388347648f  // 1/sqrt(128)
                 );
             else
                 had_hf_r_128_inner<false, true>
                 (
-                    ((const half*) C) + this_warp * 128,
-                    ((half*) C) + this_warp * 128,
-                    svh + (this_warp * 128) % size_n,
+                    ((const half*) C) + (size_t) r * c_row_stride + c0,
+                    ((half*) C) + (size_t) r * c_row_stride + c0,
+                    svh + c0 % size_n,
                     0.088388347648f  // 1/sqrt(128)
                 );
         }
@@ -897,7 +905,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     exl3_gemv_body<bits, c_fp32, cb, MMODE, CFG, SMEM_STAGE, HALF>
     (
         A, B, C, size_m, size_k, size_n, locks, suh, A_had, svh,
-        blockIdx.x, gridDim.x, gridDim.x, size_n / 16
+        blockIdx.x, gridDim.x, gridDim.x, size_n / 16, size_n
     );
 }
 
@@ -948,11 +956,12 @@ void exl3_gemv_mkernel
     const half* A_j = A + (bszm_in > 1 ? (size_t) (j % bszm_in) * mk : 0);
     half* A_had_j = A_had + (size_t) src * mk;
     const int b_row_tiles = n_stride_list ? n_stride_list[j] / 16 : size_n / 16;
+    const int c_row_stride = n_stride_list ? n_stride_list[j] : size_n;
     void* C_j = c_list ? (void*) c_list[j]
                        : (void*) ((char*) C + (size_t) j * mn * (c_fp32 ? 4 : 2));
     exl3_gemv_body<bits, c_fp32, cb, MMODE, CFG, SMEM_STAGE, false>
     (
         A_j, B_j, C_j, size_m, size_k, size_n, locks, suh_j, A_had_j, svh_j,
-        bx, gx, gridDim.x, b_row_tiles
+        bx, gx, gridDim.x, b_row_tiles, c_row_stride
     );
 }
