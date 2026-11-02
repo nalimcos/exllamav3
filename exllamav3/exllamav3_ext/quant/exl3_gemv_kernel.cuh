@@ -979,8 +979,12 @@ __device__ __forceinline__ void exl3_gemv_body
     }
 }
 
+// Maxwell FMA decode is consume-chain-bound at 1 block/SM (16 warps cannot hide the
+// LDS -> dequant -> FMA latency), so the m=1 512-thread config is bound to 2 blocks/SM
+// (<=64 regs) there: 32 resident warps and a 2x grid cap. MMODE 1 keeps minBlocks 1 -
+// its per-row fp32 accumulators need >64 regs and would spill. The mma tiers keep 1.
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, (HALF || (EXL3_MAXWELL && MMODE == 0)) && CFG == 0 ? 2 : 1)
 void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 {
     exl3_gemv_body<bits, c_fp32, cb, MMODE, CFG, SMEM_STAGE, HALF>
@@ -1005,7 +1009,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 // (what SlicedMultiLinear builds; size_n is the slice width) — the mgemm kernel's general
 // per-slice widths are not handled here.
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, 1)
+__global__ __launch_bounds__(CFG == 0 ? 512 : 256, EXL3_MAXWELL && MMODE == 0 && CFG == 0 ? 2 : 1)
 void exl3_gemv_mkernel
 (
     const half* __restrict__ A,
