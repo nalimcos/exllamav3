@@ -1054,8 +1054,8 @@ class Attention(Module):
         # allocate (and drop) the worst case here for the device budget. QSA bounds its dense
         # prefill and stages a small window; MLA/DSA caches have their own measure
         if quant and not isinstance(layer, QSAPlanes) and self.qsa_indexer is None:
-            from .attention_fn.triton_paged import _qc_staging
-            if _qc_staging == 1:
+            from .attention_fn.triton_paged import _qc_staging_effective
+            if _qc_staging_effective(self.device):
                 n = 2 * layer.qk.shape[0] * PAGE_SIZE * layer.token_dim
                 t = torch.empty((n,), dtype = torch.half, device = self.device)
                 del t

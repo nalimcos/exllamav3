@@ -733,7 +733,14 @@ _h32_cache = {}
 #       pass triggers it, so the space is reserved at load time
 #   2 = full staging: dispatch-path debug mode; whole layers are dequantized into full-size
 #       fp16 temporaries before attention (get_kv). Only affects decode if EXL3_BC_ATTN=0
-_qc_staging = int(os.environ.get("EXL3_QC_STAGING", "1"))
+# None = arch default (set per call in paged_attn_triton_prefill): staging on for Ampere and
+# newer, off for pre-Ampere. On Maxwell the kernel computes in fp32 either way, so staging's
+# fp16 expansion only doubles DRAM traffic on a bandwidth-bound kernel, while in-kernel dequant
+# reads 4x fewer bytes (measured on M40/sm_52, q=2048 kv=8326 hd=256 4+4 bits: 632 ms staged
+# vs 329 ms in-kernel); on Ampere+ in-kernel expansion costs compute instead (~6-26%) and
+# staging wins.
+_qc_staging_env = os.environ.get("EXL3_QC_STAGING", None)
+_qc_staging = int(_qc_staging_env) if _qc_staging_env is not None else None
 
 # Query-length threshold for the prefill staging pass at EXL3_QC_STAGING=1: below it the direct
 # path reads less gmem (short trailing chunks over long contexts, low bitrates)
@@ -1162,6 +1169,20 @@ def combine_subtiles(block_rows: int, hd_pad: int) -> tuple[int, int]:
 
 
 _decode_sm_count = {}
+_cc_major_cache = {}
+
+
+def _cc_major(device) -> int:
+    dev = device.index
+    if dev not in _cc_major_cache:
+        _cc_major_cache[dev] = torch.cuda.get_device_capability(device)[0]
+    return _cc_major_cache[dev]
+
+
+def _qc_staging_effective(device) -> bool:
+    if _qc_staging is not None:
+        return _qc_staging == 1
+    return _cc_major(device) >= 8
 
 def paged_attn_triton_decode(
     q: torch.Tensor,
@@ -1903,7 +1924,7 @@ def paged_attn_triton_prefill(
         # are not kept as statics: the old pool-sized static held a full fp16 copy of the cache
         # for the life of the process. The loader's autosplit budgets for the worst case (a window
         # spanning the pool) through Attention.autosplit_extra_measure
-        if (_qc_staging == 1 and q_len >= _qc_prefill_two_pass_min_q
+        if (_qc_staging_effective(q.device) and q_len >= _qc_prefill_two_pass_min_q
                 and new_kv_mode == 0 and k is None and causal):
             from ...ext import exllamav3_ext as ext
             npps_w = block_table.shape[1]
@@ -1968,6 +1989,11 @@ def paged_attn_triton_prefill(
         bn = max(16, min(128, 16384 // hd_pad))
         if hd_pad >= 256 and qck + qcv >= 13 and bn > 16:
             bn //= 2
+        # Pre-Ampere runs the in-kernel-dequant kernel at a 48 KB dynamic-smem ceiling, where
+        # bn=64 either fails the ladder outright or lands on a pathological fallback
+        # (measured 6.0 s vs 0.33 s on M40 for the same shape at bn=32)
+        if _cc_major(q.device) < 8:
+            bn = min(bn, 32)
         cfg = (cfg[0], bn, cfg[2], cfg[3])
     stock = tuple(f if f is not None else c for f, c in zip(forced, cfg))
     # Caller-forced values pin the config; otherwise the ladder is walked against the device's

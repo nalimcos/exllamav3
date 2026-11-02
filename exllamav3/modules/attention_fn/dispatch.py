@@ -38,8 +38,9 @@ _fns_qc: list[AttnFn] = [
 
 # Quantized caches feed the attention kernels directly (online dequant or prefill staging by
 # EXL3_QC_STAGING level, see triton_paged); level 2 restores the dequantize-then-attend path
-# with full-size fp16 temporaries for A/B testing
-_qc_attn = _qc_staging < 2
+# with full-size fp16 temporaries for A/B testing. Unset means the arch default (see
+# triton_paged), which still feeds the kernels directly
+_qc_attn = _qc_staging is None or _qc_staging < 2
 
 # Built once at import from the current device; 0 when there is no CUDA device at import
 _cc_major = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
