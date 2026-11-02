@@ -406,7 +406,12 @@ __device__ __forceinline__ void exl3_gemv_body
     }
 
     __shared__ float sh_red[WK][ROWS][COLS];
-    [[maybe_unused]] __shared__ uint32_t sh_stage[SMEM_STAGE ? WK : 1][SMEM_STAGE ? LOADS * LSTRIDE : 1];
+    // Staged weight groups. The Maxwell 16B-vectorized path (VEC_SMEM) double-buffers one
+    // LOADS*LSTRIDE-word group per pipeline slot; the SMEM_STAGE ring stages a single group.
+    // 16B-aligned: the vectorized path stores uint4.
+    constexpr bool VEC_SMEM = EXL3_MAXWELL && !HALF;
+    constexpr int STAGE_WORDS = SMEM_STAGE ? LOADS * LSTRIDE : (VEC_SMEM ? 2 * LOADS * LSTRIDE : 1);
+    [[maybe_unused]] __shared__ alignas(16) uint32_t sh_stage[(SMEM_STAGE || VEC_SMEM) ? WK : 1][STAGE_WORDS];
 
     for (int group = block_idx; group < num_groups; group += grid_x)
     {
@@ -434,10 +439,14 @@ __device__ __forceinline__ void exl3_gemv_body
         [[maybe_unused]] FragC_h ch[WNT][2] = {};
         [[maybe_unused]] float accm[WNT][2][ROWS] = {};
 
+        // Per-slice weight word fetch, provided by the caller: the staged-loader fetch reads the
+        // warp-private shared group, the per-word fetch shuffles the loading lane's register. idx
+        // 0/1 picks the tile's first/second window-pair word. All indices are lane constants.
+
         // Per-slice consume for the Maxwell FMA path, factored out of the mma ring so the
         // double-buffered pair pipeline below can call it per slice: A fragment (fp32 scalars,
         // row 0 on every lane for MMODE 0, per-row for MMODE 1) + WNT dequant/FMA tiles.
-        [[maybe_unused]] auto maxwell_consume = [&] (int i, const uint32_t (&cbw)[LOADS])
+        [[maybe_unused]] auto maxwell_consume = [&] (int i, auto&& getw)
         {
             const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
             float a01_x, a01_y, a23_x, a23_y;   // MMODE 0
@@ -466,35 +475,18 @@ __device__ __forceinline__ void exl3_gemv_body
             for (int t = 0; t < WNT; ++t)
             {
                 Vec<float,4> f0, f1;
-                if constexpr (SMEM_STAGE)
+                if constexpr (bits == 4)
                 {
-                    const uint32_t* tp = &sh_stage[warp][t * TWORDS];
-                    if constexpr (bits == 4)
-                        exl3_gemv_ns::dq8_regs_4bits_f32<cb>(tp[(lane + 31) & 31], tp[lane], f0, f1);
-                    else if constexpr (bits == 2)
-                        exl3_gemv_ns::dq8_regs_2bits_f32<cb>(tp[x_src_a], tp[x_src_b], lane << 3, f0, f1);
-                    else
-                        exl3_gemv_ns::dq8_regs_3bits_f32<cb>(tp[x_src_a], tp[x_src_b], x_s2, f0, f1);
-                }
-                else if constexpr (bits == 4)
-                {
-                    uint32_t aw = __shfl_sync(0xffffffffu, cbw[t], (lane + 31) & 31);
-                    exl3_gemv_ns::dq8_regs_4bits_f32<cb>(aw, cbw[t], f0, f1);
+                    exl3_gemv_ns::dq8_regs_4bits_f32<cb>(getw(t, 0), getw(t, 1), f0, f1);
                 }
                 else if constexpr (bits == 2)
                 {
                     // Two tiles per loaded word group: tile t lives in lanes (t&1)*16 .. +15
-                    const uint32_t w = cbw[t >> 1];
-                    const int base = (t & 1) << 4;
-                    uint32_t bwv = __shfl_sync(0xffffffffu, w, base + x_src_b);
-                    uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
-                    exl3_gemv_ns::dq8_regs_2bits_f32<cb>(awv, bwv, lane << 3, f0, f1);
+                    exl3_gemv_ns::dq8_regs_2bits_f32<cb>(getw(t, 0), getw(t, 1), lane << 3, f0, f1);
                 }
                 else  // bits == 3
                 {
-                    uint32_t awv = __shfl_sync(0xffffffffu, cbw[t], x_src_a);
-                    uint32_t bwv = __shfl_sync(0xffffffffu, cbw[t], x_src_b);
-                    exl3_gemv_ns::dq8_regs_3bits_f32<cb>(awv, bwv, x_s2, f0, f1);
+                    exl3_gemv_ns::dq8_regs_3bits_f32<cb>(getw(t, 0), getw(t, 1), x_s2, f0, f1);
                 }
 
                 // Direct per-lane fp32 FMA, no B-gather: each lane multiplies its own A fragment by
@@ -536,40 +528,126 @@ __device__ __forceinline__ void exl3_gemv_body
             // so pair i+1's memory latency hides behind pair i's consume chain. Slices are still
             // consumed strictly in ascending i — accumulation order and numerics are identical
             // to the ring. No __syncthreads inside the loop (the phase barriers are outside).
-            uint32_t pb[2][LOADS];
-            #pragma unroll
-            for (int d = 0; d < 2; ++d)
-                #pragma unroll
-                for (int l = 0; l < LOADS; ++l)
-                    pb[d][l] = d < myn ? ld_b(d, l) : 0;
 
-            for (int i = 0; i < myn; i += 2)
+            // Per-word staged weight group (HALF bitrates): same loads as the former per-word ring.
+            struct WArr { uint32_t v[LOADS]; };
+
+            // Weight word fetch from the per-word register layout (HALF bitrates), with the same
+            // register and source lane as the former direct shuffle extraction. Only the Maxwell
+            // integer-bitrate path is exercised in practice; the HALF instances keep their prior
+            // behavior through this same fetch.
+            auto make_getw = [&] (const WArr& w)
             {
-                uint32_t nb[2][LOADS];
+                return [&] (int t, int idx) -> uint32_t
+                {
+                    const uint32_t ww = TWO_PER_LOAD ? w.v[t >> 1] : w.v[t];
+                    const int base = TWO_PER_LOAD ? (t & 1) * TWORDS : 0;
+                    return __shfl_sync(0xffffffffu, ww, base + (idx == 0 ? x_src_a : x_src_b));
+                };
+            };
+
+            if constexpr (!HALF)
+            {
+                // Integer bitrates: load the k-slice's whole WNT*TWORDS-word weight group with
+                // 16-byte vectorized loads, staged through shared memory. The group is contiguous
+                // and 16B-aligned (TWORDS % 4 == 0 makes every row stride, tile and slice offset a
+                // multiple of 4 words), so one uint4 per lane moves 4x the bytes per instruction
+                // and issues 4x fewer loads than the per-word form. Staging feeds the existing
+                // tile-extraction unchanged (same word at tile base t*TWORDS + x), and the smem
+                // reads are conflict-free: lanes read distinct words of the 24/32-word tile or
+                // broadcast the same one. Numerics are identical — same words, same extraction.
+                constexpr int SW = LOADS * LSTRIDE;      // staged words per k-slice (== WNT*TWORDS)
+                constexpr int NV = (WNT * TWORDS) / 4;   // active lanes per k-slice load
+                static_assert(WNT * TWORDS == SW && WNT * TWORDS % 4 == 0, "staged group must be 16B divisible");
+                const uint4* bp4 = reinterpret_cast<const uint4*>
+                    (B32 + (size_t) ks0 * slice_stride + group * (WNT * TWORDS));
+
+                auto ld_slice = [&] (int i) -> uint4
+                {
+                    if constexpr (NV < 32)
+                        return lane < NV ? __ldcs(bp4 + (size_t) i * (slice_stride / 4) + lane)
+                                         : uint4{0, 0, 0, 0};
+                    else
+                        return __ldcs(bp4 + (size_t) i * (slice_stride / 4) + lane);
+                };
+
+                // Word fetch from the staged group: tile t's words live at [t*TWORDS, +TWORDS)
+                // of the warp-private buffer, identical layout to the SMEM_STAGE ring below.
+                auto getw_staged = [&] (int sob)
+                {
+                    return [&] (int t, int idx) -> uint32_t
+                    {
+                        const uint32_t* tp = &sh_stage[warp][sob + t * TWORDS];
+                        if constexpr (bits == 4) return tp[idx == 0 ? ((lane + 31) & 31) : lane];
+                        else                     return tp[idx == 0 ? x_src_a : x_src_b];
+                    };
+                };
+
+                uint4 pb[2];
+                pb[0] = 0 < myn ? ld_slice(0) : uint4{0, 0, 0, 0};
+                pb[1] = 1 < myn ? ld_slice(1) : uint4{0, 0, 0, 0};
+
+                for (int i = 0; i < myn; i += 2)
+                {
+                    uint4 nb[2];
+                    nb[0] = (i + 2 < myn) ? ld_slice(i + 2) : uint4{0, 0, 0, 0};
+                    nb[1] = (i + 3 < myn) ? ld_slice(i + 3) : uint4{0, 0, 0, 0};
+
+                    #pragma unroll
+                    for (int d = 0; d < 2; ++d)
+                        if (i + d < myn && lane < NV)
+                            *reinterpret_cast<uint4*>(&sh_stage[warp][d * SW + lane * 4]) = pb[d];
+                    __syncwarp();
+
+                    #pragma unroll
+                    for (int d = 0; d < 2; ++d)
+                    {
+                        if (i + d < myn)
+                            maxwell_consume(i + d, getw_staged(d * SW));
+                    }
+
+                    __syncwarp();
+                    pb[0] = nb[0];
+                    pb[1] = nb[1];
+                }
+            }
+            else
+            {
+                uint32_t pb[2][LOADS];
                 #pragma unroll
                 for (int d = 0; d < 2; ++d)
                     #pragma unroll
                     for (int l = 0; l < LOADS; ++l)
-                        nb[d][l] = (i + 2 + d < myn) ? ld_b(i + 2 + d, l) : 0;
+                        pb[d][l] = d < myn ? ld_b(d, l) : 0;
 
-                #pragma unroll
-                for (int d = 0; d < 2; ++d)
+                for (int i = 0; i < myn; i += 2)
                 {
-                    if (i + d < myn)
-                    {
-                        uint32_t cbw[LOADS];
+                    uint32_t nb[2][LOADS];
+                    #pragma unroll
+                    for (int d = 0; d < 2; ++d)
                         #pragma unroll
                         for (int l = 0; l < LOADS; ++l)
-                            cbw[l] = pb[d][l];
-                        maxwell_consume(i + d, cbw);
-                    }
-                }
+                            nb[d][l] = (i + 2 + d < myn) ? ld_b(i + 2 + d, l) : 0;
 
-                #pragma unroll
-                for (int d = 0; d < 2; ++d)
                     #pragma unroll
-                    for (int l = 0; l < LOADS; ++l)
-                        pb[d][l] = nb[d][l];
+                    for (int d = 0; d < 2; ++d)
+                    {
+                        if (i + d < myn)
+                        {
+                            WArr cw;
+                            #pragma unroll
+                            for (int l = 0; l < LOADS; ++l)
+                                cw.v[l] = pb[d][l];
+                            maxwell_consume(i + d, make_getw(cw));
+                        }
+                    }
+
+                    #pragma unroll
+                    for (int d = 0; d < 2; ++d)
+                        #pragma unroll
+                        for (int l = 0; l < LOADS; ++l)
+                            pb[d][l] = nb[d][l];
+                }
             }
         }
         else
