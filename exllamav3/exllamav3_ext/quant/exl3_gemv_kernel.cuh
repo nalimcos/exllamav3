@@ -233,17 +233,20 @@ __device__ __forceinline__ void dq8_regs_2bits_f32(uint32_t a, uint32_t b, int t
 template <int cb>
 __device__ __forceinline__ void dq8_regs_3bits_f32(uint32_t a, uint32_t b, int s2, Vec<float,4>& f0, Vec<float,4>& f1)
 {
-    uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
-    w7 = fshift(b, a, s2);
-    w6 = w7 >> 3;
-    w5 = w6 >> 3;
-    w4 = w5 >> 3;
-    w3 = fshift(b, a, s2 + 12);
-    w2 = w3 >> 3;
-    w1 = w2 >> 3;
-    w0 = w1 >> 3;
-    decode8_f32<cb>(w0 & 0xffff, w1 & 0xffff, w2 & 0xffff, w3 & 0xffff,
-                    w4 & 0xffff, w5 & 0xffff, w6 & 0xffff, w7 & 0xffff, f0, f1);
+    // Each 16-bit window is one bfe.u32 from an aligned word (1 instruction) instead of the
+    // shift chain + final AND mask (2 per value) — bit-identical fields, 6 fewer instructions
+    // per 8-value tile than the dq8_regs_3bits chain form.
+    uint32_t w7 = fshift(b, a, s2);
+    uint32_t w3 = fshift(b, a, s2 + 12);
+    uint32_t w6, w5, w4, w2, w1, w0;
+    BFE16_IMM(w6, w7, 3);
+    BFE16_IMM(w5, w7, 6);
+    BFE16_IMM(w4, w7, 9);
+    BFE16_IMM(w2, w3, 3);
+    BFE16_IMM(w1, w3, 6);
+    BFE16_IMM(w0, w3, 9);
+    decode8_f32<cb>(w0, w1, w2, w3 & 0xffffu,
+                    w4, w5, w6, w7 & 0xffffu, f0, f1);
 }
 
 // Register form of dq8_half<KA, cb> (exl3_dq.cuh): the two window groups' word pairs and funnel alignments are
