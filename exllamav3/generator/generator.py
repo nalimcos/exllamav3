@@ -26,11 +26,11 @@ import os
 
 def _parse_draft_batch_depth() -> dict:
     """
-    Per-batch draft depth table from EXL3_DRAFT_BATCH_DEPTH, default "1:7,2:3,3:1,4:1".
+    Per-batch draft depth table from EXL3_DRAFT_BATCH_DEPTH, default "1:6,2:3,3:1,4:1".
     Maps live decode batch size -> draft depth for that round; a batch size absent from
     the table decodes without drafting. Invalid entries are dropped with a warning.
     """
-    raw = os.environ.get("EXL3_DRAFT_BATCH_DEPTH", "1:7,2:3,3:1,4:1")
+    raw = os.environ.get("EXL3_DRAFT_BATCH_DEPTH", "1:6,2:3,3:1,4:1")
     table = {}
     for entry in raw.split(","):
         entry = entry.strip()
@@ -217,14 +217,18 @@ class Generator:
         # GEMV row count m = decode_jobs * (1 + depth) stays inside the flat m<=8
         # MMODE-1 regime (measured 1.06 ms/matrix flat to m=8, 2.43 ms at m=9..16
         # dense, ~3.37 ms at m>=17 reconstruct). Default keeps verify m <= 8 at every
-        # drafted batch size: depth 7 at batch 1 (verify m=8), 3 at batch 2 (m=8),
-        # 1 at batches 3 and 4 (m=8, m=8); batches > 4 decode without drafting.
-        # Env override: EXL3_DRAFT_BATCH_DEPTH="1:7,2:3,3:1,4:1" — a batch size absent
+        # drafted batch size: depth 6 at batch 1 (verify m=7), 3 at batch 2 (m=8),
+        # 1 at batches 3 and 4 (m=6, m=8); batches > 4 decode without drafting.
+        # Batch-1 depth 6 measured 9.93 t/s vs 9.06 at depth 4 (acceptance on draft
+        # tokens 5+ is ~0, so depth 7 pays a full draft round for nothing); batch 4
+        # depth 2 measured 10.83 t/s vs 20.48 at depth 1 — the dense m=12 verify
+        # regime costs 2.3x per matrix and kills drafting.
+        # Env override: EXL3_DRAFT_BATCH_DEPTH="1:6,2:3,3:1,4:1" — a batch size absent
         # from the table decodes without drafting.
         self.draft_batch_depth = _parse_draft_batch_depth()
         # The table ceiling, not the configured depth, sizes the pinned draft buffer and
         # the token queue: the runtime depth can exceed the configured num_draft_tokens
-        # (table batch-1 depth 7 vs a configured 6)
+        # (e.g. env table batch-1 depth 7 vs a configured 6)
         self._draft_buffer_depth = max(self.num_draft_tokens,
                                        max(self.draft_batch_depth.values(), default = 0))
         max_q_size = max(self._draft_buffer_depth + 1, max_q_size)
