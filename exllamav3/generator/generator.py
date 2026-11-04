@@ -230,11 +230,13 @@ class Generator:
         max_q_size = max(self._draft_buffer_depth + 1, max_q_size)
 
         # Step-phase profiler (EXL3_STEP_PROF=1): per-phase CPU wall time per iterate() call, logged
-        # every 256 steps. Off by default; when off, self._prof is None and the hot path pays nothing.
+        # every EXL3_STEP_PROF_INTERVAL steps (default 256). Off by default; when off, self._prof is
+        # None and the hot path pays nothing.
         self._prof = (
             { "draft": 0.0, "gen_pre": 0.0, "fwd": 0.0, "accept": 0.0, "mtp": 0.0, "tail": 0.0, "n": 0 }
             if os.environ.get("EXL3_STEP_PROF", "0") == "1" else None
         )
+        self._prof_interval = max(1, int(os.environ.get("EXL3_STEP_PROF_INTERVAL", "256")))
 
         # Chunking/partitioning
         self.max_batch_size = max_batch_size
@@ -641,7 +643,7 @@ class Generator:
         if prof is not None:
             prof["tail"] += time.perf_counter() - _it
             prof["n"] += 1
-            if prof["n"] % 256 == 0:
+            if prof["n"] % self._prof_interval == 0:
                 n = prof["n"]
                 parts = " ".join(
                     f"{k}={1000 * v / n:.2f}ms" for k, v in prof.items() if k != "n"
