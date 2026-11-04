@@ -229,6 +229,13 @@ class Generator:
                                        max(self.draft_batch_depth.values(), default = 0))
         max_q_size = max(self._draft_buffer_depth + 1, max_q_size)
 
+        # Step-phase profiler (EXL3_STEP_PROF=1): per-phase CPU wall time per iterate() call, logged
+        # every 256 steps. Off by default; when off, self._prof is None and the hot path pays nothing.
+        self._prof = (
+            { "draft": 0.0, "gen_pre": 0.0, "fwd": 0.0, "accept": 0.0, "mtp": 0.0, "tail": 0.0, "n": 0 }
+            if os.environ.get("EXL3_STEP_PROF", "0") == "1" else None
+        )
+
         # Chunking/partitioning
         self.max_batch_size = max_batch_size
         self.max_chunk_size = max_chunk_size
@@ -599,19 +606,23 @@ class Generator:
         # draft-off (depth 6 verifies at m=28, ~3.2x matrix cost); 8 streams draft-off 18.82.
         # mtp_last_hidden is refreshed by every target forward, so drafting resumes
         # seamlessly when the batch drops back into the table.
+        prof = self._prof
+        if prof is not None: _it = time.perf_counter()
+
         decode_jobs = sum(1 for job in self.active_jobs if job.is_prefill_done())
         _draft_depth = self.draft_batch_depth.get(decode_jobs, 0) if self.draft_model else 0
         if _draft_depth:
             self.num_draft_tokens = _draft_depth
+            if prof is not None: _pt = time.perf_counter()
             if self.dflash_draft:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results)
-                self.iterate_gen(results, draft_tokens)
             elif self.mtp_draft:
                 draft_tokens = self.iterate_draftmodel_mtp_gen(results)
-                self.iterate_gen(results, draft_tokens)
             else:
                 draft_tokens = self.iterate_draftmodel_gen(results)
-                self.iterate_gen(results, draft_tokens)
+            if prof is not None:
+                prof["draft"] += time.perf_counter() - _pt
+            self.iterate_gen(results, draft_tokens)
 
         # Generation with n-gram draft
         elif self.ngram_match_min:
@@ -627,6 +638,16 @@ class Generator:
             self.update_visualizer()
 
         # Finished iteration
+        if prof is not None:
+            prof["tail"] += time.perf_counter() - _it
+            prof["n"] += 1
+            if prof["n"] % 256 == 0:
+                n = prof["n"]
+                parts = " ".join(
+                    f"{k}={1000 * v / n:.2f}ms" for k, v in prof.items() if k != "n"
+                )
+                print(f" [stepprof] steps={n} avg-per-step: {parts}", flush = True)
+
         return results
 
 
@@ -1040,6 +1061,9 @@ class Generator:
 
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
 
+        _prof = self._prof
+        if _prof is not None: _gt0 = time.perf_counter()
+
         # Get shape of active batch
         # Only jobs that have finished prefill can participate in token generation. The maximum sequence length
         # determines how many cache pages the temporary block table needs for this iteration.
@@ -1136,10 +1160,16 @@ class Generator:
         }
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
+        if _prof is not None:
+            _gt = time.perf_counter()
+            _prof["gen_pre"] += _gt - _gt0
         batch_logits = self.model.forward(
             input_ids = batch_ids,
             params = params,
         )
+        if _prof is not None:
+            _gt0 = time.perf_counter()
+            _prof["fwd"] += _gt0 - _gt
 
         # Keep only the fields needed below for draft-cache updates and drop the params dict so it cannot extend
         # references to recurrent state objects past this iteration.
@@ -1364,6 +1394,11 @@ class Generator:
                 accepted_lengths.append(accepted_length)
                 j += 1
 
+        if _prof is not None:
+            _gt = time.perf_counter()
+            _prof["accept"] += _gt - _gt0
+            _gt0 = _gt
+
         # Update the draft-confidence calibration with this round's verification outcomes (any
         # draft-model mode)
         if self.draft_calibrator is not None and self._draft_conf_round is not None:
@@ -1407,6 +1442,12 @@ class Generator:
         if self.mtp_draft:
             target_hidden = p_export_states[-1]
             accepted_idx = 0
+            # Batch the accept prefills across jobs, grouped by continuation width k = accepted_length - 1:
+            # rows in a group share one rectangular prefill instead of one pipeline launch per job.
+            # At depth 1 every accepting row has k = 1, so the whole batch collapses to a single call.
+            # This is content-invariant: the verify step's target argmax decides acceptance, so draft-cache
+            # numerics can only affect future acceptance length, never emitted tokens.
+            prefill_groups = {}
             for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
                 if a_idx == b_idx:
                     continue
@@ -1421,22 +1462,35 @@ class Generator:
 
                 # Position K was drafted from the last target state already. Replace accepted
                 # speculative positions K+1..K+A-1 with the corresponding target-state inputs.
-                if accepted_length > 1:
-                    self.draft_model.prefill(
-                        batch_ids[a_idx:b_idx, 1:accepted_length],
-                        {
-                            "attn_mode": "flash_attn",
-                            "block_table": block_index[a_idx:b_idx],
-                            "cache": self.draft_cache,
-                            "cache_seqlens": p_cache_seqlens[a_idx:b_idx] + 1,
-                            "target_hidden": target_hidden[a_idx:b_idx, :accepted_length - 1, :],
-                        },
-                    )
+                k = accepted_length - 1
+                if k > 0:
+                    prefill_groups.setdefault(k, []).append((a_idx, b_idx))
 
                 # The next unprocessed token is paired with the preceding target hidden state.
                 job.mtp_last_hidden = target_hidden[
                     a_idx:b_idx, accepted_length - 1:accepted_length, :
                 ].clone()
+
+            for k, spans in prefill_groups.items():
+                self.draft_model.prefill(
+                    torch.cat([batch_ids[a:b, 1:k + 1] for a, b in spans], dim = 0),
+                    {
+                        "attn_mode": "flash_attn",
+                        "block_table": block_index[[a for a, _ in spans]],
+                        "cache": self.draft_cache,
+                        "cache_seqlens": torch.cat(
+                            [p_cache_seqlens[a:b] + 1 for a, b in spans], dim = 0
+                        ),
+                        "target_hidden": torch.cat(
+                            [target_hidden[a:b, :k, :] for a, b in spans], dim = 0
+                        ),
+                    },
+                )
+
+        if _prof is not None:
+            _gt = time.perf_counter()
+            _prof["mtp"] += _gt - _gt0
+            _gt0 = _gt
 
         # Release pages for completed jobs. Finished and requeued jobs no longer need their active page references.
         # Requeued recurrent jobs may stash the last checkpoint first so the next queued job can resume from cached
