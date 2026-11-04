@@ -19,7 +19,9 @@
 //
 // CFG 0 ("narrow", 512 threads, 2 n-tiles/warp, 16 k-splits) wins at attention-projection sizes;
 // CFG 1 ("wide", 256 threads, 4 n-tiles/warp, 8 k-splits) wins at large-n FFN sizes. MMODE 0 is
-// the m == 1 fast path, MMODE 1 covers 2 <= m <= 8 with row-guarded fragment loads.
+// the m == 1 fast path, MMODE 1 covers 2 <= m <= 8 with row-guarded fragment loads. CFG 2
+// (128 threads, 2 n-tiles/warp, 4 k-splits, 4-deep prefetch ring) is the Maxwell m == 1 low-warp
+// geometry, opt-in via EXL3_GEMV_GEO = 1.
 
 #include <cooperative_groups.h>
 #include "../ptx.cuh"
@@ -319,10 +321,10 @@ __device__ __forceinline__ void exl3_gemv_body
 {
     static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
                   "exl3_gemv_kernel supports 2, 3 and 4 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
-    constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
-    constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
-    constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
-    constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
+    constexpr int WK   = CFG == 0 ? 16 : CFG == 1 ? 8 : 4;   // k-split (warps per block)
+    constexpr int WNT  = CFG == 1 ? 4 : 2;                   // adjacent n-tiles per warp
+    constexpr int PF   = CFG == 0 ? 4 : CFG == 1 ? 2 : 4;    // prefetch ring depth
+    constexpr int FOLD = CFG == 0 ? 4 : 2;                   // fp16->fp32 fold cadence (divides PF)
     constexpr int THREADS = WK * 32;
     constexpr int ROWS = MMODE == 0 ? 1 : EXL3_GEMV_MAX_M;
     constexpr int COLS = WNT * 16;
@@ -413,7 +415,8 @@ __device__ __forceinline__ void exl3_gemv_body
     // LOADS*LSTRIDE-word group per pipeline slot; the SMEM_STAGE ring stages a single group.
     // 16B-aligned: the vectorized path stores uint4.
     constexpr bool VEC_SMEM = EXL3_MAXWELL && !HALF;
-    constexpr int STAGE_WORDS = SMEM_STAGE ? LOADS * LSTRIDE : (VEC_SMEM ? 2 * LOADS * LSTRIDE : 1);
+    // CFG 2 (Maxwell low-warp geometry) rings through a single stage slot; CFG 0/1 double-buffer pairs
+    constexpr int STAGE_WORDS = SMEM_STAGE ? LOADS * LSTRIDE : (VEC_SMEM ? (CFG == 2 ? LOADS * LSTRIDE : 2 * LOADS * LSTRIDE) : 1);
     [[maybe_unused]] __shared__ alignas(16) uint32_t sh_stage[(SMEM_STAGE || VEC_SMEM) ? WK : 1][STAGE_WORDS];
 
     for (int group = block_idx; group < num_groups; group += grid_x)
@@ -549,7 +552,58 @@ __device__ __forceinline__ void exl3_gemv_body
                 };
             };
 
-            if constexpr (!HALF)
+            if constexpr (!HALF && CFG == 2)
+            {
+                // CFG 2 (Maxwell low-warp geometry, EXL3_GEMV_GEO): 4-deep register prefetch ring
+                // over a single smem stage slot. Measured on M40 (tmp/geo_bench.py, 5120x17408
+                // 3bpw): 4 warps/block at 4 blocks/SM (<=128 regs) sustains ~59.5 GB/s vs ~53-55
+                // for the CFG 0 pair pipeline at 16 warps/block — the deeper per-warp ILP replaces
+                // warps/SM as the latency-hiding resource. Slices are still consumed in ascending
+                // i through the same accumulator, so numerics are identical to the pair pipeline.
+                constexpr int NV_ = (WNT * TWORDS) / 4;
+                const uint4* bp4r = reinterpret_cast<const uint4*>
+                    (B32 + (size_t) ks0 * slice_stride + group * (WNT * TWORDS));
+
+                auto ld_slice_r = [&] (int i) -> uint4
+                {
+                    if constexpr (NV_ < 32)
+                        return lane < NV_ ? __ldcs(bp4r + (size_t) i * (slice_stride / 4) + lane)
+                                          : uint4{0, 0, 0, 0};
+                    else
+                        return __ldcs(bp4r + (size_t) i * (slice_stride / 4) + lane);
+                };
+
+                // Word fetch from the single staged slot (same layout as the pair pipeline's
+                // getw_staged with sob = 0)
+                auto getw_ring = [&] (int t, int idx) -> uint32_t
+                {
+                    const uint32_t* tp = &sh_stage[warp][t * TWORDS];
+                    if constexpr (bits == 4) return tp[idx == 0 ? ((lane + 31) & 31) : lane];
+                    else                     return tp[idx == 0 ? x_src_a : x_src_b];
+                };
+
+                uint4 ring[4];
+                #pragma unroll
+                for (int d = 0; d < 4; ++d)
+                    ring[d] = d < myn ? ld_slice_r(d) : uint4{0, 0, 0, 0};
+
+                for (int ib = 0; ib < myn; ib += 4)
+                {
+                    #pragma unroll
+                    for (int d = 0; d < 4; ++d)
+                    {
+                        const int i = ib + d;
+                        if (i >= myn) break;
+                        if (lane < NV_)
+                            *reinterpret_cast<uint4*>(&sh_stage[warp][lane * 4]) = ring[d];
+                        __syncwarp();
+                        maxwell_consume(i, getw_ring);
+                        __syncwarp();
+                        ring[d] = (i + 4 < myn) ? ld_slice_r(i + 4) : uint4{0, 0, 0, 0};
+                    }
+                }
+            }
+            else if constexpr (!HALF)
             {
                 // Integer bitrates: load the k-slice's whole WNT*TWORDS-word weight group with
                 // 16-byte vectorized loads, staged through shared memory. The group is contiguous
@@ -983,8 +1037,12 @@ __device__ __forceinline__ void exl3_gemv_body
 // LDS -> dequant -> FMA latency), so the m=1 512-thread config is bound to 2 blocks/SM
 // (<=64 regs) there: 32 resident warps and a 2x grid cap. MMODE 1 keeps minBlocks 1 -
 // its per-row fp32 accumulators need >64 regs and would spill. The mma tiers keep 1.
+// CFG 2 (Maxwell m=1 low-warp geometry, EXL3_GEMV_GEO): 128 threads, 4 blocks/SM (<=128
+// regs) — the 4-deep prefetch ring hides latency per warp instead of via 32 warps/SM.
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, (HALF || (EXL3_MAXWELL && MMODE == 0)) && CFG == 0 ? 2 : 1)
+__global__ __launch_bounds__(CFG == 0 ? 512 : CFG == 1 ? 256 : 128,
+                             (CFG == 0 && (HALF || (EXL3_MAXWELL && MMODE == 0))) ? 2
+                             : (CFG == 2 && EXL3_MAXWELL && MMODE == 0 && !HALF) ? 4 : 1)
 void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 {
     exl3_gemv_body<bits, c_fp32, cb, MMODE, CFG, SMEM_STAGE, HALF>
@@ -1009,7 +1067,9 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 // (what SlicedMultiLinear builds; size_n is the slice width) — the mgemm kernel's general
 // per-slice widths are not handled here.
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE>
-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, EXL3_MAXWELL && MMODE == 0 && CFG == 0 ? 2 : 1)
+__global__ __launch_bounds__(CFG == 0 ? 512 : CFG == 1 ? 256 : 128,
+                             CFG == 0 ? (EXL3_MAXWELL && MMODE == 0 ? 2 : 1)
+                                      : (CFG == 2 && EXL3_MAXWELL && MMODE == 0 ? 4 : 1))
 void exl3_gemv_mkernel
 (
     const half* __restrict__ A,

@@ -19,7 +19,8 @@ exl3_gemv_try_launch when the shape heuristic applies, or forced through the exl
 point. Kernel arguments and graph parameter offsets are identical to exl3_gemm_kernel.
 
 Env: EXL3_GEMV = 0 disables the path, 1/unset = heuristic (default), 2 = use wherever the hard
-constraints allow (testing).
+constraints allow (testing). EXL3_GEMV_GEO = 1 routes Maxwell m = 1 integer-bitrate calls to the
+CFG 2 low-warp geometry (4 warps/block, 4 blocks/SM, 4-deep prefetch ring); unset/0 = default.
 
 Heuristic envelope (measured, RTX 3090, 4 bpw, m <= 8, vs the tuned regular kernel): the narrow
 config wins 15-60% at attention-projection sizes (n <= 4096), the wide config wins ~8% at
@@ -52,6 +53,16 @@ static int exl3_gemv_env_smem()
 {
     const char* env = std::getenv("EXL3_GEMV_SMEM");
     if (!env) return -1;
+    return atoi(env);
+}
+
+// 1 = route Maxwell m=1 integer-bitrate GEMV calls to CFG 2 (4 warps/block, 4 blocks/SM,
+// 4-deep prefetch ring) instead of CFG 0. Measured +8% sustained on M40 at 5120x17408 3bpw
+// (tmp/geo_bench.py geometry sweep). Unset/0 = default geometry.
+static int exl3_gemv_env_geo()
+{
+    const char* env = std::getenv("EXL3_GEMV_GEO");
+    if (!env) return 0;
     return atoi(env);
 }
 
@@ -111,6 +122,16 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
     SEL_GRID(2, 1, false) SEL_GRID(2, 2, false) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
     SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
     #undef SEL_GRID
+    // CFG 2 (Maxwell low-warp geometry) is instantiated for MMODE 0 only, extraction style
+    // fixed to the vectorized smem staging (SMEM_STAGE is inert on the Maxwell VEC_SMEM path)
+    if (mmode == 0 && cfg == 2 && !smem)
+    {
+        SEL(4, 1, false, 0, 2, false) SEL(4, 2, false, 0, 2, false)
+        SEL(3, 1, false, 0, 2, false) SEL(3, 2, false, 0, 2, false)
+        SEL(3, 1, true,  0, 2, false) SEL(3, 2, true,  0, 2, false)
+        SEL(2, 1, false, 0, 2, false) SEL(2, 2, false, 0, 2, false)
+        SEL(2, 1, true,  0, 2, false) SEL(2, 2, true,  0, 2, false)
+    }
     #undef SEL
     return nullptr;
 }
@@ -129,6 +150,15 @@ static void* exl3_gemv_select_mkernel(int bits, int cb, bool c_fp32, int mmode, 
     SEL_GRID(2, 1, false) SEL_GRID(2, 2, false) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
     SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
     #undef SEL_GRID
+    // CFG 2 (Maxwell low-warp geometry), MMODE 0 only — see exl3_gemv_select_kernel
+    if (mmode == 0 && cfg == 2 && !smem)
+    {
+        SEL(4, 1, false, 0, 2, false) SEL(4, 2, false, 0, 2, false)
+        SEL(3, 1, false, 0, 2, false) SEL(3, 2, false, 0, 2, false)
+        SEL(3, 1, true,  0, 2, false) SEL(3, 2, true,  0, 2, false)
+        SEL(2, 1, false, 0, 2, false) SEL(2, 2, false, 0, 2, false)
+        SEL(2, 1, true,  0, 2, false) SEL(2, 2, true,  0, 2, false)
+    }
     #undef SEL
     return nullptr;
 }
@@ -191,8 +221,10 @@ static bool exl3_gemv_pick
 
     auto select = [&] (int cfg_) -> void*
     {
-        return half_k ? exl3_gemv_select_kernel_half(K, c_fp32, mmode, cfg_, smem)
-                      : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg_, smem);
+        // CFG 2 fixes its extraction style (vectorized smem staging); the env SMEM_STAGE toggle is inert there
+        bool smem_sel = cfg_ == 2 ? false : smem;
+        return half_k ? exl3_gemv_select_kernel_half(K, c_fp32, mmode, cfg_, smem_sel)
+                      : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg_, smem_sel);
     };
     void* narrow_kernel = select(0);
     if (!narrow_kernel) return false;
@@ -203,17 +235,22 @@ static bool exl3_gemv_pick
     int cfg = exl3_gemv_cfg(cc, size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident);
     if (cfg < 0) return false;
 
+    // EXL3_GEMV_GEO: Maxwell m=1 low-warp geometry (4 warps/block, 4 blocks/SM, 4-deep ring).
+    // Only MMODE 0 integer bitrates are instantiated; everything else keeps the default cfg.
+    if (cfg >= 0 && cc == CC_MAXWELL && mmode == 0 && !half_k && exl3_gemv_env_geo() == 1)
+        cfg = 2;
+
     void* kernel = cfg == 0 ? narrow_kernel : select(cfg);
     if (!kernel) return false;
 
-    int block_dim = cfg == 0 ? 512 : 256;
-    int cols = cfg == 0 ? 32 : 64;
+    int block_dim = cfg == 0 ? 512 : cfg == 1 ? 256 : 128;
+    int cols = cfg == 1 ? 64 : 32;
 
     int max_blocks = exl3_gemv_occupancy(device, kernel, block_dim) * num_sms;
     if (max_blocks < 1) return false;
 
     *kernel_out = kernel;
-    *mkernel_out = half_k ? nullptr : exl3_gemv_select_mkernel(K, cb, c_fp32, mmode, cfg, smem);
+    *mkernel_out = half_k ? nullptr : exl3_gemv_select_mkernel(K, cb, c_fp32, mmode, cfg, cfg == 2 ? false : smem);
     *block_dim_out = block_dim;
     *cols_out = cols;
     *max_blocks_out = max_blocks;
