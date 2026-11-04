@@ -22,6 +22,29 @@ import time
 import threading
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
+import os
+
+def _parse_draft_batch_depth() -> dict:
+    """
+    Per-batch draft depth table from EXL3_DRAFT_BATCH_DEPTH, default "1:7,2:3,3:1,4:1".
+    Maps live decode batch size -> draft depth for that round; a batch size absent from
+    the table decodes without drafting. Invalid entries are dropped with a warning.
+    """
+    raw = os.environ.get("EXL3_DRAFT_BATCH_DEPTH", "1:7,2:3,3:1,4:1")
+    table = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            batch_s, depth_s = entry.split(":")
+            batch, depth = int(batch_s), int(depth_s)
+            if batch < 1 or depth < 0:
+                raise ValueError
+            table[batch] = depth
+        except ValueError:
+            print(f" !! Warning: ignoring malformed EXL3_DRAFT_BATCH_DEPTH entry '{entry}'")
+    return table
 
 class Generator:
 
@@ -189,7 +212,22 @@ class Generator:
         self.ngram_match_min = ngram_match_min
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
-        max_q_size = max(self.num_draft_tokens + 1, max_q_size)
+
+        # Per-batch draft depth table (Maxwell M40): drafting only pays while the verify
+        # GEMV row count m = decode_jobs * (1 + depth) stays inside the flat m<=8
+        # MMODE-1 regime (measured 1.06 ms/matrix flat to m=8, 2.43 ms at m=9..16
+        # dense, ~3.37 ms at m>=17 reconstruct). Default keeps verify m <= 8 at every
+        # drafted batch size: depth 7 at batch 1 (verify m=8), 3 at batch 2 (m=8),
+        # 1 at batches 3 and 4 (m=8, m=8); batches > 4 decode without drafting.
+        # Env override: EXL3_DRAFT_BATCH_DEPTH="1:7,2:3,3:1,4:1" — a batch size absent
+        # from the table decodes without drafting.
+        self.draft_batch_depth = _parse_draft_batch_depth()
+        # The table ceiling, not the configured depth, sizes the pinned draft buffer and
+        # the token queue: the runtime depth can exceed the configured num_draft_tokens
+        # (table batch-1 depth 7 vs a configured 6)
+        self._draft_buffer_depth = max(self.num_draft_tokens,
+                                       max(self.draft_batch_depth.values(), default = 0))
+        max_q_size = max(self._draft_buffer_depth + 1, max_q_size)
 
         # Chunking/partitioning
         self.max_batch_size = max_batch_size
@@ -218,7 +256,7 @@ class Generator:
                 pin_memory = True
             )
             self.draft_ids_pinned = torch.empty(
-                (max_batch_size, self.num_draft_tokens),
+                (max_batch_size, self._draft_buffer_depth),
                 dtype = torch.long,
                 pin_memory = True
             )
@@ -550,19 +588,21 @@ class Generator:
         if self.recurrent_cache is not None:
             self.recurrent_checkpoint()
 
-        # Generation with draft model. Drafting is batch-conditional: it only runs while the
-        # live decode batch is <= 4 streams. Measured M40 crossover: batch <= 4 drafting ON
-        # wins (4 streams: 10.69 aggregate ON vs 9.54 OFF), batch = 8 drafting OFF wins
-        # (8.83 OFF vs 6.98 ON) — at m>4 every stream pays its own draft forwards per step
-        # on top of an already ~2x costlier m>1 GEMV, so the draft pass is skipped there and
-        # each stream decodes one verified token per step. mtp_last_hidden is refreshed by
-        # every target forward, so drafting resumes seamlessly when the batch drops back.
+        # Generation with draft model. Drafting is batch-conditional via a per-batch depth
+        # table (self.draft_batch_depth, env EXL3_DRAFT_BATCH_DEPTH): each live decode batch
+        # size drafts at the table depth, which caps the verify GEMV at decode_jobs * (1 +
+        # depth) rows. The default table keeps verify inside the flat m<=8 MMODE-1 regime
+        # (1.06 ms/matrix) at every drafted batch size: batch 1 drafts deep (7), batches 2-4
+        # shallow (3, 1, 1), batch > 4 decodes without drafting (there verify m >= 9..16
+        # costs 2.43 ms/matrix dense and every stream pays its own draft forwards on top).
+        # Prior measured M40 crossovers: 4 streams depth-6-always 10.69 aggregate vs 9.54
+        # draft-off (depth 6 verifies at m=28, ~3.2x matrix cost); 8 streams draft-off 18.82.
+        # mtp_last_hidden is refreshed by every target forward, so drafting resumes
+        # seamlessly when the batch drops back into the table.
         decode_jobs = sum(1 for job in self.active_jobs if job.is_prefill_done())
-        # Env override for measurement only: EXL3_DRAFT_MAX_JOBS (default 4, the measured M40
-        # crossover with the old m>16 dense-verify cost)
-        import os as _os
-        _draft_max_jobs = int(_os.environ.get("EXL3_DRAFT_MAX_JOBS", "4"))
-        if self.draft_model and decode_jobs <= _draft_max_jobs:
+        _draft_depth = self.draft_batch_depth.get(decode_jobs, 0) if self.draft_model else 0
+        if _draft_depth:
+            self.num_draft_tokens = _draft_depth
             if self.dflash_draft:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results)
                 self.iterate_gen(results, draft_tokens)
