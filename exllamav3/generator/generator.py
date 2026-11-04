@@ -551,14 +551,14 @@ class Generator:
             self.recurrent_checkpoint()
 
         # Generation with draft model. Drafting is batch-conditional: it only runs while the
-        # live decode batch is a single stream. With batch > 1 every stream pays its own draft
-        # forwards per step on top of an already ~2x costlier m>1 GEMV (measured M40: 8 streams
-        # with drafting aggregate 6.98 t/s < 9.93 single), so the draft pass is skipped under
-        # batch and each stream decodes one verified token per step. mtp_last_hidden is
-        # refreshed by every target forward, so drafting resumes seamlessly when the batch
-        # drops back to one stream.
+        # live decode batch is <= 4 streams. Measured M40 crossover: batch <= 4 drafting ON
+        # wins (4 streams: 10.69 aggregate ON vs 9.54 OFF), batch = 8 drafting OFF wins
+        # (8.83 OFF vs 6.98 ON) — at m>4 every stream pays its own draft forwards per step
+        # on top of an already ~2x costlier m>1 GEMV, so the draft pass is skipped there and
+        # each stream decodes one verified token per step. mtp_last_hidden is refreshed by
+        # every target forward, so drafting resumes seamlessly when the batch drops back.
         decode_jobs = sum(1 for job in self.active_jobs if job.is_prefill_done())
-        if self.draft_model and decode_jobs == 1:
+        if self.draft_model and decode_jobs <= 4:
             if self.dflash_draft:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results)
                 self.iterate_gen(results, draft_tokens)
