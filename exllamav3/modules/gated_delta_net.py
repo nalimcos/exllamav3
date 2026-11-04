@@ -1139,7 +1139,12 @@ class GatedDeltaNet(Module):
                 g = F.softplus(gf, threshold = 20.0).mul_(-decay)
             del gf
         else:
-            if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
+            # Bundled only below the Maxwell reconstruct routing threshold: at rows >= 17 the
+            # dense mgemm halves in occupancy (measured 6.8 GB/s vs 13.6 at m <= 16) while the
+            # separate LinearEXL3 forwards below route to reconstruct_hgemm (EXL3_RECONSTRUCT_MIN_M)
+            from .quant.exl3 import RECONSTRUCT_MIN_M as _recon_min_m
+            _qkvz_max = 32 if _recon_min_m <= 0 else min(32, _recon_min_m - 1)
+            if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= _qkvz_max:
                 qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
             else:
                 qkv = self.qkv_proj.forward(x, params, out_dtype = _proj_dtype)

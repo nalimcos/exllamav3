@@ -13,6 +13,16 @@ RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
 
+# Maxwell small-m routing (measured on M40, sm_52, 3 bpw mul1): the dense exl3_gemm tile kernel
+# holds ~13.6 GB/s through m = 16 but its occupancy halves at m >= 17 (6.8 GB/s at 17..32,
+# 4.6 at 33..48, 3.4 at 56..64, worse above) while reconstruct+GemmEx fp16/COMPUTE_32F stays
+# ~flat at 3.3-3.4 ms per 5120x17408 matrix out to m = 64. Crossover: dense wins 9..16,
+# reconstruct wins 17..128 (probe_mgemm_routes.py). Default 17 routes rows >= 17 to
+# reconstruct_hgemm; set EXL3_RECONSTRUCT_MIN_M = 0 to restore the old threshold (144) for
+# all m <= 144, or a large value to disable.
+RECONSTRUCT_MIN_M = int(os.environ.get("EXL3_RECONSTRUCT_MIN_M", "17"))
+assert RECONSTRUCT_MIN_M >= 0
+
 class LinearEXL3:
 
     quant_type: str = "exl3"
@@ -137,6 +147,9 @@ class LinearEXL3:
         reconstruct = params.get("reconstruct")
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
+            if RECONSTRUCT_MIN_M > 0 and RECONSTRUCT_MIN_M <= rows < AUTO_RECONSTRUCT_THRESHOLD \
+                    and not self.config.infer_params.no_reconstruct:
+                return self.reconstruct_hgemm(x, out_dtype)
             if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
                 dtype = out_dtype or self.default_out_dtype
                 return self.bc.run_alloc(x, self.out_features, dtype == torch.float)

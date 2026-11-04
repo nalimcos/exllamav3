@@ -558,7 +558,11 @@ class Generator:
         # each stream decodes one verified token per step. mtp_last_hidden is refreshed by
         # every target forward, so drafting resumes seamlessly when the batch drops back.
         decode_jobs = sum(1 for job in self.active_jobs if job.is_prefill_done())
-        if self.draft_model and decode_jobs <= 4:
+        # Env override for measurement only: EXL3_DRAFT_MAX_JOBS (default 4, the measured M40
+        # crossover with the old m>16 dense-verify cost)
+        import os as _os
+        _draft_max_jobs = int(_os.environ.get("EXL3_DRAFT_MAX_JOBS", "4"))
+        if self.draft_model and decode_jobs <= _draft_max_jobs:
             if self.dflash_draft:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results)
                 self.iterate_gen(results, draft_tokens)
