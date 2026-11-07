@@ -1142,7 +1142,7 @@ def _paged_attn_decode_combine_kernel(
     tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None] & (offs_d < V_DIM)[None, :])
 
 
-def decode_row_layout(q_len: int, group_size: int, hd_pad: int) -> tuple[int, int]:
+def decode_row_layout(q_len: int, group_size: int, hd_pad: int, min_rows: int = 16) -> tuple[int, int]:
     """(BLOCK_ROWS, row blocks per kv head) for the decode split / combine kernels.
 
     A kv head's rows are its q_len * group_size (query position, sibling q head) pairs, packed densely
@@ -1150,9 +1150,10 @@ def decode_row_layout(q_len: int, group_size: int, hd_pad: int) -> tuple[int, in
     once. (Padding query positions up to a power of two and giving a program 16 / that many heads used
     to split a 6-head group across three programs for a 5-token verify step, tripling the tile work.)
     32 rows pays off at every head_dim up to 256 on Ampere, Blackwell and RDNA3 alike, the fp32
-    accumulator notwithstanding, since the tile loads dominate; at least 16 rows, the dots' minimum."""
+    accumulator notwithstanding, since the tile loads dominate. Tensor-core dots need at least 16 rows;
+    Maxwell's FMA path supports 8, avoiding the padded rows and high register pressure for GQA decode."""
     rows = q_len * group_size
-    block_rows = max(16, min(32, triton.next_power_of_2(rows)))
+    block_rows = max(min_rows, min(32, triton.next_power_of_2(rows)))
     return block_rows, triton.cdiv(rows, block_rows)
 
 
@@ -1275,7 +1276,8 @@ def paged_attn_triton_decode(
     candidates = halving_ladder(cfg_block_n) if block_n is None else [block_n]
 
     group_size = n_q_heads // n_kv_heads
-    block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad)
+    min_rows = 8 if _cc_major(q.device) == 5 else 16
+    block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad, min_rows)
     num_pages_per_seq = block_table.shape[1]
 
     # Upper bound on kv length: caller-provided hint, else from the block table shape
@@ -1289,7 +1291,7 @@ def paged_attn_triton_decode(
     dev = q.device.index
     if dev not in _decode_sm_count:
         _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
-    target = 2 * _decode_sm_count[dev]
+    target = (3 if _cc_major(q.device) == 5 else 2) * _decode_sm_count[dev]
 
     def prepare(block_n):
         """Split count, partial buffers and the split kernel's argument list for one kv tile."""

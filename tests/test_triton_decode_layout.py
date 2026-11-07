@@ -40,6 +40,7 @@ def test_row_layout_shapes():
     assert decode_row_layout(1, 16, 128) == (16, 1)
     assert decode_row_layout(8, 8, 128) == (32, 2)
     assert decode_row_layout(1, 1, 256) == (16, 1)
+    assert decode_row_layout(1, 6, 256, min_rows = 8) == (8, 1)
 
 
 @pytest.mark.parametrize("head_dim", [128, 256])

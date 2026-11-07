@@ -313,12 +313,13 @@ class BCAttn:
         group_size = qh // kvh
 
         block_n, split_warps, split_stages = attn_decode_config(dev, hd_pad)
-        block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad)
+        min_rows = 8 if torch.cuda.get_device_capability(dev)[0] == 5 else 16
+        block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad, min_rows)
         programs = bsz * kvh * h_blocks
 
         # The live split count and split length are runtime kernel arguments derived from the
         # block-table bound per call (patched into the graph); the grid is sized to the cap
-        target = 2 * _get_sm_count(dev)
+        target = (3 if torch.cuda.get_device_capability(dev)[0] == 5 else 2) * _get_sm_count(dev)
         splits_cap = max(1, min(target // programs, 128))
         window_left, window_right = _normalize_window(self.window_size)
 
