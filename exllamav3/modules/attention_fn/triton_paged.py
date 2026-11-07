@@ -1051,6 +1051,150 @@ def _paged_attn_decode_split_kernel(
 
 
 @triton.jit
+def _paged_attn_decode_split6_kernel(
+    q,
+    k_cache,
+    v_cache,
+    block_table,
+    cache_seqlens,
+    out,
+    partial_o,
+    partial_ml,
+    k_scales,
+    v_scales,
+    h32,
+    split_len,
+    num_pages_per_seq,
+    num_splits,
+    sinks,
+    QCK: tl.constexpr,
+    QCV: tl.constexpr,
+    q_len: tl.constexpr,
+    kv_append_len: tl.constexpr,
+    n_q_heads: tl.constexpr,
+    n_kv_heads: tl.constexpr,
+    page_size: tl.constexpr,
+    head_dim: tl.constexpr,
+    HD_PAD: tl.constexpr,
+    scale: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    WINDOW_RIGHT: tl.constexpr,
+    SOFTCAP: tl.constexpr,
+    FINAL: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Maxwell Q4 decode for six real GQA rows: 4 + 2 row dots reduce padded FMA work
+    while both row groups share each K/V tile. Partials retain the generic eight-row layout
+    so the standard combine kernel is unchanged."""
+    pid = tl.program_id(0)
+    split = tl.program_id(1)
+    batch = pid // n_kv_heads
+    kv_head = pid - batch * n_kv_heads
+
+    rows_a = tl.arange(0, 4)
+    rows_b = tl.arange(0, 2)
+    offs_d = tl.arange(0, HD_PAD)
+    q_base_a = (batch * n_q_heads + kv_head * 6 + rows_a) * head_dim
+    q_base_b = (batch * n_q_heads + kv_head * 6 + 4 + rows_b) * head_dim
+    q_a = tl.load(q + q_base_a[:, None] + offs_d[None, :])
+    q_b = tl.load(q + q_base_b[:, None] + offs_d[None, :])
+    q_a = _rot_h32(q_a, h32, 4, HD_PAD)
+    q_b = _rot_h32(q_b, h32, 2, HD_PAD)
+
+    total_k_len = tl.load(cache_seqlens + batch) + kv_append_len
+    q_abs = total_k_len - 1
+    if WINDOW_LEFT >= 0:
+        w_lo = tl.maximum(total_k_len - 1 - WINDOW_LEFT, 0)
+        w_lo = (w_lo // BLOCK_N) * BLOCK_N
+        w_span = tl.cdiv(tl.cdiv(total_k_len - w_lo, num_splits), BLOCK_N) * BLOCK_N
+        n_start = w_lo + split * w_span
+        n_end = tl.minimum(n_start + w_span, total_k_len)
+    else:
+        n_start = split * split_len
+        n_end = tl.minimum(n_start + split_len, total_k_len)
+
+    m_a = tl.full((4,), -float("inf"), tl.float32)
+    m_b = tl.full((2,), -float("inf"), tl.float32)
+    l_a = tl.zeros((4,), tl.float32)
+    l_b = tl.zeros((2,), tl.float32)
+    acc_a = tl.zeros((4, HD_PAD), tl.float32)
+    acc_b = tl.zeros((2, HD_PAD), tl.float32)
+
+    for n0 in range(n_start, n_end, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        page = offs_n // page_size
+        page_off = offs_n - page * page_size
+        valid_n = offs_n < n_end
+        phys = tl.load(block_table + batch * num_pages_per_seq + page, mask = valid_n, other = 0)
+        tok_rows = phys * page_size + page_off
+        k_tile = _qc_load_kt(k_cache, k_scales, tok_rows, kv_head, offs_d, valid_n,
+                             QCK, n_kv_heads, head_dim, HD_PAD)
+        scores_a = tl.dot(q_a, k_tile) * scale
+        scores_b = tl.dot(q_b, k_tile) * scale
+        if SOFTCAP > 0.0:
+            scores_a = (2.0 / (1.0 + tl.exp(-2.0 * scores_a / SOFTCAP)) - 1.0) * SOFTCAP
+            scores_b = (2.0 / (1.0 + tl.exp(-2.0 * scores_b / SOFTCAP)) - 1.0) * SOFTCAP
+
+        valid = valid_n[None, :]
+        if CAUSAL:
+            valid = valid & (offs_n[None, :] <= q_abs)
+        if WINDOW_LEFT >= 0:
+            valid = valid & (offs_n[None, :] >= q_abs - WINDOW_LEFT)
+        if WINDOW_RIGHT >= 0:
+            valid = valid & (offs_n[None, :] <= q_abs + WINDOW_RIGHT)
+        scores_a = tl.where(valid, scores_a, -float("inf"))
+        scores_b = tl.where(valid, scores_b, -float("inf"))
+
+        m_new_a = tl.maximum(m_a, tl.max(scores_a, axis = 1))
+        m_new_b = tl.maximum(m_b, tl.max(scores_b, axis = 1))
+        m_exp_a = tl.where(m_new_a == -float("inf"), 0.0, m_new_a)
+        m_exp_b = tl.where(m_new_b == -float("inf"), 0.0, m_new_b)
+        p_a = tl.exp(scores_a - m_exp_a[:, None])
+        p_b = tl.exp(scores_b - m_exp_b[:, None])
+        p_a = tl.where(valid, p_a, 0.0)
+        p_b = tl.where(valid, p_b, 0.0)
+        alpha_a = tl.where(m_a == -float("inf"), 0.0, tl.exp(m_a - m_exp_a))
+        alpha_b = tl.where(m_b == -float("inf"), 0.0, tl.exp(m_b - m_exp_b))
+        l_new_a = l_a * alpha_a + tl.sum(p_a, axis = 1)
+        l_new_b = l_b * alpha_b + tl.sum(p_b, axis = 1)
+
+        v_tile = _qc_load_v(v_cache, v_scales, tok_rows, kv_head, offs_d, valid_n,
+                            QCV, n_kv_heads, head_dim, HD_PAD)
+        acc_a = acc_a * alpha_a[:, None] + tl.dot(p_a.to(v_tile.dtype), v_tile)
+        acc_b = acc_b * alpha_b[:, None] + tl.dot(p_b.to(v_tile.dtype), v_tile)
+        m_a = m_new_a
+        m_b = m_new_b
+        l_a = l_new_a
+        l_b = l_new_b
+
+    if FINAL:
+        out_a = acc_a / tl.where(l_a[:, None] == 0.0, 1.0, l_a[:, None])
+        out_b = acc_b / tl.where(l_b[:, None] == 0.0, 1.0, l_b[:, None])
+        out_a = _rot_h32(out_a, h32, 4, HD_PAD)
+        out_b = _rot_h32(out_b, h32, 2, HD_PAD)
+        tl.store(out + q_base_a[:, None] + offs_d[None, :], out_a)
+        tl.store(out + q_base_b[:, None] + offs_d[None, :], out_b)
+    else:
+        if split < num_splits:
+            po_base = (pid * num_splits + split) * BLOCK_ROWS * HD_PAD
+            tl.store(partial_o + po_base + rows_a[:, None] * HD_PAD + offs_d[None, :], acc_a)
+            tl.store(partial_o + po_base + (4 + rows_b)[:, None] * HD_PAD + offs_d[None, :], acc_b)
+            tl.store(partial_o + po_base + (6 + rows_b)[:, None] * HD_PAD + offs_d[None, :],
+                     tl.zeros((2, HD_PAD), tl.float32))
+            ml_base = (pid * num_splits + split) * BLOCK_ROWS * 2
+            tl.store(partial_ml + ml_base + rows_a * 2, m_a)
+            tl.store(partial_ml + ml_base + rows_a * 2 + 1, l_a)
+            tl.store(partial_ml + ml_base + (4 + rows_b) * 2, m_b)
+            tl.store(partial_ml + ml_base + (4 + rows_b) * 2 + 1, l_b)
+            tl.store(partial_ml + ml_base + (6 + rows_b) * 2,
+                     tl.full((2,), -float("inf"), tl.float32))
+            tl.store(partial_ml + ml_base + (6 + rows_b) * 2 + 1, tl.zeros((2,), tl.float32))
+
+
+@triton.jit
 def _paged_attn_decode_combine_kernel(
     partial_o,
     partial_ml,
@@ -1278,6 +1422,12 @@ def paged_attn_triton_decode(
     group_size = n_q_heads // n_kv_heads
     min_rows = 8 if _cc_major(q.device) == 5 else 16
     block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad, min_rows)
+    split6 = (
+        _cc_major(q.device) == 5 and q_len == 1 and group_size == 6 and
+        qck == 4 and qcv == 4 and hd_pad == head_dim and not has_sinks
+    )
+    split_kernel = _paged_attn_decode_split6_kernel if split6 else _paged_attn_decode_split_kernel
+    split_maxnreg = 168 if split6 else None
     num_pages_per_seq = block_table.shape[1]
 
     # Upper bound on kv length: caller-provided hint, else from the block table shape
@@ -1321,16 +1471,16 @@ def paged_attn_triton_decode(
                     window_right >= 0, has_sinks, num_warps, num_stages, candidates[0])
         block_n = pick_config(
             q.device, "paged_attn_decode", pick_key, candidates,
-            lambda bn: shared_bytes(_paged_attn_decode_split_kernel, prepare(bn)[0],
-                                    num_warps = num_warps, num_stages = num_stages))
+            lambda bn: shared_bytes(split_kernel, prepare(bn)[0], num_warps = num_warps,
+                                    num_stages = num_stages, maxnreg = split_maxnreg))
         args, num_splits, partial_o, partial_ml = prepare(block_n)
 
         if k is not None and kv_append_len:
             _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, bsz, kv_append_len,
                              n_kv_heads, page_size, head_dim)
 
-        _paged_attn_decode_split_kernel[(programs, num_splits)](
-            *args, num_warps = num_warps, num_stages = num_stages,
+        split_kernel[(programs, num_splits)](
+            *args, num_warps = num_warps, num_stages = num_stages, maxnreg = split_maxnreg,
         )
 
         if num_splits > 1:

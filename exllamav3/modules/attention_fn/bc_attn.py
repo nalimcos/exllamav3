@@ -74,11 +74,12 @@ _SPLIT_WARPS, _SPLIT_STAGES = ATTN_SPLIT_WARPS_STAGES
 
 
 def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
-                    num_warps: int, num_stages: int, pointer_range_32: bool = False):
+                    num_warps: int, num_stages: int, pointer_range_32: bool = False,
+                    maxnreg: int | None = None):
     """pointer_range_32 (AMD backend): every pointer argument addresses an allocation under 2 GB, which lets
     the compiler use buffer loads/stores; the caller must have checked the allocations"""
     key = (device.index, fn.__name__, tuple(sorted(constexprs.items())), num_warps, num_stages,
-           tuple(sorted(signature.items())), pointer_range_32)
+           tuple(sorted(signature.items())), pointer_range_32, maxnreg)
     k = _kernel_cache.get(key)
     if k is None:
         import triton
@@ -99,7 +100,10 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
                 attrs.setdefault((fn.arg_names.index(name),), []).append(["tt.pointer_range", 32])
         with torch.cuda.device(device):
             src = ASTSource(fn = fn, signature = sig, constexprs = constexprs, attrs = attrs)
-            ck = triton.compile(src, options = {"num_warps": num_warps, "num_stages": num_stages})
+            options = {"num_warps": num_warps, "num_stages": num_stages}
+            if maxnreg is not None:
+                options["maxnreg"] = maxnreg
+            ck = triton.compile(src, options = options)
             limit = smem_limit(device)
             if ck.metadata.shared > limit:
                 if os.environ.get("EXL3_TRITON_SMEM_DEBUG"):
@@ -301,6 +305,7 @@ class BCAttn:
             combine_subtiles,
             decode_row_layout,
             _paged_attn_decode_split_kernel,
+            _paged_attn_decode_split6_kernel,
             _paged_attn_decode_combine_kernel,
             _paged_kv_update_kernel,
             _normalize_window,
@@ -313,13 +318,19 @@ class BCAttn:
         group_size = qh // kvh
 
         block_n, split_warps, split_stages = attn_decode_config(dev, hd_pad)
-        min_rows = 8 if torch.cuda.get_device_capability(dev)[0] == 5 else 16
+        maxwell = torch.cuda.get_device_capability(dev)[0] == 5
+        min_rows = 8 if maxwell else 16
         block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad, min_rows)
         programs = bsz * kvh * h_blocks
+        split6 = (
+            maxwell and q_len == 1 and group_size == 6 and
+            self.k_bits == 4 and self.v_bits == 4 and hd_pad == hd and self.sinks is None
+        )
+        split_fn = _paged_attn_decode_split6_kernel if split6 else _paged_attn_decode_split_kernel
 
         # The live split count and split length are runtime kernel arguments derived from the
         # block-table bound per call (patched into the graph); the grid is sized to the cap
-        target = (3 if torch.cuda.get_device_capability(dev)[0] == 5 else 2) * _get_sm_count(dev)
+        target = (3 if maxwell else 2) * _get_sm_count(dev)
         splits_cap = max(1, min(target // programs, 128))
         window_left, window_right = _normalize_window(self.window_size)
 
@@ -346,8 +357,8 @@ class BCAttn:
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
             BLOCK_ROWS = block_rows, BLOCK_N = block_n,
         )
-        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, split_warps, split_stages,
-                                  pointer_range_32 = self._pointer_range_32())
+        k_split = _compile_kernel(dev, split_fn, sig, consts, split_warps, split_stages,
+                                  pointer_range_32 = self._pointer_range_32(), maxnreg = 168 if split6 else None)
 
         sig_c = {
             "partial_o": "*fp32:16", "partial_ml": "*fp32:16", "out": "*fp16:16", "h32": "*fp16:16",
