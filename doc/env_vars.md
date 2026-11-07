@@ -169,6 +169,14 @@ way in the top-k regime: six to eight GEMV launches collapse into two. A/B switc
 eager path only; the graphed path (`EXL3_BC_DSA`) builds its own fan and is not affected.
 Layers whose projections mix quantization formats or bitrates decline the fan by themselves.
 
+### `EXL3_PAP_CUBLAS` (default: `1`)
+
+On pre-Ampere CUDA GPUs, use chunked FP32 cuBLAS GEMMs for batch-1 causal Q4 paged-cache
+prefill with head_dim 256. K/V are dequantized once per layer/chunk, and online softmax and
+output accumulation stay FP32. This replaces the Triton prefill kernel on the supported shape;
+other shapes and decode are unchanged. The temporary K/V and chunk workspaces are included in
+autosplit memory measurement. Set to `0` to fall back to Triton.
+
 ### `EXL3_QC_STAGING` (default: `1`)
 
 How quantized K/V caches feed the attention kernels (replaces the former `EXL3_QC_ATTN`). Only

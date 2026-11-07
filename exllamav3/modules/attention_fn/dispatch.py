@@ -2,6 +2,7 @@ import torch
 from ...cache import CacheLayer, Cache, CacheLayer_quant
 from .common import AttnArgs, AttnFn
 from .bighead_scalar import fn_bighead_scalar_attn
+from .cublas_paged import fn_cublas_paged_attn_prefill_qc
 from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
 from .xformers import fn_xformers_cutlass_fallback_cache, fn_xformers_cutlass_fallback_nocache
 from .triton_paged import (
@@ -33,6 +34,7 @@ _fns_triton_fast: list[AttnFn] = [
 _fns_qc: list[AttnFn] = [
     fn_fa75_decode_qc,          # opt-in (EXL3_ATTN_FA75) Maxwell CUDA-core decode; None otherwise
     fn_triton_paged_attn_decode_qc,
+    fn_cublas_paged_attn_prefill_qc,  # pre-Ampere; EXL3_PAP_CUBLAS=0 falls through to Triton
     fn_triton_paged_attn_prefill_qc,
 ]
 

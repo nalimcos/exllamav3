@@ -1054,8 +1054,21 @@ class Attention(Module):
         # allocate (and drop) the worst case here for the device budget. QSA bounds its dense
         # prefill and stages a small window; MLA/DSA caches have their own measure
         if quant and not isinstance(layer, QSAPlanes) and self.qsa_indexer is None:
+            from .attention_fn.cublas_paged import _cublas_prefill_available
             from .attention_fn.triton_paged import _qc_staging_effective
-            if _qc_staging_effective(self.device):
+            if (
+                _cublas_prefill_available(self.device) and self.head_dim == 256
+                and layer.k_bits == 4 and layer.v_bits == 4
+            ):
+                # Peak staging: both fp16 buffers + one fp32 buffer while K converts, then
+                # one fp16 + two fp32 buffers while V converts. The per-chunk score/output
+                # workspaces coexist with the final two fp32 buffers, not with that peak.
+                values = layer.qk.shape[0] * PAGE_SIZE * layer.token_dim
+                chunk = min(256, params["batch_shape"][1])
+                workspace = 4 * self.num_q_heads * chunk * (2 * self.head_dim + 256)
+                t = torch.empty((10 * values + workspace,), dtype = torch.uint8, device = self.device)
+                del t
+            elif _qc_staging_effective(self.device):
                 n = 2 * layer.qk.shape[0] * PAGE_SIZE * layer.token_dim
                 t = torch.empty((n,), dtype = torch.half, device = self.device)
                 del t
