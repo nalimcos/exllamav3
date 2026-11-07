@@ -18,6 +18,7 @@
 #include "add.cuh"
 #include "dflash2.cuh"
 #include "fa75_decode.cuh"
+#include "attn_q4_maxwell.cuh"
 
 #include "quant/quantize.cuh"
 #include "quant/pack.cuh"
@@ -223,6 +224,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 #endif
     m.def("rope", &rope, "rope");
     m.def("fa75_decode_qc", &fa75_decode_qc, "fa75_decode_qc");
+    m.def("q4m_prepare", &q4m_prepare, "q4m_prepare");
+    m.def("q4m_attention", &q4m_attention, "q4m_attention");
+    m.def("q4m_resource_info", &q4m_resource_info, "q4m_resource_info");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");
     m.def("silu_oai_mul", &silu_oai_mul, "silu_oai_mul");

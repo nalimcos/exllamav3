@@ -1,6 +1,7 @@
 import torch
 from ...cache import CacheLayer, Cache, CacheLayer_quant
 from .common import AttnArgs, AttnFn
+from .maxwell_q4 import fn_maxwell_q4_decode
 from .bighead_scalar import fn_bighead_scalar_attn
 from .cublas_paged import fn_cublas_paged_attn_prefill_qc
 from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
@@ -32,6 +33,7 @@ _fns_triton_fast: list[AttnFn] = [
 # would silently attend over just the new K/V rows and ignore the cached context, so quant-direct calls only
 # ever dispatch over the qc-aware functions
 _fns_qc: list[AttnFn] = [
+    fn_maxwell_q4_decode,     # opt-in native Maxwell 24Q/4KV Q4 decode
     fn_fa75_decode_qc,          # opt-in (EXL3_ATTN_FA75) Maxwell CUDA-core decode; None otherwise
     fn_triton_paged_attn_decode_qc,
     fn_cublas_paged_attn_prefill_qc,  # pre-Ampere; EXL3_PAP_CUBLAS=0 falls through to Triton
