@@ -13,6 +13,7 @@ pytestmark = pytest.mark.skipif(
     reason="requires Maxwell sm_52",
 )
 DEV = torch.device("cuda:0")
+NATIVE_MODE = os.environ.get("EXL3_ATTN_Q4M", "1")
 R32 = 1.0 / math.sqrt(32.0)
 LOG2E = math.log2(math.e)
 
@@ -96,7 +97,8 @@ def check_close(out, ref, label=""):
 
 def run_native(case, splits=30, scale=1 / 16):
     q, kc, ks, vc, vs, bt, past, out, qr, po, ml = case
-    ext.q4m_attention(q, kc, ks, vc, vs, bt, past, out, qr, po, ml, scale, splits)
+    attention = ext.q4m_laneD_attention if NATIVE_MODE == "2" else ext.q4m_attention
+    attention(q, kc, ks, vc, vs, bt, past, out, qr, po, ml, scale, splits)
     return out
 
 
@@ -242,11 +244,18 @@ def test_decode_vs_prefill_and_eager_dispatch(monkeypatch):
         cu_seqlens=None, max_seqlen=None, window_size=None, softcap=0.0,
         block_table=bt, cache_seqlens=past, q_cache=(kc, ks, vc, vs, 4, 4),
     )
-    monkeypatch.setenv("EXL3_ATTN_Q4M", "1")
+    monkeypatch.setenv("EXL3_ATTN_Q4M", NATIVE_MODE)
     native = fn_maxwell_q4_decode(args)
-    assert native is not None
-    torch.testing.assert_close(native, prefill, atol=2e-3, rtol=0)
-    assert torch.isfinite(native).all()
+    if native is None:
+        resources = ext.q4m_laneD_resource_info()
+        resource_failure = (
+            resources[2] > 96 or resources[3] > 18080 or
+            resources[4] != 0 or resources[5] < 5
+        )
+        assert NATIVE_MODE == "2" and resource_failure
+    else:
+        torch.testing.assert_close(native, prefill, atol=2e-3, rtol=0)
+        assert torch.isfinite(native).all()
     monkeypatch.delenv("EXL3_ATTN_Q4M")
     assert fn_maxwell_q4_decode(args) is None
 

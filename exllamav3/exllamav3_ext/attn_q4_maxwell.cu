@@ -520,6 +520,395 @@ void q4m_split_kernel(
     }
 }
 
+struct LaneDHot
+{
+    float red03[8][36];
+    float red45[8][36];
+    float score[8][6];
+    float2 pa[8][6];
+    uint32_t flags[8];
+};
+
+struct LaneDHotArena
+{
+    LaneDHot warps[4];
+    float q[6][HD];
+};
+
+union LaneDArena
+{
+    LaneDHotArena hot;
+    float stage[2][6][HD];
+};
+
+static_assert(sizeof(LaneDHot) == 2912);
+static_assert(sizeof(LaneDHotArena) == 17792);
+static_assert(sizeof(LaneDArena) == 17792);
+
+__device__ __forceinline__ void laneD_qk_row(
+    float& score, const float (&k)[8], const float4& q0, const float4& q1)
+{
+    score = fmaf(q0.x, k[0], 0.0f);
+    score = fmaf(q0.y, k[1], score);
+    score = fmaf(q0.z, k[2], score);
+    score = fmaf(q0.w, k[3], score);
+    score = fmaf(q1.x, k[4], score);
+    score = fmaf(q1.y, k[5], score);
+    score = fmaf(q1.z, k[6], score);
+    score = fmaf(q1.w, k[7], score);
+}
+
+template<int N>
+__device__ __forceinline__ void laneD_pv_dimension(
+    float (&o)[6][8], const float (&p)[6], uint32_t word, float a, float b)
+{
+    static_assert(N >= 0 && N < 8);
+    float x = fmaf((float) ((word >> (4 * N)) & 15), a, b);
+    #pragma unroll
+    for (int r = 0; r < 6; ++r)
+        o[r][N] = fmaf(p[r], x, o[r][N]);
+    if constexpr (N < 7)
+        laneD_pv_dimension<N + 1>(o, p, word, a, b);
+}
+
+template<int R>
+__device__ __forceinline__ void laneD_rescale_pair(
+    float (&o)[6][8], float a0, float a1)
+{
+    static_assert(R == 0 || R == 2 || R == 4);
+    #pragma unroll
+    for (int j = 0; j < 8; ++j)
+    {
+        o[R][j] *= a0;
+        o[R + 1][j] *= a1;
+    }
+}
+
+__global__ __launch_bounds__(128, 5)
+void q4m_laneD_split_kernel(
+    const float* __restrict__ q_rot,
+    const uint32_t* __restrict__ K,
+    const uint32_t* __restrict__ V,
+    const half* __restrict__ SK,
+    const half* __restrict__ SV,
+    const int* __restrict__ block_table,
+    const int* __restrict__ cache_seqlens,
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_ml,
+    int num_pages_per_seq,
+    int S)
+{
+    __shared__ __align__(16) LaneDArena arena;
+    __shared__ __align__(16) float warp_m[4][6];
+    __shared__ __align__(16) float warp_l[4][6];
+    __shared__ __align__(16) float weights[2][2][6];
+
+    int tid = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int cohort = warp >> 1;
+    int warp_half = warp & 1;
+    int program = blockIdx.x;
+    int split = blockIdx.y;
+    int h = program & 3;
+    int b = program >> 2;
+    int past = cache_seqlens[b];
+    int kv_end = past + 1;
+    int T = (kv_end + TILE - 1) / TILE;
+    int t0 = T * split / S;
+    int t1 = T * (split + 1) / S;
+
+    if (t0 == t1)
+    {
+        if (tid < 6)
+        {
+            size_t ml_base = (((size_t) program * S + split) * 6) * 2;
+            partial_ml[ml_base + 2 * tid] = -CUDART_INF_F;
+            partial_ml[ml_base + 2 * tid + 1] = 0.0f;
+        }
+        return;
+    }
+
+    const float* q_base = q_rot + (((size_t) b * QH + 6 * h) * HD);
+    float4* q_dst = reinterpret_cast<float4*>(&arena.hot.q[0][0]);
+    const float4* q_src = reinterpret_cast<const float4*>(q_base);
+    #pragma unroll
+    for (int i = 0; i < 3; ++i) q_dst[tid + 128 * i] = q_src[tid + 128 * i];
+    float o[6][8];
+    #pragma unroll
+    for (int r = 0; r < 6; ++r)
+    {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) o[r][j] = 0.0f;
+    }
+    float m = -CUDART_INF_F;
+    float l = 0.0f;
+
+    LaneDHot& hot = arena.hot.warps[warp];
+    int n0 = TILE * t0;
+    int tiles_left = t1 - t0;
+    int valid_left = kv_end - n0 - 32 * warp;
+    __syncthreads();
+    for (; tiles_left > 0; --tiles_left, n0 += TILE, valid_left -= TILE - 32)
+    {
+        int physical_page = block_table[b * num_pages_per_seq + (n0 >> 8)];
+        int physical_row0 = physical_page * PAGE + (n0 & 255);
+        const uint32_t* k_ptr = K + ((size_t) physical_row0 * KVH + h) * 32
+                                + 32 * warp * (KVH * 32) + lane;
+        const uint32_t* v_ptr = V + ((size_t) physical_row0 * KVH + h) * 32
+                                + 32 * warp * (KVH * 32) + lane;
+        const half* sk_ptr = SK + ((size_t) physical_row0 * KVH + h) * 8
+                             + 32 * warp * (KVH * 8) + (lane >> 2);
+        const half* sv_ptr = SV + ((size_t) physical_row0 * KVH + h) * 8
+                             + 32 * warp * (KVH * 8) + (lane >> 2);
+
+        #pragma unroll 1
+        for (int batch = 0; batch < 4; ++batch)
+        {
+            #pragma unroll
+            for (int token = 0; token < 8; ++token)
+            {
+                bool valid = token < valid_left;
+                uint32_t word = valid ? k_ptr[token * (KVH * 32)] : 0u;
+                float a = valid ? __half2float(sk_ptr[token * (KVH * 8)]) * 0.125f : 0.0f;
+                float bmid = -7.5f * a;
+                float k[8];
+                #pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    k[j] = fmaf((float) ((word >> (4 * j)) & 15), a, bmid);
+                float score[6];
+                // Adjacent quads load opposite halves first to cover all 32 banks.
+                int half = (lane >> 2) & 1;
+                #pragma unroll
+                for (int r = 0; r < 6; ++r)
+                {
+                    const float* qr = &arena.hot.q[r][8 * lane];
+                    float4 q0 = *reinterpret_cast<const float4*>(qr + 4 * half);
+                    float4 q1 = *reinterpret_cast<const float4*>(qr + 4 * (half ^ 1));
+                    if (half) laneD_qk_row(score[r], k, q1, q0);
+                    else laneD_qk_row(score[r], k, q0, q1);
+                }
+                #pragma unroll
+                for (int r = 0; r < 6; ++r)
+                {
+                    score[r] += __shfl_xor_sync(0xffffffffu, score[r], 1);
+                    score[r] += __shfl_xor_sync(0xffffffffu, score[r], 2);
+                }
+                if ((lane & 3) == 0)
+                {
+                    int group = lane >> 2;
+                    *reinterpret_cast<float4*>(&hot.red03[token][4 * group]) =
+                        make_float4(score[0], score[1], score[2], score[3]);
+                    *reinterpret_cast<float2*>(&hot.red45[token][4 * group]) =
+                        make_float2(score[4], score[5]);
+                }
+            }
+            __syncwarp();
+
+            {
+                int r = lane >> 3;
+                int token = lane & 7;
+                float v[8];
+                #pragma unroll
+                for (int g = 0; g < 8; ++g) v[g] = hot.red03[token][4 * g + r];
+                v[0] += v[1]; v[2] += v[3]; v[4] += v[5]; v[6] += v[7];
+                v[0] += v[2]; v[4] += v[6];
+                v[0] += v[4];
+                if (lane < 16) *reinterpret_cast<volatile float*>(&hot.score[token][r]) = v[0];
+                if (lane >= 16) *reinterpret_cast<volatile float*>(&hot.score[token][r]) = v[0];
+            }
+            if (lane < 16)
+            {
+                int r = 4 + (lane >> 3);
+                int token = lane & 7;
+                float v[8];
+                #pragma unroll
+                for (int g = 0; g < 8; ++g) v[g] = hot.red45[token][4 * g + r - 4];
+                v[0] += v[1]; v[2] += v[3]; v[4] += v[5]; v[6] += v[7];
+                v[0] += v[2]; v[4] += v[6];
+                v[0] += v[4];
+                hot.score[token][r] = v[0];
+            }
+            __syncwarp();
+
+            float threshold = m + 12.0f;
+            #pragma unroll
+            for (int token = 0; token < 8; ++token)
+            {
+                bool valid = token < valid_left;
+                bool updated = false;
+                float p = 0.0f;
+                float alpha = 1.0f;
+                if (lane < 6 && valid)
+                {
+                    float x = hot.score[token][lane];
+                    if (m == -CUDART_INF_F)
+                    {
+                        m = x;
+                        threshold = m + 12.0f;
+                        alpha = 0.0f;
+                        p = 1.0f;
+                        l = 1.0f;
+                        updated = true;
+                    }
+                    else if (x > threshold)
+                    {
+                        alpha = exp2f(m - x);
+                        m = x;
+                        threshold = m + 12.0f;
+                        p = 1.0f;
+                        l = fmaf(l, alpha, 1.0f);
+                        updated = true;
+                    }
+                    else
+                    {
+                        p = exp2f(x - m);
+                        l += p;
+                    }
+                }
+                uint32_t ballot = __ballot_sync(0xffffffffu, updated);
+                if (lane < 6) hot.pa[token][lane] = make_float2(p, alpha);
+                if (lane == 0) hot.flags[token] = ballot;
+            }
+            __syncwarp();
+
+            #pragma unroll
+            for (int token = 0; token < 8; ++token)
+            {
+                uint32_t flag = hot.flags[token];
+                float p[6];
+                float4 pa01 = *reinterpret_cast<const float4*>(&hot.pa[token][0]);
+                p[0] = pa01.x; p[1] = pa01.z;
+                if (flag) laneD_rescale_pair<0>(o, pa01.y, pa01.w);
+                float4 pa23 = *reinterpret_cast<const float4*>(&hot.pa[token][2]);
+                p[2] = pa23.x; p[3] = pa23.z;
+                if (flag) laneD_rescale_pair<2>(o, pa23.y, pa23.w);
+                float4 pa45 = *reinterpret_cast<const float4*>(&hot.pa[token][4]);
+                p[4] = pa45.x; p[5] = pa45.z;
+                if (flag) laneD_rescale_pair<4>(o, pa45.y, pa45.w);
+
+                bool valid = token < valid_left;
+                uint32_t word = valid ? v_ptr[token * (KVH * 32)] : 0u;
+                float a = valid ? __half2float(sv_ptr[token * (KVH * 8)]) * 0.125f : 0.0f;
+                float bmid = -7.5f * a;
+                laneD_pv_dimension<0>(o, p, word, a, bmid);
+            }
+            valid_left -= 8;
+            k_ptr += 8 * (KVH * 32);
+            v_ptr += 8 * (KVH * 32);
+            sk_ptr += 8 * (KVH * 8);
+            sv_ptr += 8 * (KVH * 8);
+        }
+    }
+
+    // All hot phases finish before reduction/Q storage becomes final staging.
+    __syncthreads();
+    if (lane < 6)
+    {
+        warp_m[warp][lane] = m;
+        warp_l[warp][lane] = l;
+    }
+    if (warp_half)
+    {
+        #pragma unroll
+        for (int r = 0; r < 6; ++r)
+        {
+            float4 o0 = make_float4(o[r][0], o[r][1], o[r][2], o[r][3]);
+            float4 o1 = make_float4(o[r][4], o[r][5], o[r][6], o[r][7]);
+            *reinterpret_cast<float4*>(&arena.stage[cohort][r][8 * lane]) = o0;
+            *reinterpret_cast<float4*>(&arena.stage[cohort][r][8 * lane + 4]) = o1;
+        }
+    }
+    cohort_barrier(cohort);
+
+    float cohort_a0 = 0.0f;
+    float cohort_a1 = 0.0f;
+    if (!warp_half && lane < 6)
+    {
+        int r = lane;
+        float m0 = warp_m[2 * cohort][r];
+        float m1 = warp_m[2 * cohort + 1][r];
+        float l0 = warp_l[2 * cohort][r];
+        float l1 = warp_l[2 * cohort + 1][r];
+        float mc = fmaxf(m0, m1);
+        cohort_a0 = (l0 == 0.0f || m0 == -CUDART_INF_F) ? 0.0f : exp2f(m0 - mc);
+        cohort_a1 = (l1 == 0.0f || m1 == -CUDART_INF_F) ? 0.0f : exp2f(m1 - mc);
+        float lc = fmaf(l0, cohort_a0, l1 * cohort_a1);
+        if (lc == 0.0f) mc = -CUDART_INF_F;
+        warp_m[2 * cohort][r] = mc;
+        warp_l[2 * cohort][r] = lc;
+    }
+    if (!warp_half)
+    {
+        #pragma unroll
+        for (int r = 0; r < 6; ++r)
+        {
+            float a0 = __shfl_sync(0xffffffffu, cohort_a0, r);
+            float a1 = __shfl_sync(0xffffffffu, cohort_a1, r);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j)
+                o[r][j] = fmaf(arena.stage[cohort][r][8 * lane + j], a1, o[r][j] * a0);
+        }
+    }
+    __syncthreads();
+
+    if (warp == 0 && lane < 6)
+    {
+        int r = lane;
+        size_t ml_base = (((size_t) blockIdx.x * S + blockIdx.y) * 6) * 2;
+        float m0 = warp_m[0][r];
+        float m1 = warp_m[2][r];
+        float l0 = warp_l[0][r];
+        float l1 = warp_l[2][r];
+        float mf = fmaxf(m0, m1);
+        float a0 = (l0 == 0.0f || m0 == -CUDART_INF_F) ? 0.0f : exp2f(m0 - mf);
+        float a1 = (l1 == 0.0f || m1 == -CUDART_INF_F) ? 0.0f : exp2f(m1 - mf);
+        float lf = fmaf(l0, a0, l1 * a1);
+        if (lf == 0.0f) mf = -CUDART_INF_F;
+        partial_ml[ml_base + 2 * r] = mf;
+        partial_ml[ml_base + 2 * r + 1] = lf;
+        weights[0][0][r] = a0;
+        weights[0][1][r] = a1;
+        warp_l[0][r] = lf;
+    }
+    if (warp == 2)
+    {
+        #pragma unroll
+        for (int r = 0; r < 6; ++r)
+        {
+            float4 o0 = make_float4(o[r][0], o[r][1], o[r][2], o[r][3]);
+            float4 o1 = make_float4(o[r][4], o[r][5], o[r][6], o[r][7]);
+            *reinterpret_cast<float4*>(&arena.stage[1][r][8 * lane]) = o0;
+            *reinterpret_cast<float4*>(&arena.stage[1][r][8 * lane + 4]) = o1;
+        }
+    }
+    __syncthreads();
+
+    if (warp == 0)
+    {
+        size_t o_base = (((size_t) blockIdx.x * S + blockIdx.y) * 6) * HD;
+        #pragma unroll
+        for (int r = 0; r < 6; ++r)
+        {
+            if (warp_l[0][r] != 0.0f)
+            {
+                float a0 = weights[0][0][r];
+                float a1 = weights[0][1][r];
+                float4 s0 = *reinterpret_cast<const float4*>(&arena.stage[1][r][8 * lane]);
+                float4 s1 = *reinterpret_cast<const float4*>(&arena.stage[1][r][8 * lane + 4]);
+                float4 o0 = make_float4(
+                    fmaf(s0.x, a1, o[r][0] * a0), fmaf(s0.y, a1, o[r][1] * a0),
+                    fmaf(s0.z, a1, o[r][2] * a0), fmaf(s0.w, a1, o[r][3] * a0));
+                float4 o1 = make_float4(
+                    fmaf(s1.x, a1, o[r][4] * a0), fmaf(s1.y, a1, o[r][5] * a0),
+                    fmaf(s1.z, a1, o[r][6] * a0), fmaf(s1.w, a1, o[r][7] * a0));
+                *reinterpret_cast<float4*>(partial_o + o_base + r * HD + 8 * lane) = o0;
+                *reinterpret_cast<float4*>(partial_o + o_base + r * HD + 8 * lane + 4) = o1;
+            }
+        }
+    }
+}
+
 template<int M>
 __global__ __launch_bounds__(32)
 void q4m_combine_kernel(
@@ -623,6 +1012,58 @@ void validate_q_rot(const at::Tensor& q, const at::Tensor& q_rot)
                 (reinterpret_cast<uintptr_t>(q_rot.data_ptr()) & 15) == 0, "q4m: 16-byte alignment required");
 }
 
+void validate_q4m_args(
+    const at::Tensor& q,
+    const at::Tensor& k_cache, const at::Tensor& k_scales,
+    const at::Tensor& v_cache, const at::Tensor& v_scales,
+    const at::Tensor& block_table, const at::Tensor& cache_seqlens,
+    const at::Tensor& out, const at::Tensor& q_rot,
+    const at::Tensor& partial_o, const at::Tensor& partial_ml,
+    int64_t splits)
+{
+    validate_q_rot(q, q_rot);
+    auto* properties = at::cuda::getDeviceProperties(q.get_device());
+    TORCH_CHECK(properties->major == 5 && properties->minor == 2, "q4m: sm_52 required");
+    int bsz = (int) q.size(0);
+    int M = (int) q.size(1);
+    TORCH_CHECK(bsz == 1 && M == 1, "q4m increment 1 supports batch=1, q_len=1");
+    TORCH_CHECK(out.scalar_type() == at::kHalf && out.is_contiguous() && out.sizes() == q.sizes(),
+                "q4m: out must match q");
+    TORCH_CHECK(k_cache.scalar_type() == at::kInt && v_cache.scalar_type() == at::kInt,
+                "q4m: packed caches must be int32");
+    TORCH_CHECK(k_cache.dim() == 3 && k_cache.size(1) == PAGE && k_cache.size(2) == KVH * 32 &&
+                v_cache.sizes() == k_cache.sizes(), "q4m: packed cache shape");
+    TORCH_CHECK(k_scales.scalar_type() == at::kHalf && v_scales.scalar_type() == at::kHalf &&
+                k_scales.dim() == 3 && k_scales.size(0) == k_cache.size(0) &&
+                k_scales.size(1) == PAGE && k_scales.size(2) == KVH * 8 &&
+                v_scales.sizes() == k_scales.sizes(), "q4m: scale cache shape");
+    TORCH_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous() && k_scales.is_contiguous() &&
+                v_scales.is_contiguous() && block_table.is_contiguous() && cache_seqlens.is_contiguous() &&
+                partial_o.is_contiguous() && partial_ml.is_contiguous(), "q4m: contiguous tensors required");
+    TORCH_CHECK(block_table.scalar_type() == at::kInt && cache_seqlens.scalar_type() == at::kInt &&
+                block_table.dim() == 2 && block_table.size(0) == bsz && cache_seqlens.numel() == bsz,
+                "q4m: bad block table/sequence lengths");
+    TORCH_CHECK(splits >= 1 && splits <= 32, "q4m: splits must be 1..32");
+    int64_t programs = (int64_t) bsz * 4;
+    TORCH_CHECK(partial_o.scalar_type() == at::kFloat && partial_ml.scalar_type() == at::kFloat &&
+                partial_o.numel() >= programs * splits * 6 * HD &&
+                partial_ml.numel() >= programs * splits * 6 * 2, "q4m: partial workspace too small");
+    auto device = q.device();
+    TORCH_CHECK(out.device() == device && k_cache.device() == device && v_cache.device() == device &&
+                k_scales.device() == device && v_scales.device() == device && block_table.device() == device &&
+                cache_seqlens.device() == device && partial_o.device() == device && partial_ml.device() == device,
+                "q4m: device mismatch");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(out.data_ptr()) & 15) == 0 &&
+                (reinterpret_cast<uintptr_t>(k_cache.data_ptr()) & 15) == 0 &&
+                (reinterpret_cast<uintptr_t>(v_cache.data_ptr()) & 15) == 0 &&
+                (reinterpret_cast<uintptr_t>(k_scales.data_ptr()) & 15) == 0 &&
+                (reinterpret_cast<uintptr_t>(v_scales.data_ptr()) & 15) == 0 &&
+                (reinterpret_cast<uintptr_t>(block_table.data_ptr()) & 15) == 0 &&
+                (reinterpret_cast<uintptr_t>(partial_o.data_ptr()) & 15) == 0 &&
+                (reinterpret_cast<uintptr_t>(partial_ml.data_ptr()) & 15) == 0,
+                "q4m: 16-byte alignment required");
+}
+
 } // namespace
 
 void q4m_prepare_gr(const at::Tensor& q, const at::Tensor& q_rot, int total_rows,
@@ -668,6 +1109,40 @@ void q4m_decode_gr(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void q4m_laneD_decode_gr(
+    const at::Tensor& q,
+    const at::Tensor& k_cache, const at::Tensor& k_scales,
+    const at::Tensor& v_cache, const at::Tensor& v_scales,
+    const at::Tensor& block_table, const at::Tensor& cache_seqlens,
+    const at::Tensor& out, const at::Tensor& q_rot,
+    const at::Tensor& partial_o, const at::Tensor& partial_ml,
+    int bsz, int num_pages_per_seq, int splits,
+    cudaStream_t stream, Graph* graph)
+{
+    TORCH_CHECK(q.size(1) == 1, "q4m laneD increment 1 supports q_len=1 only");
+    dim3 grid(bsz * 4, splits);
+    auto split_fn = q4m_laneD_split_kernel;
+    split_fn<<<grid, 128, 0, stream>>>(
+        (const float*) q_rot.data_ptr(), (const uint32_t*) k_cache.data_ptr(),
+        (const uint32_t*) v_cache.data_ptr(), (const half*) k_scales.data_ptr(),
+        (const half*) v_scales.data_ptr(), (const int*) block_table.data_ptr(),
+        (const int*) cache_seqlens.data_ptr(), (float*) partial_o.data_ptr(),
+        (float*) partial_ml.data_ptr(), num_pages_per_seq, splits);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (graph)
+    {
+        graph->record_param((void*) split_fn, GP_attn_block_table, 5);
+        graph->record_param((void*) split_fn, GP_attn_seqlens, 6);
+        graph->record_param((void*) split_fn, GP_attn_num_pages, 9, 4);
+        graph->record_param((void*) split_fn, GP_end, 0);
+    }
+    q4m_combine_kernel<1><<<bsz * QH, 32, 0, stream>>>(
+        (const float*) partial_o.data_ptr(), (const float*) partial_ml.data_ptr(),
+        (const float*) partial_o.data_ptr(), (const float*) partial_ml.data_ptr(),
+        (half*) out.data_ptr(), splits, 0);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void q4m_prepare(at::Tensor q, at::Tensor q_rot, double q_scale)
 {
     const at::cuda::OptionalCUDAGuard guard(q.device());
@@ -686,47 +1161,10 @@ void q4m_attention(
     double softmax_scale, int64_t splits)
 {
     const at::cuda::OptionalCUDAGuard guard(q.device());
-    validate_q_rot(q, q_rot);
-    auto* properties = at::cuda::getDeviceProperties(q.get_device());
-    TORCH_CHECK(properties->major == 5 && properties->minor == 2, "q4m: sm_52 required");
+    validate_q4m_args(q, k_cache, k_scales, v_cache, v_scales, block_table, cache_seqlens,
+                      out, q_rot, partial_o, partial_ml, splits);
     int bsz = (int) q.size(0);
     int M = (int) q.size(1);
-    TORCH_CHECK(bsz == 1 && M == 1, "q4m increment 1 supports batch=1, q_len=1");
-    TORCH_CHECK(out.scalar_type() == at::kHalf && out.is_contiguous() && out.sizes() == q.sizes(),
-                "q4m: out must match q");
-    TORCH_CHECK(k_cache.scalar_type() == at::kInt && v_cache.scalar_type() == at::kInt,
-                "q4m: packed caches must be int32");
-    TORCH_CHECK(k_cache.dim() == 3 && k_cache.size(1) == PAGE && k_cache.size(2) == KVH * 32 &&
-                v_cache.sizes() == k_cache.sizes(), "q4m: packed cache shape");
-    TORCH_CHECK(k_scales.scalar_type() == at::kHalf && v_scales.scalar_type() == at::kHalf &&
-                k_scales.dim() == 3 && k_scales.size(0) == k_cache.size(0) &&
-                k_scales.size(1) == PAGE && k_scales.size(2) == KVH * 8 &&
-                v_scales.sizes() == k_scales.sizes(), "q4m: scale cache shape");
-    TORCH_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous() && k_scales.is_contiguous() &&
-                v_scales.is_contiguous() && block_table.is_contiguous() && cache_seqlens.is_contiguous() &&
-                partial_o.is_contiguous() && partial_ml.is_contiguous(), "q4m: contiguous tensors required");
-    TORCH_CHECK(block_table.scalar_type() == at::kInt && cache_seqlens.scalar_type() == at::kInt &&
-                block_table.dim() == 2 && block_table.size(0) == bsz && cache_seqlens.numel() == bsz,
-                "q4m: bad block table/sequence lengths");
-    TORCH_CHECK(splits >= 1 && splits <= 32, "q4m: splits must be 1..32");
-    int64_t programs = (int64_t) bsz * 4;
-    TORCH_CHECK(partial_o.scalar_type() == at::kFloat && partial_ml.scalar_type() == at::kFloat &&
-                partial_o.numel() >= programs * splits * 6 * HD &&
-                partial_ml.numel() >= programs * splits * 6 * 2, "q4m: partial workspace too small");
-    auto device = q.device();
-    TORCH_CHECK(out.device() == device && k_cache.device() == device && v_cache.device() == device &&
-                k_scales.device() == device && v_scales.device() == device && block_table.device() == device &&
-                cache_seqlens.device() == device && partial_o.device() == device && partial_ml.device() == device,
-                "q4m: device mismatch");
-    TORCH_CHECK((reinterpret_cast<uintptr_t>(out.data_ptr()) & 15) == 0 &&
-                (reinterpret_cast<uintptr_t>(k_cache.data_ptr()) & 15) == 0 &&
-                (reinterpret_cast<uintptr_t>(v_cache.data_ptr()) & 15) == 0 &&
-                (reinterpret_cast<uintptr_t>(k_scales.data_ptr()) & 15) == 0 &&
-                (reinterpret_cast<uintptr_t>(v_scales.data_ptr()) & 15) == 0 &&
-                (reinterpret_cast<uintptr_t>(block_table.data_ptr()) & 15) == 0 &&
-                (reinterpret_cast<uintptr_t>(partial_o.data_ptr()) & 15) == 0 &&
-                (reinterpret_cast<uintptr_t>(partial_ml.data_ptr()) & 15) == 0,
-                "q4m: 16-byte alignment required");
     auto stream = at::cuda::getCurrentCUDAStream();
     q4m_prepare_gr(q, q_rot, bsz * M * QH, (float) softmax_scale * LOG2E, stream);
     q4m_decode_gr(q, k_cache, k_scales, v_cache, v_scales, block_table, cache_seqlens,
@@ -734,10 +1172,41 @@ void q4m_attention(
                   stream, nullptr);
 }
 
+void q4m_laneD_attention(
+    at::Tensor q,
+    at::Tensor k_cache, at::Tensor k_scales,
+    at::Tensor v_cache, at::Tensor v_scales,
+    at::Tensor block_table, at::Tensor cache_seqlens,
+    at::Tensor out, at::Tensor q_rot,
+    at::Tensor partial_o, at::Tensor partial_ml,
+    double softmax_scale, int64_t splits)
+{
+    const at::cuda::OptionalCUDAGuard guard(q.device());
+    validate_q4m_args(q, k_cache, k_scales, v_cache, v_scales, block_table, cache_seqlens,
+                      out, q_rot, partial_o, partial_ml, splits);
+    int bsz = (int) q.size(0);
+    int M = (int) q.size(1);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    q4m_prepare_gr(q, q_rot, bsz * M * QH, (float) softmax_scale * LOG2E, stream);
+    q4m_laneD_decode_gr(q, k_cache, k_scales, v_cache, v_scales, block_table, cache_seqlens,
+                        out, q_rot, partial_o, partial_ml, bsz, (int) block_table.size(1), (int) splits,
+                        stream, nullptr);
+}
+
 std::vector<int64_t> q4m_resource_info()
 {
     cudaFuncAttributes attr{};
     auto fn = q4m_split_kernel<6, 1, true>;
+    C10_CUDA_CHECK(cudaFuncGetAttributes(&attr, (const void*) fn));
+    int occupancy = 0;
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, (const void*) fn, 128, 0));
+    return {6, 1, attr.numRegs, (int64_t) attr.sharedSizeBytes, (int64_t) attr.localSizeBytes, occupancy};
+}
+
+std::vector<int64_t> q4m_laneD_resource_info()
+{
+    cudaFuncAttributes attr{};
+    auto fn = q4m_laneD_split_kernel;
     C10_CUDA_CHECK(cudaFuncGetAttributes(&attr, (const void*) fn));
     int occupancy = 0;
     C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, (const void*) fn, 128, 0));
@@ -752,6 +1221,10 @@ void q4m_prepare(at::Tensor, at::Tensor, double) { TORCH_CHECK(false, "q4m Maxwe
 void q4m_attention(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                    at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                    double, int64_t) { TORCH_CHECK(false, "q4m Maxwell unavailable on ROCm"); }
+void q4m_laneD_attention(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+                         at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+                         double, int64_t) { TORCH_CHECK(false, "q4m Maxwell unavailable on ROCm"); }
 std::vector<int64_t> q4m_resource_info() { return {}; }
+std::vector<int64_t> q4m_laneD_resource_info() { return {}; }
 
 #endif

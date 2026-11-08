@@ -7,8 +7,13 @@ from ...ext import exllamav3_ext as ext
 from .common import AttnArgs
 
 
-def _enabled() -> bool:
-    return os.environ.get("EXL3_ATTN_Q4M", "").lower() in ("1", "true")
+def _mode() -> int:
+    value = os.environ.get("EXL3_ATTN_Q4M", "").lower()
+    if value == "2":
+        return 2
+    if value in ("1", "true"):
+        return 1
+    return 0
 
 
 def _aligned(t: torch.Tensor) -> bool:
@@ -16,13 +21,15 @@ def _aligned(t: torch.Tensor) -> bool:
 
 
 @functools.lru_cache(maxsize=None)
-def _resources(device: int):
+def _resources(device: int, mode: int):
     with torch.cuda.device(device):
-        return tuple(ext.q4m_resource_info())
+        query = ext.q4m_laneD_resource_info if mode == 2 else ext.q4m_resource_info
+        return tuple(query())
 
 
 def fn_maxwell_q4_decode(args: AttnArgs) -> torch.Tensor | None:
-    if not _enabled() or args.q_cache is None:
+    mode = _mode()
+    if not mode or args.q_cache is None:
         return None
     if (
         args.bsz != 1 or args.q_len != 1 or
@@ -51,8 +58,11 @@ def fn_maxwell_q4_decode(args: AttnArgs) -> torch.Tensor | None:
     ):
         return None
 
-    resources = _resources(args.q.device.index)
-    if resources[2] > 128 or resources[3] > 16672 or resources[4] != 0 or resources[5] < 4:
+    resources = _resources(args.q.device.index, mode)
+    if mode == 2:
+        if resources[2] > 96 or resources[3] > 18080 or resources[4] != 0 or resources[5] < 5:
+            return None
+    elif resources[2] > 128 or resources[3] > 16672 or resources[4] != 0 or resources[5] < 4:
         return None
 
     splits = 30
@@ -60,7 +70,8 @@ def fn_maxwell_q4_decode(args: AttnArgs) -> torch.Tensor | None:
     q_rot = torch.empty(args.q.shape, dtype=torch.float32, device=args.q.device)
     partial_o = torch.empty(4 * splits * 6 * 256, dtype=torch.float32, device=args.q.device)
     partial_ml = torch.empty(4 * splits * 6 * 2, dtype=torch.float32, device=args.q.device)
-    ext.q4m_attention(
+    attention = ext.q4m_laneD_attention if mode == 2 else ext.q4m_attention
+    attention(
         args.q, qk, sk, qv, sv, args.block_table, args.cache_seqlens,
         out, q_rot, partial_o, partial_ml, args.sm_scale, splits,
     )
