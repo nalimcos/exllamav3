@@ -299,6 +299,14 @@ per-expert MoE dequant path (small row counts per expert), the rotated-basis pip
 (input Hadamard → GEMM → output Hadamard) is kept. Set to `1` to force the rotated-basis
 pipeline everywhere, for A/B testing.
 
+### `EXL3_FP32_PREFILL` (default: `1`)
+
+On pre-Ampere CUDA GPUs, fused reconstruct prefill (1024+ rows) uses direct FP32 weight
+reconstruction and SGEMM for matrices with `k*n >= 5120*17408`. The threshold keeps smaller
+matrices on the FP16-input GemmEx path, including the measured 5120x6144 shape where FP32 did
+not provide a sufficient end-to-end win. Decode and non-fused reconstruct are unchanged. Set
+to `0` to restore FP16 reconstruct plus GemmEx everywhere.
+
 ### `EXLLAMAV3_TUNE_CACHE` (default: platform cache dir)
 
 Override the path of the on-disk autotune cache for the cooperative GEMM kernels (kernel shape

@@ -12,6 +12,12 @@ MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
+no_fp32_prefill = os.environ.get("EXL3_FP32_PREFILL", "1") == "0" or torch.version.hip is not None
+
+# Pre-Ampere fused prefill: direct fp32 reconstruct + SGEMM won 1.106x/1.179x end-to-end on the
+# two 89.1M-weight shapes, but only 1.080x on the 31.5M shape. Stay on fp16 below the measured
+# winning size so all unmeasured smaller shapes, including 5120x12288, retain the current path.
+FP32_RECONSTRUCT_MIN_NUMEL = 5120 * 17408
 
 # Maxwell small-m routing (measured on M40, sm_52, 3 bpw mul1): the dense exl3_gemm tile kernel
 # holds ~13.6 GB/s through m = 16 but its occupancy halves at m >= 17 (6.8 GB/s at 17..32,
@@ -200,23 +206,37 @@ class LinearEXL3:
         # The fused kernel costs ~4x plain reconstruct (k*n-proportional) while the saved
         # had launches scale with rows*(k+n); breakeven is rows ~400-900 across shapes
         use_fused = self._fused_reconstruct and rows >= 1024
+        use_fp32 = (
+            use_fused and not no_fp32_prefill
+            and self.in_features * self.out_features >= FP32_RECONSTRUCT_MIN_NUMEL
+            and torch.cuda.get_device_capability(self.trellis.device)[0] < 8
+        )
+        work_dtype = torch.float if use_fp32 else torch.half
 
         if use_fused:
-            xh = x
+            xh = x.float() if use_fp32 else x
         else:
             xh = torch.empty_like(x)
             ext.had_r_128(x, xh, self.suh, None, 1.0)
 
+        def gemm(w, y_out):
+            if use_fp32:
+                yf = torch.empty(y_out.shape, dtype = torch.float, device = y_out.device)
+                torch.mm(xh, w, out = yf)
+                y_out.copy_(yf)
+            else:
+                ext.hgemm_recon(xh, w, y_out)
+
         if self.out_features <= MAX_RECONSTRUCT_SLICE_N:
-            w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
+            w = torch.empty((self.in_features, self.out_features), dtype = work_dtype, device = self.trellis.device)
             if use_fused:
                 ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh, self.K, self.mcg, self.mul1, 0)
             else:
                 self._reconstruct_inner(w, 0)
-            ext.hgemm_recon(xh, w, y_)
+            gemm(w, y_)
         else:
             numel_ = self.in_features * MAX_RECONSTRUCT_SLICE_N
-            w_ = torch.empty((numel_,), dtype = torch.half, device = self.trellis.device)
+            w_ = torch.empty((numel_,), dtype = work_dtype, device = self.trellis.device)
             for n_start in range(0, self.out_features, MAX_RECONSTRUCT_SLICE_N):
                 n_end = min(n_start + MAX_RECONSTRUCT_SLICE_N, self.out_features)
                 numel = self.in_features * (n_end - n_start)
@@ -226,7 +246,7 @@ class LinearEXL3:
                         w, self.trellis, self.suh, self.svh[n_start:], self.K, self.mcg, self.mul1, n_start)
                 else:
                     self._reconstruct_inner(w, n_start)
-                ext.hgemm_recon(xh, w, y_[:, n_start:n_end])
+                gemm(w, y_[:, n_start:n_end])
 
         if not use_fused:
             ext.had_r_128(y_, y_, None, self.svh, 1.0)

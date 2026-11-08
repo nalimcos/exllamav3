@@ -1,4 +1,5 @@
 #include <cuda_fp16.h>
+#include <type_traits>
 #include "reconstruct.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -208,11 +209,11 @@ void reconstruct_slice
 // column-then-row order is H W H).
 #define RH_THREADS 256
 
-template <int K, int cb, bool HALF = false>
+template <typename T, int K, int cb, bool HALF = false>
 __device__ __forceinline__
 void reconstruct_had_tile
 (
-    half* __restrict__ g_unpacked,
+    T* __restrict__ g_unpacked,
     const uint16_t* __restrict__ g_packed,
     const half* __restrict__ suh,
     const half* __restrict__ svh,
@@ -353,20 +354,35 @@ void reconstruct_had_tile
         half2 h23 = __hmul2(__floats2half2_rn(s0 - s1, d0 - d1), rs2);
         h01 = shuffle_had_h2x32(h01, lane_id);
         h23 = shuffle_had_h2x32(h23, lane_id);
-        half2 su2 = __half2half2(suh[kb * 128 + R]);
-        half4 v;
-        v.x = __hmul2(__hmul2(h01, su2), sv4.x);
-        v.y = __hmul2(__hmul2(h23, su2), sv4.y);
-        *((half4*) (g_unpacked + (size_t) (kb * 128 + R) * row_len + nb * 128 + lane_id * 4)) = v;
+        T* out = g_unpacked + (size_t) (kb * 128 + R) * row_len + nb * 128 + lane_id * 4;
+        if constexpr (std::is_same<T, half>::value)
+        {
+            half2 su2 = __half2half2(suh[kb * 128 + R]);
+            half4 v;
+            v.x = __hmul2(__hmul2(h01, su2), sv4.x);
+            v.y = __hmul2(__hmul2(h23, su2), sv4.y);
+            *((half4*) out) = v;
+        }
+        else
+        {
+            static_assert(std::is_same<T, float>::value);
+            float su = __half2float(suh[kb * 128 + R]);
+            float4 v;
+            v.x = __low2float(h01) * su * __low2float(sv4.x);
+            v.y = __high2float(h01) * su * __high2float(sv4.x);
+            v.z = __low2float(h23) * su * __low2float(sv4.y);
+            v.w = __high2float(h23) * su * __high2float(sv4.y);
+            *((float4*) out) = v;
+        }
     }
 }
 
 
-template <int K, int cb, bool HALF = false>
+template <typename T, int K, int cb, bool HALF = false>
 __global__ __launch_bounds__(RH_THREADS)
 void reconstruct_had_kernel
 (
-    half* __restrict__ g_unpacked,
+    T* __restrict__ g_unpacked,
     const uint16_t* __restrict__ g_packed,
     const half* __restrict__ suh,
     const half* __restrict__ svh,
@@ -374,7 +390,7 @@ void reconstruct_had_kernel
     int packed_n_offset
 )
 {
-    reconstruct_had_tile<K, cb, HALF>(g_unpacked, g_packed, suh, svh, packed_blocks_n, packed_n_offset);
+    reconstruct_had_tile<T, K, cb, HALF>(g_unpacked, g_packed, suh, svh, packed_blocks_n, packed_n_offset);
 }
 
 // Batched variant: blockIdx.z selects the matrix from per-matrix pointer tables, the outputs
@@ -392,7 +408,7 @@ void reconstruct_had_batch_kernel
 )
 {
     int b = blockIdx.z;
-    reconstruct_had_tile<K, cb, HALF>
+    reconstruct_had_tile<half, K, cb, HALF>
     (
         g_unpacked + (size_t) b * out_stride,
         packed_ptrs[b],
@@ -415,13 +431,23 @@ constexpr auto reconstruct_had_batch_kernel_instances = std::array
 #undef __
 
 // Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
-#define __(i, cb) reconstruct_had_kernel<i, cb>
+#define __(i, cb) reconstruct_had_kernel<half, i, cb>
 constexpr auto reconstruct_had_kernel_instances = std::array
 {
     __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
     __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
     __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
-    reconstruct_had_kernel<1, 2, true>, reconstruct_had_kernel<2, 2, true>, reconstruct_had_kernel<3, 2, true>
+    reconstruct_had_kernel<half, 1, 2, true>, reconstruct_had_kernel<half, 2, 2, true>, reconstruct_had_kernel<half, 3, 2, true>
+};
+#undef __
+
+#define __(i, cb) reconstruct_had_kernel<float, i, cb>
+constexpr auto reconstruct_had_kernel_f32_instances = std::array
+{
+    __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
+    __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
+    __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
+    reconstruct_had_kernel<float, 1, 2, true>, reconstruct_had_kernel<float, 2, 2, true>, reconstruct_had_kernel<float, 3, 2, true>
 };
 #undef __
 
@@ -453,7 +479,8 @@ void reconstruct_had_slice
     TORCH_CHECK(!bk.half || mul1, "reconstruct: half-integer bitrates require the mul1 codebook");
     TORCH_CHECK_SHAPES(unpacked, 0, packed, 0, 16);
     TORCH_CHECK_SIZE(packed, 2, 16 * K + (bk.half ? 8 : 0));
-    TORCH_CHECK_DTYPE(unpacked, kHalf);
+    TORCH_CHECK(unpacked.dtype() == at::kHalf || unpacked.dtype() == at::kFloat,
+                "reconstruct_had: unpacked must be float16 or float32");
     TORCH_CHECK_DTYPE(suh, kHalf);
     TORCH_CHECK_DTYPE(svh, kHalf);
 
@@ -478,16 +505,32 @@ void reconstruct_had_slice
     TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_had_kernel_instances.size(),
                 "kernel index out of range: ", cbi);
 
-    auto reconstruct_had_fn = reconstruct_had_kernel_instances[cbi];
-    reconstruct_had_fn<<<gridDim, RH_THREADS, 0, stream>>>
-    (
-        (half*) unpacked.data_ptr(),
-        (const uint16_t*) packed.data_ptr(),
-        (const half*) suh.data_ptr(),
-        (const half*) svh.data_ptr(),
-        packed.size(1),
-        (int) (n_offset / 16)
-    );
+    if (unpacked.dtype() == at::kFloat)
+    {
+        auto reconstruct_had_fn = reconstruct_had_kernel_f32_instances[cbi];
+        reconstruct_had_fn<<<gridDim, RH_THREADS, 0, stream>>>
+        (
+            (float*) unpacked.data_ptr(),
+            (const uint16_t*) packed.data_ptr(),
+            (const half*) suh.data_ptr(),
+            (const half*) svh.data_ptr(),
+            packed.size(1),
+            (int) (n_offset / 16)
+        );
+    }
+    else
+    {
+        auto reconstruct_had_fn = reconstruct_had_kernel_instances[cbi];
+        reconstruct_had_fn<<<gridDim, RH_THREADS, 0, stream>>>
+        (
+            (half*) unpacked.data_ptr(),
+            (const uint16_t*) packed.data_ptr(),
+            (const half*) suh.data_ptr(),
+            (const half*) svh.data_ptr(),
+            packed.size(1),
+            (int) (n_offset / 16)
+        );
+    }
     cuda_check(cudaPeekAtLastError());
 }
 
