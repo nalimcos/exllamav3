@@ -334,6 +334,25 @@ class BCAttn:
         splits_cap = max(1, min(target // programs, 128))
         window_left, window_right = _normalize_window(self.window_size)
 
+        from .maxwell_q4 import _mode, _resources
+        native_q4 = (
+            regime == 0 and _mode() == 3 and causal and not self.qsa and
+            1 <= bsz <= 4 and 1 <= q_len <= 8 and
+            qh == 24 and kvh == 4 and hd == 256 and hd_pad == 256 and
+            self.k_bits == 4 and self.v_bits == 4 and
+            window_left == -1 and window_right == -1 and
+            not self.softcap and self.sinks is None and
+            self.cache_k.is_contiguous() and self.cache_v.is_contiguous() and
+            self.k_scales.is_contiguous() and self.v_scales.is_contiguous() and
+            self.cache_k.shape[1:] == (256, 128) and self.cache_v.shape == self.cache_k.shape and
+            self.k_scales.shape == (self.cache_k.shape[0], 256, 32) and
+            self.v_scales.shape == self.k_scales.shape and
+            torch.cuda.get_device_capability(dev) == (5, 2)
+        )
+        if native_q4:
+            resources = _resources(dev.index, 3)
+            native_q4 = resources[2] <= 96 and resources[5] >= 5
+
         cache_t = "*i32" if self.quant else "*fp16"
         # These pointers are whole allocations (cache tensors, graph statics, bucketed partials, the
         # generator's block table), so the 16-byte divisibility the JIT would infer holds
@@ -414,8 +433,18 @@ class BCAttn:
         pn_ml = programs * splits_cap * block_rows * 2
         if regime == 1:
             pn_o, pn_ml = self._qsa_partial_sizes(bsz * q_len)
+        if native_q4:
+            native_rows = bsz * 4 * (6 if q_len == 1 else (q_len // 2) * 12)
+            if q_len > 1 and q_len & 1:
+                native_rows += bsz * 4 * 6
+            pn_o = native_rows * 30 * hd
+            pn_ml = native_rows * 30 * 2
         partial_o = g_tensor_cache.get_bucketed(dev, pn_o, torch.float, "bca_po")
         partial_ml = g_tensor_cache.get_bucketed(dev, pn_ml, torch.float, "bca_ml")
+        q_rot = (
+            g_tensor_cache.get(dev, (bsz, q_len, qh, hd), torch.float, "bca_q4m_qr")
+            if native_q4 else None
+        )
 
         # Padded hidden dim: zero-padded input staging and padded o_proj output. The pad columns
         # of xp are zeroed here and never written afterwards (the graph copies only the exact
@@ -434,7 +463,7 @@ class BCAttn:
             gate_a, gate_b,
             k_split, k_combine, k_update,
             block_n, splits_cap, programs,
-            xp, yp,
+            xp, yp, q_rot, 3 if native_q4 else 0, float(self.sm_scale), 30,
         )
 
         if self.qsa:

@@ -1,6 +1,8 @@
 """Native Maxwell Q4 decode attention for the fixed 24Q/4KV, D=256 shape."""
 import functools
 import os
+import warnings
+
 import torch
 
 from ...ext import exllamav3_ext as ext
@@ -8,7 +10,7 @@ from .common import AttnArgs
 
 
 def _mode() -> int:
-    value = os.environ.get("EXL3_ATTN_Q4M", "").lower()
+    value = os.environ.get("EXL3_ATTN_Q4M", "3").lower()
     if value == "3":
         return 3
     if value == "2":
@@ -31,15 +33,27 @@ def _resources(device: int, mode: int):
             query = ext.q4m_laneD_resource_info
         else:
             query = ext.q4m_resource_info
-        return tuple(query())
+        resources = tuple(query())
+        if mode == 3 and resources[4]:
+            warnings.warn(
+                f"Maxwell Q4 warp-pair attention uses an {resources[4]}-byte local frame; "
+                "using it after passing the measured latency gate",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return resources
 
 
 def fn_maxwell_q4_decode(args: AttnArgs) -> torch.Tensor | None:
     mode = _mode()
     if not mode or args.q_cache is None:
         return None
+    shape_ok = (
+        1 <= args.bsz <= 4 and 1 <= args.q_len <= 8
+        if mode == 3 else args.bsz == 1 and args.q_len == 1
+    )
     if (
-        args.bsz != 1 or args.q_len != 1 or
+        not shape_ok or
         args.num_q_heads != 24 or args.num_kv_heads != 4 or args.dim != 256 or
         args.q.dtype != torch.float16 or not args.q.is_contiguous() or
         args.causal is not True or args.is_varlen() or args.is_swa() or
@@ -59,15 +73,15 @@ def fn_maxwell_q4_decode(args: AttnArgs) -> torch.Tensor | None:
         any(t is None or not t.is_contiguous() or t.device != args.q.device for t in tensors) or
         qk.ndim != 3 or qk.shape[1:] != (256, 128) or qv.shape != qk.shape or
         sk.shape != (qk.shape[0], 256, 32) or sv.shape != sk.shape or
-        args.block_table.ndim != 2 or args.block_table.shape[0] != 1 or
-        args.cache_seqlens.numel() != 1 or
+        args.block_table.ndim != 2 or args.block_table.shape[0] != args.bsz or
+        args.cache_seqlens.numel() != args.bsz or
         not all(_aligned(t) for t in (args.q, qk, sk, qv, sv, args.block_table))
     ):
         return None
 
     resources = _resources(args.q.device.index, mode)
     if mode == 3:
-        if resources[2] > 96 or resources[4] != 0 or resources[5] < 5:
+        if resources[2] > 96 or resources[5] < 5:
             return None
     elif mode == 2:
         if resources[2] > 96 or resources[3] > 18080 or resources[4] != 0 or resources[5] < 5:
@@ -78,8 +92,13 @@ def fn_maxwell_q4_decode(args: AttnArgs) -> torch.Tensor | None:
     splits = 30
     out = torch.empty_like(args.q)
     q_rot = torch.empty(args.q.shape, dtype=torch.float32, device=args.q.device)
-    partial_o = torch.empty(4 * splits * 6 * 256, dtype=torch.float32, device=args.q.device)
-    partial_ml = torch.empty(4 * splits * 6 * 2, dtype=torch.float32, device=args.q.device)
+    rows = args.bsz * 4 * 6
+    if mode == 3 and args.q_len > 1:
+        rows = args.bsz * 4 * (args.q_len // 2) * 12
+        if args.q_len & 1:
+            rows += args.bsz * 4 * 6
+    partial_o = torch.empty(rows * splits * 256, dtype=torch.float32, device=args.q.device)
+    partial_ml = torch.empty(rows * splits * 2, dtype=torch.float32, device=args.q.device)
     if mode == 3:
         attention = ext.q4m_laneD3_attention
     elif mode == 2:

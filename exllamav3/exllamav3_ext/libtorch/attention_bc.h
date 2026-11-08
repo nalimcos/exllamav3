@@ -159,7 +159,11 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
     py::arg("splits_cap"),
     py::arg("programs"),
     py::arg("xp"),
-    py::arg("yp")
+    py::arg("yp"),
+    py::arg("q_rot"),
+    py::arg("q4m_mode"),
+    py::arg("q4m_scale"),
+    py::arg("q4m_splits")
 )
 .def("configure_slot_qsa", &BC_Attention::configure_slot_qsa,
     py::arg("bsz"),

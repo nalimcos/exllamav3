@@ -163,8 +163,11 @@ struct BC_Attention
         // (R, 2*qh*hd) staging + g (R, qh*hd). xp: input staging, present when the hidden dim
         // is padded or the gate projection is fp16 (the cublas node needs a static input).
         // yp: padded o_proj output, only when hidden_size_padded > hidden_size
-        at::Tensor q, kv, o, partial_o, partial_ml, gate_a, gate_b, xp, yp;
+        at::Tensor q, kv, o, partial_o, partial_ml, gate_a, gate_b, xp, yp, q_rot;
         at::Tensor q2, q4, k4, v4, o2, o4, qg2, g2;
+        int q4m_mode = 0;
+        float q4m_scale = 0.0f;
+        int q4m_splits = 0;
         at::Tensor qkv_c_ptrs;   // sliced bundle: per-slice output pointers into the statics
 
         std::shared_ptr<TritonKernel> k_split;
@@ -289,7 +292,11 @@ struct BC_Attention
         int splits_cap,
         int programs,
         c10::optional<at::Tensor> xp,
-        c10::optional<at::Tensor> yp
+        c10::optional<at::Tensor> yp,
+        c10::optional<at::Tensor> q_rot,
+        int q4m_mode,
+        float q4m_scale,
+        int q4m_splits
     );
 
     // Attaches the QSA statics/kernels to an already-configured slot. Selection pieces are

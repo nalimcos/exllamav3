@@ -77,9 +77,7 @@ def test_laneD3_resource_failure_selects_generic(monkeypatch):
     monkeypatch.setenv("EXL3_ATTN_Q4M", "3")
     out = fn_maxwell_q4_decode(args)
     resources = ext.q4m_laneD3_resource_info()
-    resource_failure = (
-        resources[2] > 96 or resources[4] != 0 or resources[5] < 5
-    )
+    resource_failure = resources[2] > 96 or resources[5] < 5
     if resource_failure:
         assert out is None
     else:

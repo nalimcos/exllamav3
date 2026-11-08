@@ -13,6 +13,7 @@
 #include "../activation.cuh"
 #include "../norm.cuh"
 #include "../dsa_topk.cuh"
+#include "../attn_q4_maxwell.cuh"
 
 BC_Attention::BC_Attention
 (
@@ -213,7 +214,11 @@ void BC_Attention::configure_slot
     int splits_cap,
     int programs,
     c10::optional<at::Tensor> xp,
-    c10::optional<at::Tensor> yp
+    c10::optional<at::Tensor> yp,
+    c10::optional<at::Tensor> q_rot,
+    int q4m_mode,
+    float q4m_scale,
+    int q4m_splits
 )
 {
     TORCH_CHECK(regime == 0 || qsa, "BC_Attention: sparse regime without QSA indexer");
@@ -225,6 +230,18 @@ void BC_Attention::configure_slot
     s.o = std::move(o);
     s.partial_o = std::move(partial_o);
     s.partial_ml = std::move(partial_ml);
+    s.q4m_mode = q4m_mode;
+    s.q4m_scale = q4m_scale;
+    s.q4m_splits = q4m_splits;
+    if (q4m_mode)
+    {
+        TORCH_CHECK(q4m_mode == 3 && regime == 0 && quant_cache && q_rot, "BC_Attention: invalid native Q4 slot");
+        s.q_rot = q_rot.value();
+        TORCH_CHECK(s.q_rot.is_contiguous() && s.q_rot.scalar_type() == at::kFloat &&
+                    s.q_rot.sizes() == s.q.sizes(), "BC_Attention: invalid native Q rotation static");
+        TORCH_CHECK(bsz <= 4 && q_len <= 8 && q4m_splits >= 1 && q4m_splits <= 32,
+                    "BC_Attention: invalid native Q4 geometry");
+    }
     if (gate_a) s.gate_a = gate_a.value();
     if (gate_b) s.gate_b = gate_b.value();
     s.k_split = k_split;
@@ -754,6 +771,14 @@ void BC_Attention::run_gr
             s.k_qsa_combine->launch(s.qsa_programs, s.k_qsa_combine->grid_y, 1, args, stream);
         }
     }
+    else if (s.q4m_mode == 3)
+    {
+        q4m_prepare_gr(s.q4, s.q_rot, R * num_q_heads,
+                       s.q4m_scale * 1.44269504088896340736f, stream);
+        q4m_laneD3_decode_gr(s.q4, cache_k, cache_k_scales.value(), cache_v, cache_v_scales.value(),
+                             block_table, cache_seqlens, s.o, s.q_rot, s.partial_o, s.partial_ml,
+                             bsz, (int) block_table.size(1), s.q4m_splits, stream, graph);
+    }
     else
     {
 
@@ -998,6 +1023,15 @@ void BC_Attention::run
         params.emplace_back(GP_dsa_T, (void*) (uintptr_t) (uint32_t) t_scan);   // top-k
         params.emplace_back(GP_dsa_qpos, (void*) (uintptr_t) (uint32_t) position);   // expand
         params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());    // gather
+    }
+    else if (s.q4m_mode == 3)
+    {
+        for (int segment = 0; segment < 1 + (q_len > 1 && (q_len & 1)); ++segment)
+        {
+            params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());
+            params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
+            params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
+        }
     }
     else
     {

@@ -52,6 +52,7 @@ def reference(q, kc, ks, vc, vs, block_table, past, scale):
     outputs = []
     for qpos in range(q.shape[1]):
         scores = torch.einsum("bhd,nhd->bhn", q[:, qpos].float(), k) * scale
+        scores = scores.masked_fill(torch.arange(total, device=DEV) > past + qpos, -float("inf"))
         probs = torch.softmax(scores, dim=-1)
         outputs.append(torch.einsum("bhn,nhd->bhd", probs, v))
     return torch.stack(outputs, dim=1)
@@ -254,9 +255,7 @@ def test_decode_vs_prefill_and_eager_dispatch(monkeypatch):
     if native is None:
         if NATIVE_MODE == "3":
             resources = ext.q4m_laneD3_resource_info()
-            resource_failure = (
-                resources[2] > 96 or resources[4] != 0 or resources[5] < 5
-            )
+            resource_failure = resources[2] > 96 or resources[5] < 5
         else:
             resources = ext.q4m_laneD_resource_info()
             resource_failure = (
@@ -267,7 +266,7 @@ def test_decode_vs_prefill_and_eager_dispatch(monkeypatch):
     else:
         torch.testing.assert_close(native, prefill, atol=2e-3, rtol=0)
         assert torch.isfinite(native).all()
-    monkeypatch.delenv("EXL3_ATTN_Q4M")
+    monkeypatch.setenv("EXL3_ATTN_Q4M", "0")
     assert fn_maxwell_q4_decode(args) is None
 
 

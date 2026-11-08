@@ -955,6 +955,7 @@ __device__ __forceinline__ void laneD3_pv_dimension(
         laneD3_pv_dimension<N + 1>(o, p0, p1, p2, word, a, b);
 }
 
+template<int M, bool TAIL>
 __global__ __launch_bounds__(128, 5)
 void q4m_laneD3_split_kernel(
     const float* __restrict__ q_rot,
@@ -979,246 +980,260 @@ void q4m_laneD3_split_kernel(
     int lane = tid & 31;
     int pair = warp >> 1;
     int warp_half = warp & 1;
+    static_assert(M >= 1 && M <= 8);
+    static_assert(TAIL ? (M == 1 || (M & 1)) : M >= 2);
+    constexpr int NRB = TAIL ? 1 : M / 2;
+    constexpr int R = TAIL ? 6 : 12;
     int program = blockIdx.x;
     int split = blockIdx.y;
-    int h = program & 3;
-    int b = program >> 2;
+    int rb = program % NRB;
+    int bh = program / NRB;
+    int h = bh & 3;
+    int b = bh >> 2;
     int past = cache_seqlens[b];
-    int kv_end = past + 1;
+    int last_qpos = TAIL ? (M == 1 ? 0 : M - 1) : 2 * rb + 1;
+    int kv_end = past + last_qpos + 1;
     int T = (kv_end + TILE - 1) / TILE;
     int t0 = T * split / S;
     int t1 = T * (split + 1) / S;
 
     if (t0 == t1)
     {
-        if (tid < 6)
+        if (tid < R)
         {
-            size_t ml_base = (((size_t) program * S + split) * 6) * 2;
+            size_t ml_base = (((size_t) program * S + split) * R) * 2;
             partial_ml[ml_base + 2 * tid] = -CUDART_INF_F;
             partial_ml[ml_base + 2 * tid + 1] = 0.0f;
         }
         return;
     }
 
-    const float* q_base = q_rot + (((size_t) b * QH + 6 * h + 3 * warp_half) * HD);
-    float q[3][8];
     #pragma unroll
-    for (int r = 0; r < 3; ++r)
+    for (int pass = 0; pass < (TAIL ? 1 : 2); ++pass)
     {
-        float4 q0 = *reinterpret_cast<const float4*>(q_base + r * HD + 8 * lane);
-        float4 q1 = *reinterpret_cast<const float4*>(q_base + r * HD + 8 * lane + 4);
-        q[r][0] = q0.x; q[r][1] = q0.y; q[r][2] = q0.z; q[r][3] = q0.w;
-        q[r][4] = q1.x; q[r][5] = q1.y; q[r][6] = q1.z; q[r][7] = q1.w;
-    }
-    float o[3][8];
-    #pragma unroll
-    for (int r = 0; r < 3; ++r)
-    {
+        int qpos = TAIL ? last_qpos : 2 * rb + pass;
+        int valid_end = past + qpos + 1;
+        const float* q_base = q_rot + (((size_t) (b * M + qpos) * QH + 6 * h + 3 * warp_half) * HD);
+        float q[3][8];
         #pragma unroll
-        for (int j = 0; j < 8; ++j) o[r][j] = 0.0f;
-    }
-    float m = -CUDART_INF_F;
-    float l = 0.0f;
-
-    LaneD3Hot& hot = arena.warps[warp];
-    int n0 = TILE * t0;
-    int tiles_left = t1 - t0;
-    int valid_left = kv_end - n0 - 64 * pair;
-    for (; tiles_left > 0; --tiles_left, n0 += TILE, valid_left -= TILE - 64)
-    {
-        int physical_page = block_table[b * num_pages_per_seq + (n0 >> 8)];
-        int physical_row0 = physical_page * PAGE + (n0 & 255);
-        const uint32_t* k_ptr = K + ((size_t) physical_row0 * KVH + h) * 32
-                                + 64 * pair * (KVH * 32) + lane;
-        const uint32_t* v_ptr = V + ((size_t) physical_row0 * KVH + h) * 32
-                                + 64 * pair * (KVH * 32) + lane;
-        const half* sk_ptr = SK + ((size_t) physical_row0 * KVH + h) * 8
-                             + 64 * pair * (KVH * 8) + (lane >> 2);
-        const half* sv_ptr = SV + ((size_t) physical_row0 * KVH + h) * 8
-                             + 64 * pair * (KVH * 8) + (lane >> 2);
-
-        #pragma unroll 1
-        for (int batch = 0; batch < 8; ++batch)
+        for (int r = 0; r < 3; ++r)
+        {
+            float4 q0 = *reinterpret_cast<const float4*>(q_base + r * HD + 8 * lane);
+            float4 q1 = *reinterpret_cast<const float4*>(q_base + r * HD + 8 * lane + 4);
+            q[r][0] = q0.x; q[r][1] = q0.y; q[r][2] = q0.z; q[r][3] = q0.w;
+            q[r][4] = q1.x; q[r][5] = q1.y; q[r][6] = q1.z; q[r][7] = q1.w;
+        }
+        float o[3][8];
+        #pragma unroll
+        for (int r = 0; r < 3; ++r)
         {
             #pragma unroll
-            for (int token = 0; token < 8; ++token)
+            for (int j = 0; j < 8; ++j) o[r][j] = 0.0f;
+        }
+        float m = -CUDART_INF_F;
+        float l = 0.0f;
+
+        LaneD3Hot& hot = arena.warps[warp];
+        int n0 = TILE * t0;
+        int tiles_left = t1 - t0;
+        int valid_left = valid_end - n0 - 64 * pair;
+        for (; tiles_left > 0; --tiles_left, n0 += TILE, valid_left -= TILE - 64)
+        {
+            int physical_page = block_table[b * num_pages_per_seq + (n0 >> 8)];
+            int physical_row0 = physical_page * PAGE + (n0 & 255);
+            const uint32_t* k_ptr = K + ((size_t) physical_row0 * KVH + h) * 32
+                                    + 64 * pair * (KVH * 32) + lane;
+            const uint32_t* v_ptr = V + ((size_t) physical_row0 * KVH + h) * 32
+                                    + 64 * pair * (KVH * 32) + lane;
+            const half* sk_ptr = SK + ((size_t) physical_row0 * KVH + h) * 8
+                                 + 64 * pair * (KVH * 8) + (lane >> 2);
+            const half* sv_ptr = SV + ((size_t) physical_row0 * KVH + h) * 8
+                                 + 64 * pair * (KVH * 8) + (lane >> 2);
+
+            #pragma unroll 1
+            for (int batch = 0; batch < 8; ++batch)
             {
-                bool valid = token < valid_left;
-                uint32_t word = valid ? k_ptr[token * (KVH * 32)] : 0u;
-                float a = valid ? __half2float(sk_ptr[token * (KVH * 8)]) * 0.125f : 0.0f;
-                float bmid = -7.5f * a;
-                float score[3];
-                laneD3_qk_dimension<0>(score, q, word, a, bmid);
                 #pragma unroll
-                for (int r = 0; r < 3; ++r)
+                for (int token = 0; token < 8; ++token)
                 {
-                    score[r] += __shfl_xor_sync(0xffffffffu, score[r], 1);
-                    score[r] += __shfl_xor_sync(0xffffffffu, score[r], 2);
-                }
-                if ((lane & 3) == 0)
-                {
-                    int group = lane >> 2;
-                    *reinterpret_cast<float4*>(&hot.red[token][4 * group]) =
-                        make_float4(score[0], score[1], score[2], 0.0f);
-                }
-            }
-            __syncwarp();
-
-            {
-                int r = lane >> 3;
-                int token = lane & 7;
-                float v[8];
-                #pragma unroll
-                for (int g = 0; g < 8; ++g) v[g] = hot.red[token][4 * g + r];
-                v[0] += v[1]; v[2] += v[3]; v[4] += v[5]; v[6] += v[7];
-                v[0] += v[2]; v[4] += v[6];
-                v[0] += v[4];
-                if (lane < 24) hot.score[token][r] = v[0];
-            }
-            __syncwarp();
-
-            float threshold = m + 12.0f;
-            #pragma unroll
-            for (int token = 0; token < 8; ++token)
-            {
-                bool valid = token < valid_left;
-                bool updated = false;
-                float p = 0.0f;
-                float alpha = 1.0f;
-                if (lane < 3 && valid)
-                {
-                    float x = hot.score[token][lane];
-                    if (m == -CUDART_INF_F)
-                    {
-                        m = x;
-                        threshold = m + 12.0f;
-                        alpha = 0.0f;
-                        p = 1.0f;
-                        l = 1.0f;
-                        updated = true;
-                    }
-                    else if (x > threshold)
-                    {
-                        alpha = exp2f(m - x);
-                        m = x;
-                        threshold = m + 12.0f;
-                        p = 1.0f;
-                        l = fmaf(l, alpha, 1.0f);
-                        updated = true;
-                    }
-                    else
-                    {
-                        p = exp2f(x - m);
-                        l += p;
-                    }
-                }
-                uint32_t ballot = __ballot_sync(0xffffffffu, updated);
-                if (lane < 3) hot.pa[token][lane] = make_float2(p, alpha);
-                if (lane == 0) hot.flags[token] = ballot;
-            }
-            __syncwarp();
-
-            #pragma unroll
-            for (int token = 0; token < 8; ++token)
-            {
-                uint32_t flag = hot.flags[token];
-                float4 pa01 = *reinterpret_cast<const float4*>(&hot.pa[token][0]);
-                float p0 = pa01.x;
-                float p1 = pa01.z;
-                float2 pa2 = *reinterpret_cast<const float2*>(&hot.pa[token][2]);
-                float p2 = pa2.x;
-                if (flag)
-                {
+                    bool valid = token < valid_left;
+                    uint32_t word = valid ? k_ptr[token * (KVH * 32)] : 0u;
+                    float a = valid ? __half2float(sk_ptr[token * (KVH * 8)]) * 0.125f : 0.0f;
+                    float bmid = -7.5f * a;
+                    float score[3];
+                    laneD3_qk_dimension<0>(score, q, word, a, bmid);
                     #pragma unroll
-                    for (int j = 0; j < 8; ++j)
+                    for (int r = 0; r < 3; ++r)
                     {
-                        o[0][j] *= pa01.y;
-                        o[1][j] *= pa01.w;
-                        o[2][j] *= pa2.y;
+                        score[r] += __shfl_xor_sync(0xffffffffu, score[r], 1);
+                        score[r] += __shfl_xor_sync(0xffffffffu, score[r], 2);
+                    }
+                    if ((lane & 3) == 0)
+                    {
+                        int group = lane >> 2;
+                        *reinterpret_cast<float4*>(&hot.red[token][4 * group]) =
+                            make_float4(score[0], score[1], score[2], 0.0f);
                     }
                 }
+                __syncwarp();
 
-                bool valid = token < valid_left;
-                uint32_t word = valid ? v_ptr[token * (KVH * 32)] : 0u;
-                float a = valid ? __half2float(sv_ptr[token * (KVH * 8)]) * 0.125f : 0.0f;
-                float bmid = -7.5f * a;
-                laneD3_pv_dimension<0>(o, p0, p1, p2, word, a, bmid);
+                {
+                    int r = lane >> 3;
+                    int token = lane & 7;
+                    float v[8];
+                    #pragma unroll
+                    for (int g = 0; g < 8; ++g) v[g] = hot.red[token][4 * g + r];
+                    v[0] += v[1]; v[2] += v[3]; v[4] += v[5]; v[6] += v[7];
+                    v[0] += v[2]; v[4] += v[6];
+                    v[0] += v[4];
+                    if (lane < 24) hot.score[token][r] = v[0];
+                }
+                __syncwarp();
+
+                float threshold = m + 12.0f;
+                #pragma unroll
+                for (int token = 0; token < 8; ++token)
+                {
+                    bool valid = token < valid_left;
+                    bool updated = false;
+                    float p = 0.0f;
+                    float alpha = 1.0f;
+                    if (lane < 3 && valid)
+                    {
+                        float x = hot.score[token][lane];
+                        if (m == -CUDART_INF_F)
+                        {
+                            m = x;
+                            threshold = m + 12.0f;
+                            alpha = 0.0f;
+                            p = 1.0f;
+                            l = 1.0f;
+                            updated = true;
+                        }
+                        else if (x > threshold)
+                        {
+                            alpha = exp2f(m - x);
+                            m = x;
+                            threshold = m + 12.0f;
+                            p = 1.0f;
+                            l = fmaf(l, alpha, 1.0f);
+                            updated = true;
+                        }
+                        else
+                        {
+                            p = exp2f(x - m);
+                            l += p;
+                        }
+                    }
+                    uint32_t ballot = __ballot_sync(0xffffffffu, updated);
+                    if (lane < 3) hot.pa[token][lane] = make_float2(p, alpha);
+                    if (lane == 0) hot.flags[token] = ballot;
+                }
+                __syncwarp();
+
+                #pragma unroll
+                for (int token = 0; token < 8; ++token)
+                {
+                    uint32_t flag = hot.flags[token];
+                    float4 pa01 = *reinterpret_cast<const float4*>(&hot.pa[token][0]);
+                    float p0 = pa01.x;
+                    float p1 = pa01.z;
+                    float2 pa2 = *reinterpret_cast<const float2*>(&hot.pa[token][2]);
+                    float p2 = pa2.x;
+                    if (flag)
+                    {
+                        #pragma unroll
+                        for (int j = 0; j < 8; ++j)
+                        {
+                            o[0][j] *= pa01.y;
+                            o[1][j] *= pa01.w;
+                            o[2][j] *= pa2.y;
+                        }
+                    }
+
+                    bool valid = token < valid_left;
+                    uint32_t word = valid ? v_ptr[token * (KVH * 32)] : 0u;
+                    float a = valid ? __half2float(sv_ptr[token * (KVH * 8)]) * 0.125f : 0.0f;
+                    float bmid = -7.5f * a;
+                    laneD3_pv_dimension<0>(o, p0, p1, p2, word, a, bmid);
+                }
+                valid_left -= 8;
+                k_ptr += 8 * (KVH * 32);
+                v_ptr += 8 * (KVH * 32);
+                sk_ptr += 8 * (KVH * 8);
+                sv_ptr += 8 * (KVH * 8);
             }
-            valid_left -= 8;
-            k_ptr += 8 * (KVH * 32);
-            v_ptr += 8 * (KVH * 32);
-            sk_ptr += 8 * (KVH * 8);
-            sv_ptr += 8 * (KVH * 8);
         }
-    }
 
-    // Publish pair 1 and all metadata before any cross-pair reads.
-    __syncthreads();
-    if (lane < 3)
-    {
-        warp_m[warp][lane] = m;
-        warp_l[warp][lane] = l;
-    }
-    if (pair)
-    {
-        #pragma unroll
-        for (int r = 0; r < 3; ++r)
+        // Publish pair 1 and all metadata before any cross-pair reads.
+        __syncthreads();
+        if (lane < 3)
         {
-            int row = 3 * warp_half + r;
-            float4 o0 = make_float4(o[r][0], o[r][1], o[r][2], o[r][3]);
-            float4 o1 = make_float4(o[r][4], o[r][5], o[r][6], o[r][7]);
-            *reinterpret_cast<float4*>(&arena.stage[1][row][8 * lane]) = o0;
-            *reinterpret_cast<float4*>(&arena.stage[1][row][8 * lane + 4]) = o1;
+            warp_m[warp][lane] = m;
+            warp_l[warp][lane] = l;
         }
-    }
-    __syncthreads();
-
-    if (warp == 0 && lane < 6)
-    {
-        int row = lane;
-        int half = row >= 3;
-        int r = row - 3 * half;
-        size_t ml_base = (((size_t) program * S + split) * 6) * 2;
-        float m0 = warp_m[half][r];
-        float m1 = warp_m[2 + half][r];
-        float l0 = warp_l[half][r];
-        float l1 = warp_l[2 + half][r];
-        float mf = fmaxf(m0, m1);
-        float a0 = (l0 == 0.0f || m0 == -CUDART_INF_F) ? 0.0f : exp2f(m0 - mf);
-        float a1 = (l1 == 0.0f || m1 == -CUDART_INF_F) ? 0.0f : exp2f(m1 - mf);
-        float lf = fmaf(l0, a0, l1 * a1);
-        if (lf == 0.0f) mf = -CUDART_INF_F;
-        partial_ml[ml_base + 2 * row] = mf;
-        partial_ml[ml_base + 2 * row + 1] = lf;
-        weights[0][0][row] = a0;
-        weights[0][1][row] = a1;
-        warp_l[0][row] = lf;
-    }
-    __syncthreads();
-
-    if (!pair)
-    {
-        size_t o_base = (((size_t) program * S + split) * 6) * HD;
-        #pragma unroll
-        for (int r = 0; r < 3; ++r)
+        if (pair)
         {
-            int row = 3 * warp_half + r;
-            if (warp_l[0][row] != 0.0f)
+            #pragma unroll
+            for (int r = 0; r < 3; ++r)
             {
-                float a0 = weights[0][0][row];
-                float a1 = weights[0][1][row];
-                float4 s0 = *reinterpret_cast<const float4*>(&arena.stage[1][row][8 * lane]);
-                float4 s1 = *reinterpret_cast<const float4*>(&arena.stage[1][row][8 * lane + 4]);
-                float4 o0 = make_float4(
-                    fmaf(s0.x, a1, o[r][0] * a0), fmaf(s0.y, a1, o[r][1] * a0),
-                    fmaf(s0.z, a1, o[r][2] * a0), fmaf(s0.w, a1, o[r][3] * a0));
-                float4 o1 = make_float4(
-                    fmaf(s1.x, a1, o[r][4] * a0), fmaf(s1.y, a1, o[r][5] * a0),
-                    fmaf(s1.z, a1, o[r][6] * a0), fmaf(s1.w, a1, o[r][7] * a0));
-                *reinterpret_cast<float4*>(partial_o + o_base + row * HD + 8 * lane) = o0;
-                *reinterpret_cast<float4*>(partial_o + o_base + row * HD + 8 * lane + 4) = o1;
+                int row = 3 * warp_half + r;
+                float4 o0 = make_float4(o[r][0], o[r][1], o[r][2], o[r][3]);
+                float4 o1 = make_float4(o[r][4], o[r][5], o[r][6], o[r][7]);
+                *reinterpret_cast<float4*>(&arena.stage[1][row][8 * lane]) = o0;
+                *reinterpret_cast<float4*>(&arena.stage[1][row][8 * lane + 4]) = o1;
             }
         }
+        __syncthreads();
+
+        if (warp == 0 && lane < 6)
+        {
+            int row = lane;
+            int half = row >= 3;
+            int r = row - 3 * half;
+            size_t ml_base = (((size_t) program * S + split) * R + 6 * pass) * 2;
+            float m0 = warp_m[half][r];
+            float m1 = warp_m[2 + half][r];
+            float l0 = warp_l[half][r];
+            float l1 = warp_l[2 + half][r];
+            float mf = fmaxf(m0, m1);
+            float a0 = (l0 == 0.0f || m0 == -CUDART_INF_F) ? 0.0f : exp2f(m0 - mf);
+            float a1 = (l1 == 0.0f || m1 == -CUDART_INF_F) ? 0.0f : exp2f(m1 - mf);
+            float lf = fmaf(l0, a0, l1 * a1);
+            if (lf == 0.0f) mf = -CUDART_INF_F;
+            partial_ml[ml_base + 2 * row] = mf;
+            partial_ml[ml_base + 2 * row + 1] = lf;
+            weights[0][0][row] = a0;
+            weights[0][1][row] = a1;
+            warp_l[0][row] = lf;
+        }
+        __syncthreads();
+
+        if (!pair)
+        {
+            size_t o_base = (((size_t) program * S + split) * R + 6 * pass) * HD;
+            #pragma unroll
+            for (int r = 0; r < 3; ++r)
+            {
+                int row = 3 * warp_half + r;
+                if (warp_l[0][row] != 0.0f)
+                {
+                    float a0 = weights[0][0][row];
+                    float a1 = weights[0][1][row];
+                    float4 s0 = *reinterpret_cast<const float4*>(&arena.stage[1][row][8 * lane]);
+                    float4 s1 = *reinterpret_cast<const float4*>(&arena.stage[1][row][8 * lane + 4]);
+                    float4 o0 = make_float4(
+                        fmaf(s0.x, a1, o[r][0] * a0), fmaf(s0.y, a1, o[r][1] * a0),
+                        fmaf(s0.z, a1, o[r][2] * a0), fmaf(s0.w, a1, o[r][3] * a0));
+                    float4 o1 = make_float4(
+                        fmaf(s1.x, a1, o[r][4] * a0), fmaf(s1.y, a1, o[r][5] * a0),
+                        fmaf(s1.z, a1, o[r][6] * a0), fmaf(s1.w, a1, o[r][7] * a0));
+                    *reinterpret_cast<float4*>(partial_o + o_base + row * HD + 8 * lane) = o0;
+                    *reinterpret_cast<float4*>(partial_o + o_base + row * HD + 8 * lane + 4) = o1;
+                }
+            }
+        }
+        __syncthreads();
     }
 }
 
@@ -1233,23 +1248,31 @@ void q4m_combine_kernel(
     int S0,
     int S1)
 {
-    static_assert(M == 1);
+    static_assert(M >= 1 && M <= 8);
     int lane = threadIdx.x;
     int q_head = blockIdx.x % QH;
+    int qpos = (blockIdx.x / QH) % M;
     int b = blockIdx.x / (QH * M);
     int h = q_head / 6;
     int sibling = q_head % 6;
-    int program = b * 4 + h;
-    int S = S0;
-    (void) po1; (void) ml1; (void) S1;
+    bool tail = M > 1 && (M & 1) && qpos == M - 1;
+    bool paired = M > 1 && !tail;
+    int NRB = tail ? 1 : (M == 1 ? 1 : M / 2);
+    int R = M == 1 || tail ? 6 : 12;
+    int rb = paired ? qpos / 2 : 0;
+    int local_row = (paired ? (qpos & 1) * 6 : 0) + sibling;
+    int program = (b * 4 + h) * NRB + rb;
+    const float* po = tail ? po1 : po0;
+    const float* ml = tail ? ml1 : ml0;
+    int S = tail ? S1 : S0;
 
     float m = -CUDART_INF_F;
     float l = 0.0f;
     if (lane < S)
     {
-        size_t idx = (((size_t) program * S + lane) * 6 + sibling) * 2;
-        m = ml0[idx];
-        l = ml0[idx + 1];
+        size_t idx = (((size_t) program * S + lane) * R + local_row) * 2;
+        m = ml[idx];
+        l = ml[idx + 1];
     }
     bool valid = lane < S && l != 0.0f && m != -CUDART_INF_F;
     float mm = valid ? m : -CUDART_INF_F;
@@ -1272,7 +1295,7 @@ void q4m_combine_kernel(
         float wb = s + 1 < S ? __shfl_sync(0xffffffffu, w, s + 1) : 0.0f;
         if (wa != 0.0f)
         {
-            const float* p = po0 + (((size_t) program * S + s) * 6 + sibling) * HD;
+            const float* p = po + (((size_t) program * S + s) * R + local_row) * HD;
             float4 a = *reinterpret_cast<const float4*>(p + d0);
             float4 b4 = *reinterpret_cast<const float4*>(p + d1);
             acc0[0] = fmaf(a.x, wa, acc0[0]); acc0[1] = fmaf(a.y, wa, acc0[1]);
@@ -1282,7 +1305,7 @@ void q4m_combine_kernel(
         }
         if (wb != 0.0f)
         {
-            const float* p = po0 + (((size_t) program * S + s + 1) * 6 + sibling) * HD;
+            const float* p = po + (((size_t) program * S + s + 1) * R + local_row) * HD;
             float4 a = *reinterpret_cast<const float4*>(p + d0);
             float4 b4 = *reinterpret_cast<const float4*>(p + d1);
             acc0[0] = fmaf(a.x, wb, acc0[0]); acc0[1] = fmaf(a.y, wb, acc0[1]);
@@ -1332,14 +1355,22 @@ void validate_q4m_args(
     const at::Tensor& block_table, const at::Tensor& cache_seqlens,
     const at::Tensor& out, const at::Tensor& q_rot,
     const at::Tensor& partial_o, const at::Tensor& partial_ml,
-    int64_t splits)
+    int64_t splits, bool warp_pair = false)
 {
     validate_q_rot(q, q_rot);
     auto* properties = at::cuda::getDeviceProperties(q.get_device());
     TORCH_CHECK(properties->major == 5 && properties->minor == 2, "q4m: sm_52 required");
     int bsz = (int) q.size(0);
     int M = (int) q.size(1);
-    TORCH_CHECK(bsz == 1 && M == 1, "q4m increment 1 supports batch=1, q_len=1");
+    if (warp_pair)
+    {
+        TORCH_CHECK(bsz >= 1 && bsz <= 4 && M >= 1 && M <= 8,
+                    "q4m laneD3 supports batch=1..4, q_len=1..8");
+    }
+    else
+    {
+        TORCH_CHECK(bsz == 1 && M == 1, "q4m increment 1 supports batch=1, q_len=1");
+    }
     TORCH_CHECK(out.scalar_type() == at::kHalf && out.is_contiguous() && out.sizes() == q.sizes(),
                 "q4m: out must match q");
     TORCH_CHECK(k_cache.scalar_type() == at::kInt && v_cache.scalar_type() == at::kInt,
@@ -1357,10 +1388,15 @@ void validate_q4m_args(
                 block_table.dim() == 2 && block_table.size(0) == bsz && cache_seqlens.numel() == bsz,
                 "q4m: bad block table/sequence lengths");
     TORCH_CHECK(splits >= 1 && splits <= 32, "q4m: splits must be 1..32");
-    int64_t programs = (int64_t) bsz * 4;
+    int64_t rows = (int64_t) bsz * 4 * 6;
+    if (warp_pair && M > 1)
+    {
+        rows = (int64_t) bsz * 4 * (M / 2) * 12;
+        if (M & 1) rows += (int64_t) bsz * 4 * 6;
+    }
     TORCH_CHECK(partial_o.scalar_type() == at::kFloat && partial_ml.scalar_type() == at::kFloat &&
-                partial_o.numel() >= programs * splits * 6 * HD &&
-                partial_ml.numel() >= programs * splits * 6 * 2, "q4m: partial workspace too small");
+                partial_o.numel() >= rows * splits * HD &&
+                partial_ml.numel() >= rows * splits * 2, "q4m: partial workspace too small");
     auto device = q.device();
     TORCH_CHECK(out.device() == device && k_cache.device() == device && v_cache.device() == device &&
                 k_scales.device() == device && v_scales.device() == device && block_table.device() == device &&
@@ -1456,8 +1492,8 @@ void q4m_laneD_decode_gr(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void q4m_laneD3_decode_gr(
-    const at::Tensor& q,
+template<int M>
+static void q4m_laneD3_decode_typed(
     const at::Tensor& k_cache, const at::Tensor& k_scales,
     const at::Tensor& v_cache, const at::Tensor& v_scales,
     const at::Tensor& block_table, const at::Tensor& cache_seqlens,
@@ -1466,9 +1502,10 @@ void q4m_laneD3_decode_gr(
     int bsz, int num_pages_per_seq, int splits,
     cudaStream_t stream, Graph* graph)
 {
-    TORCH_CHECK(q.size(1) == 1, "q4m laneD3 increment 1 supports q_len=1 only");
-    dim3 grid(bsz * 4, splits);
-    auto split_fn = q4m_laneD3_split_kernel;
+    constexpr int NRB = M == 1 ? 1 : M / 2;
+    constexpr int R = M == 1 ? 6 : 12;
+    dim3 grid(bsz * 4 * NRB, splits);
+    auto split_fn = q4m_laneD3_split_kernel<M, M == 1>;
     split_fn<<<grid, 128, 0, stream>>>(
         (const float*) q_rot.data_ptr(), (const uint32_t*) k_cache.data_ptr(),
         (const uint32_t*) v_cache.data_ptr(), (const half*) k_scales.data_ptr(),
@@ -1483,11 +1520,67 @@ void q4m_laneD3_decode_gr(
         graph->record_param((void*) split_fn, GP_attn_num_pages, 9, 4);
         graph->record_param((void*) split_fn, GP_end, 0);
     }
-    q4m_combine_kernel<1><<<bsz * QH, 32, 0, stream>>>(
+
+    size_t segment_o = (size_t) bsz * 4 * NRB * splits * R * HD;
+    size_t segment_ml = (size_t) bsz * 4 * NRB * splits * R * 2;
+    const float* tail_o = (const float*) partial_o.data_ptr();
+    const float* tail_ml = (const float*) partial_ml.data_ptr();
+    int tail_splits = 0;
+    if constexpr (M > 1 && (M & 1))
+    {
+        float* po1 = (float*) partial_o.data_ptr() + segment_o;
+        float* ml1 = (float*) partial_ml.data_ptr() + segment_ml;
+        dim3 tail_grid(bsz * 4, splits);
+        auto tail_fn = q4m_laneD3_split_kernel<M, true>;
+        tail_fn<<<tail_grid, 128, 0, stream>>>(
+            (const float*) q_rot.data_ptr(), (const uint32_t*) k_cache.data_ptr(),
+            (const uint32_t*) v_cache.data_ptr(), (const half*) k_scales.data_ptr(),
+            (const half*) v_scales.data_ptr(), (const int*) block_table.data_ptr(),
+            (const int*) cache_seqlens.data_ptr(), po1, ml1, num_pages_per_seq, splits);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        if (graph)
+        {
+            graph->record_param((void*) tail_fn, GP_attn_block_table, 5);
+            graph->record_param((void*) tail_fn, GP_attn_seqlens, 6);
+            graph->record_param((void*) tail_fn, GP_attn_num_pages, 9, 4);
+            graph->record_param((void*) tail_fn, GP_end, 0);
+        }
+        tail_o = po1;
+        tail_ml = ml1;
+        tail_splits = splits;
+    }
+    q4m_combine_kernel<M><<<bsz * M * QH, 32, 0, stream>>>(
         (const float*) partial_o.data_ptr(), (const float*) partial_ml.data_ptr(),
-        (const float*) partial_o.data_ptr(), (const float*) partial_ml.data_ptr(),
-        (half*) out.data_ptr(), splits, 0);
+        tail_o, tail_ml, (half*) out.data_ptr(), splits, tail_splits);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void q4m_laneD3_decode_gr(
+    const at::Tensor& q,
+    const at::Tensor& k_cache, const at::Tensor& k_scales,
+    const at::Tensor& v_cache, const at::Tensor& v_scales,
+    const at::Tensor& block_table, const at::Tensor& cache_seqlens,
+    const at::Tensor& out, const at::Tensor& q_rot,
+    const at::Tensor& partial_o, const at::Tensor& partial_ml,
+    int bsz, int num_pages_per_seq, int splits,
+    cudaStream_t stream, Graph* graph)
+{
+    switch ((int) q.size(1))
+    {
+        #define Q4M3_CASE(M) case M: q4m_laneD3_decode_typed<M>( \
+            k_cache, k_scales, v_cache, v_scales, block_table, cache_seqlens, out, q_rot, \
+            partial_o, partial_ml, bsz, num_pages_per_seq, splits, stream, graph); break
+        Q4M3_CASE(1);
+        Q4M3_CASE(2);
+        Q4M3_CASE(3);
+        Q4M3_CASE(4);
+        Q4M3_CASE(5);
+        Q4M3_CASE(6);
+        Q4M3_CASE(7);
+        Q4M3_CASE(8);
+        #undef Q4M3_CASE
+        default: TORCH_CHECK(false, "q4m laneD3 supports q_len=1..8");
+    }
 }
 
 void q4m_prepare(at::Tensor q, at::Tensor q_rot, double q_scale)
@@ -1551,7 +1644,7 @@ void q4m_laneD3_attention(
 {
     const at::cuda::OptionalCUDAGuard guard(q.device());
     validate_q4m_args(q, k_cache, k_scales, v_cache, v_scales, block_table, cache_seqlens,
-                      out, q_rot, partial_o, partial_ml, splits);
+                      out, q_rot, partial_o, partial_ml, splits, true);
     int bsz = (int) q.size(0);
     int M = (int) q.size(1);
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -1584,7 +1677,7 @@ std::vector<int64_t> q4m_laneD_resource_info()
 std::vector<int64_t> q4m_laneD3_resource_info()
 {
     cudaFuncAttributes attr{};
-    auto fn = q4m_laneD3_split_kernel;
+    auto fn = q4m_laneD3_split_kernel<1, true>;
     C10_CUDA_CHECK(cudaFuncGetAttributes(&attr, (const void*) fn));
     int occupancy = 0;
     C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, (const void*) fn, 128, 0));
