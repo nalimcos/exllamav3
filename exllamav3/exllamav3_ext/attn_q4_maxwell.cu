@@ -39,6 +39,68 @@ __device__ __forceinline__ float half_at(const uint4& v, int i)
     return __half2float(__ushort_as_half((uint16_t) (pair >> (16 * (i & 1)))));
 }
 
+
+// Six-row QK software pipeline. F identifies one (four-dimension, row) Q fragment.
+// The four-entry Q ring loads F+4 before row F's FFMAs. The two-entry K ring
+// decodes U+2 before row block U. All indices are compile-time constants.
+template<int F>
+__device__ __forceinline__ float4 q4m_pipe_load_q(const float* q_base)
+{
+    static_assert(F >= 0 && F < 64 * 6);
+    constexpr int U = F / 6;
+    constexpr int r = F % 6;
+    return *reinterpret_cast<const float4*>(q_base + r * HD + 4 * U);
+}
+
+template<int U>
+__device__ __forceinline__ float4 q4m_pipe_load_k(const uint4* k_row, const uint4& ks, int lane)
+{
+    static_assert(U >= 0 && U < 64);
+    constexpr int g = U / 8;
+    constexpr int j = (U % 8) / 2;
+    constexpr int n4 = U % 2;
+    uint4 packed = k_row[(g + lane) & 7];
+    uint32_t word = word_at(packed, j);
+    float a = half_at(ks, g) * 0.125f;
+    float b = -7.5f * a;
+    constexpr int shift = 16 * n4;
+    return make_float4(
+        fmaf((float) ((word >> shift) & 15), a, b),
+        fmaf((float) ((word >> (shift + 4)) & 15), a, b),
+        fmaf((float) ((word >> (shift + 8)) & 15), a, b),
+        fmaf((float) ((word >> (shift + 12)) & 15), a, b));
+}
+
+template<int U, int r>
+__device__ __forceinline__ void q4m_pipe_rows(
+    const float* q_base, const uint4* k_row, const uint4& ks, int lane,
+    float4 (&q_ring)[4], float (&score)[6], const float4& kv)
+{
+    constexpr int F = U * 6 + r;
+    float4 qv = q_ring[F & 3];
+    if constexpr (F + 4 < 64 * 6)
+        q_ring[F & 3] = q4m_pipe_load_q<F + 4>(q_base);
+    score[r] = fmaf(qv.x, kv.x, score[r]);
+    score[r] = fmaf(qv.y, kv.y, score[r]);
+    score[r] = fmaf(qv.z, kv.z, score[r]);
+    score[r] = fmaf(qv.w, kv.w, score[r]);
+    if constexpr (r < 5)
+        q4m_pipe_rows<U, r + 1>(q_base, k_row, ks, lane, q_ring, score, kv);
+}
+
+template<int U>
+__device__ __forceinline__ void q4m_pipe_steps(
+    const float* q_base, const uint4* k_row, const uint4& ks, int lane,
+    float4 (&q_ring)[4], float4 (&k_ring)[2], float (&score)[6])
+{
+    float4 kv = k_ring[U & 1];
+    if constexpr (U + 2 < 64)
+        k_ring[U & 1] = q4m_pipe_load_k<U + 2>(k_row, ks, lane);
+    q4m_pipe_rows<U, 0>(q_base, k_row, ks, lane, q_ring, score, kv);
+    if constexpr (U < 63)
+        q4m_pipe_steps<U + 1>(q_base, k_row, ks, lane, q_ring, k_ring, score);
+}
+
 __global__ __launch_bounds__(128)
 void q4m_prepare_kernel(const half* __restrict__ q, float* __restrict__ q_rot,
                         int total_rows, float q_scale)
@@ -212,34 +274,46 @@ void q4m_split_kernel(
         for (int r = 0; r < R; ++r) score[r] = 0.0f;
 
         const uint4* k_row = arena.cohorts[cohort].kbuf[pv_half][lane];
-        #pragma unroll
-        for (int g = 0; g < 8; ++g)
+        if constexpr (R == 6)
         {
-            uint4 packed = k_row[(g + lane) & 7];
-            float a = half_at(ks, g) * 0.125f;
-            float bb = -7.5f * a;
+            float4 q_ring[4] = {
+                q4m_pipe_load_q<0>(q_base), q4m_pipe_load_q<1>(q_base),
+                q4m_pipe_load_q<2>(q_base), q4m_pipe_load_q<3>(q_base)};
+            float4 k_ring[2] = {
+                q4m_pipe_load_k<0>(k_row, ks, lane), q4m_pipe_load_k<1>(k_row, ks, lane)};
+            q4m_pipe_steps<0>(q_base, k_row, ks, lane, q_ring, k_ring, score);
+        }
+        else
+        {
             #pragma unroll
-            for (int j = 0; j < 4; ++j)
+            for (int g = 0; g < 8; ++g)
             {
-                uint32_t word = word_at(packed, j);
+                uint4 packed = k_row[(g + lane) & 7];
+                float a = half_at(ks, g) * 0.125f;
+                float bb = -7.5f * a;
                 #pragma unroll
-                for (int n4 = 0; n4 < 2; ++n4)
+                for (int j = 0; j < 4; ++j)
                 {
-                    int shift = 16 * n4;
-                    float k0 = fmaf((float) ((word >> shift) & 15), a, bb);
-                    float k1 = fmaf((float) ((word >> (shift + 4)) & 15), a, bb);
-                    float k2 = fmaf((float) ((word >> (shift + 8)) & 15), a, bb);
-                    float k3 = fmaf((float) ((word >> (shift + 12)) & 15), a, bb);
-                    int d = 32 * g + 8 * j + 4 * n4;
+                    uint32_t word = word_at(packed, j);
                     #pragma unroll
-                    for (int r = 0; r < R; ++r)
+                    for (int n4 = 0; n4 < 2; ++n4)
                     {
-                        int qr = R == 6 ? r : (r < 6 ? r : 24 + r - 6);
-                        float4 qv = *reinterpret_cast<const float4*>(q_base + qr * HD + d);
-                        score[r] = fmaf(qv.x, k0, score[r]);
-                        score[r] = fmaf(qv.y, k1, score[r]);
-                        score[r] = fmaf(qv.z, k2, score[r]);
-                        score[r] = fmaf(qv.w, k3, score[r]);
+                        int shift = 16 * n4;
+                        float k0 = fmaf((float) ((word >> shift) & 15), a, bb);
+                        float k1 = fmaf((float) ((word >> (shift + 4)) & 15), a, bb);
+                        float k2 = fmaf((float) ((word >> (shift + 8)) & 15), a, bb);
+                        float k3 = fmaf((float) ((word >> (shift + 12)) & 15), a, bb);
+                        int d = 32 * g + 8 * j + 4 * n4;
+                        #pragma unroll
+                        for (int r = 0; r < R; ++r)
+                        {
+                            int qr = r < 6 ? r : 24 + r - 6;
+                            float4 qv = *reinterpret_cast<const float4*>(q_base + qr * HD + d);
+                            score[r] = fmaf(qv.x, k0, score[r]);
+                            score[r] = fmaf(qv.y, k1, score[r]);
+                            score[r] = fmaf(qv.z, k2, score[r]);
+                            score[r] = fmaf(qv.w, k3, score[r]);
+                        }
                     }
                 }
             }
