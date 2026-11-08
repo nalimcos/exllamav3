@@ -95,7 +95,7 @@ union SplitArena
 static_assert(sizeof(CohortArena<6>) == 8192 && sizeof(CohortArena<12>) == 8192);
 
 template<int R, int M, bool TAIL>
-__global__ __launch_bounds__(128, R == 6 ? 5 : 4)
+__global__ __launch_bounds__(128, 4)
 void q4m_split_kernel(
     const float* __restrict__ q_rot,
     const uint32_t* __restrict__ K,
@@ -175,6 +175,10 @@ void q4m_split_kernel(
         int page_offset = n0 & 255;
         int physical_page = block_table[b * num_pages_per_seq + page];
         int physical_row0 = physical_page * PAGE + page_offset;
+        const uint32_t* k_tile = K + (size_t) physical_row0 * (KVH * 32) + h * 32;
+        const uint32_t* v_tile = V + (size_t) physical_row0 * (KVH * 32) + h * 32;
+        const half* sk_tile = SK + (size_t) physical_row0 * (KVH * 8) + h * 8;
+        const half* sv_tile = SV + (size_t) physical_row0 * (KVH * 8) + h * 8;
 
         // Each warp privately stages 32 packed K rows, with an XOR group swizzle.
         int stage_token = n0 + 32 * warp;
@@ -187,8 +191,7 @@ void q4m_split_kernel(
             uint4 packed = make_uint4(0, 0, 0, 0);
             if (logical < kv_end)
             {
-                const uint32_t* src = K + (size_t) (physical_row0 + 32 * warp + token) * (KVH * 32)
-                                    + h * 32 + 4 * g;
+                const uint32_t* src = k_tile + (32 * warp + token) * (KVH * 32) + 4 * g;
                 packed = *reinterpret_cast<const uint4*>(src);
             }
             arena.cohorts[cohort].kbuf[pv_half][token][(g + token) & 7] = packed;
@@ -200,7 +203,7 @@ void q4m_split_kernel(
         uint4 ks = make_uint4(0, 0, 0, 0);
         if (token_valid)
         {
-            const half* src = SK + (size_t) (physical_row0 + 32 * warp + lane) * (KVH * 8) + h * 8;
+            const half* src = sk_tile + (32 * warp + lane) * (KVH * 8);
             ks = *reinterpret_cast<const uint4*>(src);
         }
 
@@ -208,10 +211,11 @@ void q4m_split_kernel(
         #pragma unroll
         for (int r = 0; r < R; ++r) score[r] = 0.0f;
 
-        #pragma unroll 4
+        const uint4* k_row = arena.cohorts[cohort].kbuf[pv_half][lane];
+        #pragma unroll
         for (int g = 0; g < 8; ++g)
         {
-            uint4 packed = arena.cohorts[cohort].kbuf[pv_half][lane][(g + lane) & 7];
+            uint4 packed = k_row[(g + lane) & 7];
             float a = half_at(ks, g) * 0.125f;
             float bb = -7.5f * a;
             #pragma unroll
@@ -227,7 +231,7 @@ void q4m_split_kernel(
                     float k2 = fmaf((float) ((word >> (shift + 8)) & 15), a, bb);
                     float k3 = fmaf((float) ((word >> (shift + 12)) & 15), a, bb);
                     int d = 32 * g + 8 * j + 4 * n4;
-                    #pragma unroll 2
+                    #pragma unroll
                     for (int r = 0; r < R; ++r)
                     {
                         int qr = R == 6 ? r : (r < 6 ? r : 24 + r - 6);
@@ -300,7 +304,7 @@ void q4m_split_kernel(
         int cohort_token = n0 + 64 * cohort + t;
         if (cohort_token < kv_end)
         {
-            const half* src = SV + (size_t) (physical_row0 + 64 * cohort + t) * (KVH * 8) + h * 8;
+            const half* src = sv_tile + (64 * cohort + t) * (KVH * 8);
             vs = *reinterpret_cast<const uint4*>(src);
         }
         #pragma unroll
@@ -324,16 +328,17 @@ void q4m_split_kernel(
         }
         cohort_barrier(cohort);
 
-        int word_offset = h * 32 + 16 * pv_half + (lane >> 1);
+        int word_offset = 16 * pv_half + (lane >> 1);
         int nibble0 = 16 * (lane & 1);
         int group = 4 * pv_half + (lane >> 3);
+        const uint32_t* v_ptr = v_tile + 64 * cohort * (KVH * 32) + word_offset;
         #pragma unroll 4
         for (int pt = 0; pt < 64; ++pt)
         {
             int logical = n0 + 64 * cohort + pt;
             uint32_t word = 0;
             if (logical < kv_end)
-                word = V[(size_t) (physical_row0 + 64 * cohort + pt) * (KVH * 32) + word_offset];
+                word = *v_ptr;
             float2 ab = arena.cohorts[cohort].pv.scale_ab[group][pt];
             float v0 = fmaf((float) ((word >> nibble0) & 15), ab.x, ab.y);
             float v1 = fmaf((float) ((word >> (nibble0 + 4)) & 15), ab.x, ab.y);
@@ -376,6 +381,7 @@ void q4m_split_kernel(
                     acc[4 + r][3] = fmaf(p, v3, acc[4 + r][3]);
                 }
             }
+            v_ptr += KVH * 32;
         }
         cohort_barrier(cohort);
     }

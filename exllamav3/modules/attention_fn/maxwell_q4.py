@@ -52,7 +52,7 @@ def fn_maxwell_q4_decode(args: AttnArgs) -> torch.Tensor | None:
         return None
 
     resources = _resources(args.q.device.index)
-    if resources[2] > 96 or resources[3] > 16672 or resources[4] != 0 or resources[5] < 5:
+    if resources[2] > 128 or resources[3] > 16672 or resources[4] != 0 or resources[5] < 4:
         return None
 
     splits = 30
