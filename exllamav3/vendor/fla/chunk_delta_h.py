@@ -33,9 +33,9 @@ GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4, 8]
 @triton.autotune(
     configs=(
         [
-            # ptxas otherwise chooses 32 registers and a large local frame on sm_52. A 128-
-            # register budget is fastest on M40 despite limiting residency to 2 CTAs/SM.
-            triton.Config({'BV': 64}, num_warps=8, num_stages=1, maxnreg=128),
+            # ptxas otherwise chooses 32 registers and a large local frame on sm_52. A 255-
+            # register budget is fastest on M40 despite limiting residency to 1 CTA/SM.
+            triton.Config({'BV': 64}, num_warps=8, num_stages=1, maxnreg=255),
         ] if IS_NVIDIA_MAXWELL else [
             triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
             for num_warps in GATED_DELTA_RULE_FWD_H_NUM_WARPS
