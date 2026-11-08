@@ -97,7 +97,12 @@ def check_close(out, ref, label=""):
 
 def run_native(case, splits=30, scale=1 / 16):
     q, kc, ks, vc, vs, bt, past, out, qr, po, ml = case
-    attention = ext.q4m_laneD_attention if NATIVE_MODE == "2" else ext.q4m_attention
+    if NATIVE_MODE == "3":
+        attention = ext.q4m_laneD3_attention
+    elif NATIVE_MODE == "2":
+        attention = ext.q4m_laneD_attention
+    else:
+        attention = ext.q4m_attention
     attention(q, kc, ks, vc, vs, bt, past, out, qr, po, ml, scale, splits)
     return out
 
@@ -247,12 +252,18 @@ def test_decode_vs_prefill_and_eager_dispatch(monkeypatch):
     monkeypatch.setenv("EXL3_ATTN_Q4M", NATIVE_MODE)
     native = fn_maxwell_q4_decode(args)
     if native is None:
-        resources = ext.q4m_laneD_resource_info()
-        resource_failure = (
-            resources[2] > 96 or resources[3] > 18080 or
-            resources[4] != 0 or resources[5] < 5
-        )
-        assert NATIVE_MODE == "2" and resource_failure
+        if NATIVE_MODE == "3":
+            resources = ext.q4m_laneD3_resource_info()
+            resource_failure = (
+                resources[2] > 96 or resources[4] != 0 or resources[5] < 5
+            )
+        else:
+            resources = ext.q4m_laneD_resource_info()
+            resource_failure = (
+                resources[2] > 96 or resources[3] > 18080 or
+                resources[4] != 0 or resources[5] < 5
+            )
+        assert NATIVE_MODE in ("2", "3") and resource_failure
     else:
         torch.testing.assert_close(native, prefill, atol=2e-3, rtol=0)
         assert torch.isfinite(native).all()

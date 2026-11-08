@@ -227,8 +227,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("q4m_prepare", &q4m_prepare, "q4m_prepare");
     m.def("q4m_attention", &q4m_attention, "q4m_attention");
     m.def("q4m_laneD_attention", &q4m_laneD_attention, "q4m_laneD_attention");
+    m.def("q4m_laneD3_attention", &q4m_laneD3_attention, "q4m_laneD3_attention");
     m.def("q4m_resource_info", &q4m_resource_info, "q4m_resource_info");
     m.def("q4m_laneD_resource_info", &q4m_laneD_resource_info, "q4m_laneD_resource_info");
+    m.def("q4m_laneD3_resource_info", &q4m_laneD3_resource_info, "q4m_laneD3_resource_info");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");
     m.def("silu_oai_mul", &silu_oai_mul, "silu_oai_mul");

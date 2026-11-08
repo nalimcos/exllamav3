@@ -9,6 +9,8 @@ from .common import AttnArgs
 
 def _mode() -> int:
     value = os.environ.get("EXL3_ATTN_Q4M", "").lower()
+    if value == "3":
+        return 3
     if value == "2":
         return 2
     if value in ("1", "true"):
@@ -23,7 +25,12 @@ def _aligned(t: torch.Tensor) -> bool:
 @functools.lru_cache(maxsize=None)
 def _resources(device: int, mode: int):
     with torch.cuda.device(device):
-        query = ext.q4m_laneD_resource_info if mode == 2 else ext.q4m_resource_info
+        if mode == 3:
+            query = ext.q4m_laneD3_resource_info
+        elif mode == 2:
+            query = ext.q4m_laneD_resource_info
+        else:
+            query = ext.q4m_resource_info
         return tuple(query())
 
 
@@ -59,7 +66,10 @@ def fn_maxwell_q4_decode(args: AttnArgs) -> torch.Tensor | None:
         return None
 
     resources = _resources(args.q.device.index, mode)
-    if mode == 2:
+    if mode == 3:
+        if resources[2] > 96 or resources[4] != 0 or resources[5] < 5:
+            return None
+    elif mode == 2:
         if resources[2] > 96 or resources[3] > 18080 or resources[4] != 0 or resources[5] < 5:
             return None
     elif resources[2] > 128 or resources[3] > 16672 or resources[4] != 0 or resources[5] < 4:
@@ -70,7 +80,12 @@ def fn_maxwell_q4_decode(args: AttnArgs) -> torch.Tensor | None:
     q_rot = torch.empty(args.q.shape, dtype=torch.float32, device=args.q.device)
     partial_o = torch.empty(4 * splits * 6 * 256, dtype=torch.float32, device=args.q.device)
     partial_ml = torch.empty(4 * splits * 6 * 2, dtype=torch.float32, device=args.q.device)
-    attention = ext.q4m_laneD_attention if mode == 2 else ext.q4m_attention
+    if mode == 3:
+        attention = ext.q4m_laneD3_attention
+    elif mode == 2:
+        attention = ext.q4m_laneD_attention
+    else:
+        attention = ext.q4m_attention
     attention(
         args.q, qk, sk, qv, sv, args.block_table, args.cache_seqlens,
         out, q_rot, partial_o, partial_ml, args.sm_scale, splits,
