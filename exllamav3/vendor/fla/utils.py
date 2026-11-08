@@ -49,6 +49,7 @@ IS_NVIDIA = (device_platform == "cuda")
 _caps = [torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())] if IS_NVIDIA else []
 IS_NVIDIA_HOPPER = IS_NVIDIA and any(c[0] == 9 for c in _caps)
 IS_NVIDIA_BLACKWELL = IS_NVIDIA and any(c[0] in (10, 12) for c in _caps)
+IS_NVIDIA_MAXWELL = IS_NVIDIA and all(c[0] == 5 for c in _caps)
 IS_TF32_SUPPORTED = IS_NVIDIA and all(c[0] >= 8 for c in _caps)
 IS_GATHER_SUPPORTED = hasattr(triton.language, "gather")
 IS_TMA_SUPPORTED = False   # fla only enables TMA with FLA_USE_TMA=1; the kernels keep their non-TMA path

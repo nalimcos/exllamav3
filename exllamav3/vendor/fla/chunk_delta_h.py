@@ -14,6 +14,7 @@ from .index import prepare_chunk_offsets
 from .op import exp2
 from .utils import IS_NVIDIA_BLACKWELL
 from .utils import IS_NVIDIA_HOPPER
+from .utils import IS_NVIDIA_MAXWELL
 from .utils import autotune_cache_kwargs
 from .utils import check_shared_mem
 
@@ -30,16 +31,22 @@ GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4, 8]
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
-    configs=[
-        triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in GATED_DELTA_RULE_FWD_H_NUM_WARPS
-        for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [2, 1])
-        for BV in ([32, 64] if check_shared_mem('ada') else [32])
-    ] + ([
-        # sm_75 (Turing): num_warps=8 is ~4x faster than 2/4 for the sequential chunk
-        # recurrence (measured 9.8 ms -> 2.5 ms per GDN layer at T=1792 on a 2080 Ti)
-        triton.Config({'BV': 64}, num_warps=8, num_stages=1),
-    ] if not check_shared_mem('ada') else []),
+    configs=(
+        [
+            # ptxas otherwise chooses 32 registers and a large local frame on sm_52. This
+            # budget reduces spills and still fits the 48-head, 96-CTA launch on 24 SMs.
+            triton.Config({'BV': 64}, num_warps=8, num_stages=1, maxnreg=64),
+        ] if IS_NVIDIA_MAXWELL else [
+            triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+            for num_warps in GATED_DELTA_RULE_FWD_H_NUM_WARPS
+            for num_stages in ([2, 3, 4] if check_shared_mem('ampere') else [2, 1])
+            for BV in ([32, 64] if check_shared_mem('ada') else [32])
+        ] + ([
+            # sm_75 (Turing): num_warps=8 is ~4x faster than 2/4 for the sequential chunk
+            # recurrence (measured 9.8 ms -> 2.5 ms per GDN layer at T=1792 on a 2080 Ti)
+            triton.Config({'BV': 64}, num_warps=8, num_stages=1),
+        ] if not check_shared_mem('ada') else [])
+    ),
     key=['H', 'HV', 'K', 'V', 'BT', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )
